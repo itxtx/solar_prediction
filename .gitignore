@@ -1,11 +1,12 @@
 
 __pycache__/
 
-.csv
+*.csv
 
-.png
+*.png
 
 .ipynb_checkpoints
 
 .DS_Store
 
+.pt
