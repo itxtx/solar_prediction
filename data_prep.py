@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.model_selection import train_test_split
 import torch 
 import torch.nn as nn
@@ -79,52 +79,9 @@ def piecewise_radiation_transform(radiation_values):
     
     return transformed
 
-def piecewise_transform(radiation, threshold=50):
-    # Creates a copy to avoid modifying original data
-    transformed = np.zeros_like(radiation, dtype=float)
-    
-    # For nighttime/low radiation: keep log transform for sensitivity
-    night_mask = radiation <= threshold
-    transformed[night_mask] = np.log(radiation[night_mask] + 1e-6)
-    
-    # For daytime/high radiation: use less compressed scaling
-    day_mask = radiation > threshold
-    log_threshold = np.log(threshold + 1e-6)
-    scale_factor = 100  # Adjust based on your data distribution
-    transformed[day_mask] = log_threshold + (radiation[day_mask] - threshold) / scale_factor
-    
-    return transformed
-
-def inverse_piecewise_transform(transformed, threshold=50):
-    # Inverting the transformation for predictions
-    original = np.zeros_like(transformed, dtype=float)
-    
-    # Threshold in transformed space
-    log_threshold = np.log(threshold + 1e-6)
-    
-    # Invert night/low values
-    night_mask = transformed <= log_threshold
-    original[night_mask] = np.exp(transformed[night_mask]) - 1e-6
-    
-    # Invert day/high values
-    day_mask = transformed > log_threshold
-    scale_factor = 100  # Same as in transform
-    original[day_mask] = threshold + (transformed[day_mask] - log_threshold) * scale_factor
-    
-    return original
-
-
-
-def adjust_predictions(preds, hour_of_day):
-    # Keep nighttime predictions as they are
-    adjustment = np.zeros_like(preds)
-    # Apply scaling factor to midday predictions
-    midday_mask = (hour_of_day >= 10) & (hour_of_day <= 14)
-    adjustment[midday_mask] = preds[midday_mask] * 0.15  # Adjust by 15%
-    return preds + adjustment
-
 def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size=0.25, log_transform=False, 
-                       min_target_threshold=None, use_piecewise_transform=True, use_solar_elevation=True):
+                       min_target_threshold=None, use_piecewise_transform=False, use_solar_elevation=False,
+                       standardize_features=False, feature_selection_mode='all'):
     """
     Prepare weather time series data for LSTM training with enhanced features
     
@@ -138,6 +95,8 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         min_target_threshold: Minimum threshold for target values (set very small values to this threshold)
         use_piecewise_transform: Whether to apply piecewise transform for Radiation
         use_solar_elevation: Whether to add solar elevation proxy feature
+        standardize_features: Whether to use StandardScaler (True) instead of MinMaxScaler (False)
+        feature_selection_mode: 'all', 'basic', or 'minimal' for different feature set sizes
         
     Returns:
         X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, log_transform_info
@@ -163,8 +122,19 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
                 time_part = time_val.split(' ')[-1]
             else:
                 time_part = time_val
-            hours, minutes, seconds = map(int, time_part.split(':'))
-            return hours * 60 + minutes + seconds / 60
+            
+            # Handle different time formats
+            if ':' in time_part:
+                parts = time_part.split(':')
+                if len(parts) == 3:  # HH:MM:SS
+                    hours, minutes, seconds = map(int, parts)
+                elif len(parts) == 2:  # HH:MM
+                    hours, minutes = map(int, parts)
+                    seconds = 0
+                else:
+                    return np.nan
+                
+                return hours * 60 + minutes + seconds / 60
             
         # Return NaN for unexpected types
         return np.nan
@@ -213,7 +183,7 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
             df['DaylightPosition'] = df['TimeSinceSunrise'] / df['DaylightMinutes']
             df['DaylightPosition'] = df['DaylightPosition'].clip(0, 1)  # Clip to 0-1 range
             
-            # NEW: Add solar elevation proxy feature
+            # Add solar elevation proxy feature (optional)
             if use_solar_elevation and 'Time' in df.columns and 'TimeSunRise' in df.columns and 'TimeSunSet' in df.columns:
                 print("Adding solar elevation proxy feature")
                 # Format times for solar elevation calculation if needed
@@ -222,21 +192,15 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
                 # Apply function only to rows where all required columns are not NaN
                 valid_idx = df[['Time', 'TimeSunRise', 'TimeSunSet']].dropna().index
                 
-                for idx in valid_idx:
-                    try:
-                        time_str = str(df.loc[idx, 'Time']).split(' ')[-1]  # Extract time part
-                        sunrise_str = str(df.loc[idx, 'TimeSunRise']).split(' ')[-1] 
-                        sunset_str = str(df.loc[idx, 'TimeSunSet']).split(' ')[-1]
-                        
-                        # Calculate solar elevation
-                        df.loc[idx, 'SolarElevation'] = create_solar_elevation_proxy(
-                            time_str, sunrise_str, sunset_str
-                        )
-                    except Exception as e:
-                        print(f"Error calculating solar elevation for index {idx}: {e}")
-                        # Keep default value of 0.0
+                # Create SolarElevation from existing features instead of calculating directly
+                # This is more efficient and avoids potential format issues
+                df.loc[valid_idx, 'SolarElevation'] = df.loc[valid_idx, 'DaylightPosition'].apply(
+                    lambda x: math.sin(x * math.pi/2) if (x >= 0 and x <= 1) else 0
+                )
+                
+                print(f"SolarElevation created for {len(valid_idx)} rows, {len(valid_idx)/len(df)*100:.1f}% of data")
     
-    # Apply minimum threshold to target variable if specified (for handling zero/near-zero values)
+    # Apply minimum threshold to target variable if specified
     if min_target_threshold is not None and target_col in df.columns:
         print(f"Applying minimum threshold of {min_target_threshold} to {target_col}")
         # Count values below threshold
@@ -245,7 +209,7 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
             print(f"Found {below_threshold_count} values below threshold ({below_threshold_count/len(df)*100:.2f}% of data)")
             df[target_col] = df[target_col].clip(lower=min_target_threshold)
     
-    # NEW: Apply piecewise transformation to Radiation column if it's the target
+    # Apply piecewise transformation to Radiation column if it's the target (optional)
     transform_info = {'applied': False, 'type': None}
     if target_col == 'Radiation' and use_piecewise_transform:
         print("Applying piecewise radiation transform to Radiation data")
@@ -259,38 +223,55 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         df[f'{target_col}_is_low'] = (df[target_col] < low_threshold).astype(float)
         print(f"Added '{target_col}_is_low' feature (threshold: {low_threshold:.4f})")
     
-    # Base numerical features
-    base_feature_cols = ['Radiation', 'Temperature', 'Pressure', 'Humidity', 
-                   'WindDirection(Degrees)', 'Speed']
+    # Feature selection based on mode
+    if feature_selection_mode == 'minimal':
+        # Only essential features
+        base_feature_cols = [col for col in ['Radiation', 'Temperature', 'Humidity', 'TimeMinutesSin', 'TimeMinutesCos'] 
+                            if col in df.columns]
+    elif feature_selection_mode == 'basic':
+        # Basic set of features
+        base_feature_cols = [col for col in ['Radiation', 'Temperature', 'Pressure', 'Humidity', 
+                                           'WindDirection(Degrees)', 'Speed', 'TimeMinutesSin', 'TimeMinutesCos'] 
+                            if col in df.columns]
+    else:  # 'all'
+        # All available base features
+        base_feature_cols = [col for col in ['Radiation', 'Temperature', 'Pressure', 'Humidity', 
+                                           'WindDirection(Degrees)', 'Speed'] 
+                            if col in df.columns]
     
     # Add the low value indicator
     if f'{target_col}_is_low' not in base_feature_cols and f'{target_col}_is_low' in df.columns:
         base_feature_cols.append(f'{target_col}_is_low')
     
-    # Add solar elevation if available
-    if 'SolarElevation' in df.columns:
+    # Add solar elevation if available and enabled
+    if 'SolarElevation' in df.columns and use_solar_elevation:
         base_feature_cols.append('SolarElevation')
         print("Added SolarElevation to features")
     
     # Time features to try
-    time_features = [
-        'SunriseMinutes', 'SunsetMinutes', 'DaylightMinutes',
-        'TimeSinceSunrise', 'TimeUntilSunset', 'DaylightPosition',
-        'TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'IsDaylight'
-    ]
+    if feature_selection_mode == 'minimal':
+        time_features = ['TimeMinutesSin', 'TimeMinutesCos']
+    elif feature_selection_mode == 'basic':
+        time_features = ['TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'IsDaylight']
+    else:  # 'all'
+        time_features = [
+            'SunriseMinutes', 'SunsetMinutes', 'DaylightMinutes',
+            'TimeSinceSunrise', 'TimeUntilSunset', 'DaylightPosition',
+            'TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'IsDaylight'
+        ]
     
     # Start with base features
-    feature_cols = base_feature_cols.copy()
+    feature_cols = list(set(base_feature_cols))  # Ensure no duplicates
     
-    # Only add time features if they don't have NaN values
+    # Only add time features if they don't have NaN values and not already in base_feature_cols
     for feature in time_features:
-        if feature in df.columns and df[feature].isna().sum() == 0:
+        if feature in df.columns and feature not in feature_cols and df[feature].isna().sum() == 0:
             feature_cols.append(feature)
     
     # Make sure all feature columns exist in the DataFrame
     feature_cols = [col for col in feature_cols if col in df.columns]
     
-    # Handle NaN values in the base features
+    # Handle NaN values in the features
     df[feature_cols] = df[feature_cols].fillna(method='ffill').fillna(method='bfill')
     
     # Log transform target if specified
@@ -310,20 +291,33 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         log_transform_info = {'applied': True, 'epsilon': epsilon, 'original_col': target_col}
         print(f"Log-transformed {target_col} -> {target_col_actual}")
     
+    # Choose the appropriate scaler based on the standardize_features flag
+    ScalerClass = StandardScaler if standardize_features else MinMaxScaler
+    scaler_name = "StandardScaler" if standardize_features else "MinMaxScaler"
+    print(f"Using {scaler_name} for feature scaling")
+    
     # Initialize scalers dictionary
     scalers = {}
     scaled_data = pd.DataFrame()
     
-    # Normalize each feature individually - simple approach
+    # Normalize each feature individually
     for col in feature_cols:
-        scaler = MinMaxScaler(feature_range=(0, 1))
+        if standardize_features:
+            scaler = ScalerClass()
+        else:
+            scaler = ScalerClass(feature_range=(0, 1))
+            
         # Make sure there are no NaNs before scaling
         values = df[col].values.reshape(-1, 1)
         scaled_data[col] = scaler.fit_transform(values).flatten()
         scalers[col] = scaler
     
     # Scale the target column
-    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    if standardize_features:
+        target_scaler = ScalerClass()
+    else:
+        target_scaler = ScalerClass(feature_range=(0, 1))
+        
     target_values = df[target_col_actual].values.reshape(-1, 1)
     scaled_data[target_col_actual] = target_scaler.fit_transform(target_values).flatten()
     scalers[target_col_actual] = target_scaler
@@ -359,9 +353,17 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
     print(f"y_test shape: {y_test.shape}")
     print(f"Features used: {feature_cols}")
     
-    # Combine log transform and piecewise transform info
+    # Create a combined transform info dictionary
+    combined_transform_info = {
+        'transforms': [],
+        'target_col_original': target_col,
+        'target_col_transformed': target_col_actual
+    }
+    
     if transform_info['applied']:
-        transform_info.update(log_transform_info)
-        return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info
-    else:
-        return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, log_transform_info
+        combined_transform_info['transforms'].append(transform_info)
+        
+    if log_transform_info['applied']:
+        combined_transform_info['transforms'].append(log_transform_info)
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info
