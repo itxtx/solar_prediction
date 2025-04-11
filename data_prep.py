@@ -80,7 +80,7 @@ def piecewise_radiation_transform(radiation_values):
     return transformed
 
 def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size=0.25, log_transform=False, 
-                       min_target_threshold=None, use_piecewise_transform=False, use_solar_elevation=False,
+                       min_target_threshold=None, use_piecewise_transform=False, use_solar_elevation=True,
                        standardize_features=False, feature_selection_mode='all'):
     """
     Prepare weather time series data for LSTM training with enhanced features
@@ -248,20 +248,15 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         base_feature_cols.append('SolarElevation')
         print("Added SolarElevation to features")
     
-    # Time features to try
-    if feature_selection_mode == 'minimal':
-        time_features = ['TimeMinutesSin', 'TimeMinutesCos']
-    elif feature_selection_mode == 'basic':
-        time_features = ['TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'IsDaylight']
-    else:  # 'all'
-        time_features = [
-            'SunriseMinutes', 'SunsetMinutes', 'DaylightMinutes',
-            'TimeSinceSunrise', 'TimeUntilSunset', 'DaylightPosition',
-            'TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'IsDaylight'
-        ]
+    # Time features to try - always include all time features for consistency with original
+    time_features = [
+        'SunriseMinutes', 'SunsetMinutes', 'DaylightMinutes',
+        'TimeSinceSunrise', 'TimeUntilSunset', 'DaylightPosition',
+        'TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'IsDaylight'
+    ]
     
     # Start with base features
-    feature_cols = list(set(base_feature_cols))  # Ensure no duplicates
+    feature_cols = base_feature_cols.copy()  # Use copy instead of set to maintain order
     
     # Only add time features if they don't have NaN values and not already in base_feature_cols
     for feature in time_features:

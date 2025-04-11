@@ -40,23 +40,34 @@ class CombinedLoss(nn.Module):
         
         # Combined loss
         return self.mse_weight * mse + self.mape_weight * mape / 100.0
-def value_aware_combined_loss(y_true, y_pred, mse_weight=0.7, mape_weight=0.3):
-    # Basic MSE component
-    squared_errors = (y_true - y_pred)**2
     
-    # Create weights that increase with radiation value
-    # This focuses more attention on higher values without sacrificing low values
-    value_weights = 1.0 + y_true * 0.01  # Adjust multiplier based on your scale
-    
-    # Weighted MSE
-    weighted_mse = torch.mean(value_weights * squared_errors)
-    
-    # Standard MAPE with epsilon protection
-    epsilon = 1.0
-    mape = torch.mean(torch.abs((y_true - y_pred) / (torch.abs(y_true) + epsilon))) * 100
-    
-    # Combined loss with original weights
-    return mse_weight * weighted_mse + mape_weight * mape
+    def value_aware_combined_loss(self, y_pred, y_true, value_multiplier=0.01):
+        """
+        A value-aware loss that gives higher weight to larger true values.
+        
+        Args:
+            y_pred: The predicted values
+            y_true: The true values
+            value_multiplier: Controls how much to scale the weighting by true values
+        
+        Returns:
+            Weighted loss that focuses more on higher radiation values
+        """
+        # Basic MSE component
+        squared_errors = (y_true - y_pred)**2
+        
+        # Create weights that increase with radiation value
+        # This focuses more attention on higher values without sacrificing low values
+        value_weights = 1.0 + y_true * value_multiplier
+        
+        # Weighted MSE
+        weighted_mse = torch.mean(value_weights * squared_errors)
+        
+        # Standard MAPE with epsilon protection
+        mape = torch.mean(torch.abs((y_true - y_pred) / (torch.abs(y_true) + self.epsilon))) * 100
+        
+        # Combined loss with original weights
+        return self.mse_weight * weighted_mse + self.mape_weight * mape / 100.0
 
 # Define the improved LSTM model
 class WeatherLSTM(nn.Module):
@@ -141,7 +152,7 @@ class WeatherLSTM(nn.Module):
     def fit(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32, 
             learning_rate=0.001, patience=10, factor=0.5, min_lr=1e-6, device="cpu",
             scheduler_type="plateau", T_max=None, weight_decay=1e-5, clip_grad_norm=1.0,
-            use_combined_loss=True, mse_weight=0.7, mape_weight=0.3):
+            loss_type="mse", mse_weight=0.7, mape_weight=0.3, value_multiplier=0.01):
         """
         Complete training method with validation, early stopping, and learning rate scheduling
         Now with training history tracking and regularization techniques
@@ -160,9 +171,10 @@ class WeatherLSTM(nn.Module):
             T_max: Maximum number of iterations for CosineAnnealingLR (defaults to epochs if None)
             weight_decay: L2 regularization strength (default: 1e-5)
             clip_grad_norm: Maximum norm for gradient clipping (default: 1.0)
-            use_combined_loss: Whether to use the combined MSE+MAPE loss function
-            mse_weight: Weight for MSE in combined loss
-            mape_weight: Weight for MAPE in combined loss
+            loss_type: Type of loss function to use ('mse', 'combined', or 'value_aware')
+            mse_weight: Weight for MSE in combined losses
+            mape_weight: Weight for MAPE in combined losses
+            value_multiplier: Multiplier for value-aware weighting (default: 0.01)
             
         Returns:
             self: The trained model
@@ -196,13 +208,22 @@ class WeatherLSTM(nn.Module):
         # Initialize optimizer with L2 regularization (weight decay)
         optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         
-        # Use either MSE Loss or Combined Loss depending on configuration
-        if use_combined_loss:
-            criterion = CombinedLoss(mse_weight=mse_weight, mape_weight=mape_weight)
-            print(f"Using Combined Loss (MSE weight: {mse_weight}, MAPE weight: {mape_weight})")
-        else:
+        # Initialize loss function based on user choice
+        combined_loss_instance = None
+        
+        if loss_type.lower() == "mse":
             criterion = nn.MSELoss()
             print("Using MSE Loss")
+        elif loss_type.lower() == "combined":
+            combined_loss_instance = CombinedLoss(mse_weight=mse_weight, mape_weight=mape_weight)
+            criterion = combined_loss_instance
+            print(f"Using Combined Loss (MSE weight: {mse_weight}, MAPE weight: {mape_weight})")
+        elif loss_type.lower() == "value_aware":
+            combined_loss_instance = CombinedLoss(mse_weight=mse_weight, mape_weight=mape_weight)
+            print(f"Using Value-Aware Combined Loss (MSE weight: {mse_weight}, MAPE weight: {mape_weight}, value multiplier: {value_multiplier})")
+            # We'll handle this case specially in the training loop
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}. Choose from 'mse', 'combined', or 'value_aware'")
         
         # Print regularization settings
         print(f"Regularization settings:")
@@ -250,7 +271,12 @@ class WeatherLSTM(nn.Module):
                 
                 # Forward pass
                 outputs = self(inputs)
-                loss = criterion(outputs, targets)
+                
+                # Calculate loss based on loss_type
+                if loss_type.lower() == "value_aware":
+                    loss = combined_loss_instance.value_aware_combined_loss(outputs, targets, value_multiplier)
+                else:
+                    loss = criterion(outputs, targets)
                 
                 # Backward pass
                 loss.backward()
@@ -275,7 +301,13 @@ class WeatherLSTM(nn.Module):
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = self(inputs)
-                    loss = criterion(outputs, targets)
+                    
+                    # Calculate validation loss (use same loss type as training)
+                    if loss_type.lower() == "value_aware":
+                        loss = combined_loss_instance.value_aware_combined_loss(outputs, targets, value_multiplier)
+                    else:
+                        loss = criterion(outputs, targets)
+                        
                     val_loss += loss.item() * inputs.size(0)
                     
                     # Collect predictions and targets for metrics
