@@ -159,16 +159,19 @@ def prepare_weather_data(df, target_col='Temperature', window_size=12, test_size
 
 
 # Define the LSTM model
+
+
 class WeatherLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, dropout_prob=0.2):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, dropout_prob=0.3):
         super(WeatherLSTM, self).__init__()
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.output_dim = output_dim
+        self.dropout_prob = dropout_prob
         
-        # LSTM layers
+        # LSTM layers with dropout between layers
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -177,10 +180,13 @@ class WeatherLSTM(nn.Module):
             dropout=dropout_prob if num_layers > 1 else 0
         )
         
+        # Additional dropout layer after LSTM for better regularization
+        self.dropout1 = nn.Dropout(dropout_prob)
+        
         # Fully connected layers for better feature extraction
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout_prob)
+        self.dropout2 = nn.Dropout(dropout_prob)  # Additional dropout between FC layers
         self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
         
         # Training history
@@ -204,20 +210,23 @@ class WeatherLSTM(nn.Module):
         # Get the output from the last time step
         out = out[:, -1, :]
         
+        # Apply dropout after LSTM
+        out = self.dropout1(out)
+        
         # Apply dense layers for better feature extraction
         out = self.fc1(out)
         out = self.relu(out)
-        out = self.dropout(out)
+        out = self.dropout2(out)
         out = self.fc2(out)
         
         return out
-    
+
     def fit(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32, 
             learning_rate=0.001, patience=10, factor=0.5, min_lr=1e-6, device="cpu",
-            scheduler_type="plateau", T_max=None):
+            scheduler_type="plateau", T_max=None, weight_decay=1e-5, clip_grad_norm=1.0):
         """
         Complete training method with validation, early stopping, and learning rate scheduling
-        Now with training history tracking and support for multiple scheduler types
+        Now with training history tracking and regularization techniques
         
         Args:
             X_train, y_train: Training data
@@ -231,6 +240,8 @@ class WeatherLSTM(nn.Module):
             device: Device to train on ('cpu' or 'cuda')
             scheduler_type: Type of learning rate scheduler ('plateau' or 'cosine')
             T_max: Maximum number of iterations for CosineAnnealingLR (defaults to epochs if None)
+            weight_decay: L2 regularization strength (default: 1e-5)
+            clip_grad_norm: Maximum norm for gradient clipping (default: 1.0)
             
         Returns:
             self: The trained model
@@ -259,9 +270,15 @@ class WeatherLSTM(nn.Module):
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size)
         
-        # Initialize optimizer and loss function
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        # Initialize optimizer with L2 regularization (weight decay)
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         criterion = nn.MSELoss()
+        
+        # Print regularization settings
+        print(f"Regularization settings:")
+        print(f"- Dropout probability: {self.dropout_prob}")
+        print(f"- L2 regularization (weight decay): {weight_decay}")
+        print(f"- Gradient clipping norm: {clip_grad_norm}")
         
         # Learning rate scheduler
         if scheduler_type.lower() == "plateau":
@@ -305,8 +322,13 @@ class WeatherLSTM(nn.Module):
                 outputs = self(inputs)
                 loss = criterion(outputs, targets)
                 
-                # Backward pass and optimize
+                # Backward pass
                 loss.backward()
+                
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(self.parameters(), clip_grad_norm)
+                
+                # Optimize
                 optimizer.step()
                 
                 train_loss += loss.item() * inputs.size(0)
