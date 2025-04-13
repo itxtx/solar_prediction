@@ -117,7 +117,7 @@ class WeatherLSTM(nn.Module):
         }
         
         # Store log transform info
-        self.log_transform_info = None
+        self.transform_info = None
         
     def forward(self, x):
         # Initialize hidden state with zeros
@@ -369,7 +369,7 @@ class WeatherLSTM(nn.Module):
         
         return self
     
-    def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, log_transform_info=None):
+    def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, transform_info=None):
         """
         Evaluate the model on test data
         """
@@ -416,13 +416,33 @@ class WeatherLSTM(nn.Module):
         
         # If we have a scaler, calculate metrics on the original scale
         if target_scaler is not None:
-            # Inverse transform the predictions and actuals
-            if log_transform_info and log_transform_info['applied']:
+            # Check for log transform
+            log_transform_applied = False
+            log_epsilon = 0
+            
+            # Use transform_info from instance if not provided
+            if transform_info is None and hasattr(self, 'transform_info'):
+                transform_info = self.transform_info
+            elif transform_info is None and hasattr(self, 'log_transform_info'):
+                # For backward compatibility
+                log_transform_info = self.log_transform_info
+                if log_transform_info and log_transform_info.get('applied', False):
+                    log_transform_applied = True
+                    log_epsilon = log_transform_info.get('epsilon', 0)
+                    
+            # Extract log transform info if available in the new format
+            if transform_info and 'transforms' in transform_info:
+                for transform in transform_info['transforms']:
+                    if transform.get('applied', False) and ('type' in transform and transform['type'] == 'log'):
+                        log_transform_applied = True
+                        log_epsilon = transform.get('epsilon', 0)
+                    
+            # Inverse transform based on transforms applied
+            if log_transform_applied:
                 # For log-transformed data, first inverse scale, then inverse log
-                epsilon = log_transform_info['epsilon']
-                predictions_orig = np.exp(target_scaler.inverse_transform(predictions)) - epsilon
-                actuals_orig = np.exp(target_scaler.inverse_transform(actuals)) - epsilon
-                print(f"Applied inverse log transform with epsilon={epsilon}")
+                print(f"Applying inverse log transform with epsilon={log_epsilon}")
+                predictions_orig = np.exp(target_scaler.inverse_transform(predictions)) - log_epsilon
+                actuals_orig = np.exp(target_scaler.inverse_transform(actuals)) - log_epsilon
             else:
                 # Just inverse scale
                 predictions_orig = target_scaler.inverse_transform(predictions)
