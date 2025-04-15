@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from scipy.stats import multivariate_normal
+from sklearn.decomposition import PCA
 
 class SolarTDMC:
     """
@@ -13,7 +14,7 @@ class SolarTDMC:
     This is a specialized Hidden Markov Model with time-dependent transition probabilities.
     """
     
-    def __init__(self, n_states=4, n_emissions=2, time_slices=24):
+    def __init__(self, n_states=4, n_emissions=None, time_slices=24, n_components=None):
         """
         Initialize the TDMC model.
         
@@ -21,14 +22,22 @@ class SolarTDMC:
         -----------
         n_states : int
             Number of hidden states in the model
-        n_emissions : int
+        n_emissions : int or None
             Number of observable emission variables (e.g., irradiance, temperature)
+            If None, will be determined from the data during fit()
         time_slices : int
             Number of time slices for the day (e.g., 24 for hourly)
+        n_components : int or None
+            Number of PCA components to use. If None, will use enough components
+            to explain 95% of the variance.
         """
         self.n_states = n_states
         self.n_emissions = n_emissions
         self.time_slices = time_slices
+        self.n_components = n_components
+        
+        # Initialize PCA
+        self.pca = PCA(n_components=n_components)
         
         # Initialize time-dependent transition matrices (one for each time slice)
         self.transitions = np.zeros((time_slices, n_states, n_states))
@@ -37,16 +46,12 @@ class SolarTDMC:
             self.transitions[t] = np.ones((n_states, n_states)) / n_states
         
         # Initialize emission parameters (means and covariances for each state)
-        self.emission_means = np.zeros((n_states, n_emissions))
-        self.emission_covars = np.zeros((n_states, n_emissions, n_emissions))
-        for s in range(n_states):
-            self.emission_covars[s] = np.eye(n_emissions)
+        # These will be properly initialized in fit() when we know n_emissions
+        self.emission_means = None
+        self.emission_covars = None
         
         # Initial state distribution
         self.initial_probs = np.ones(n_states) / n_states
-        
-        # Scaling for standardizing input data
-        self.scaler = StandardScaler()
         
         # For tracking training
         self.trained = False
@@ -58,35 +63,58 @@ class SolarTDMC:
         
         Parameters:
         -----------
-        X : array-like, shape (n_samples, n_emissions)
+        X : array-like, shape (n_samples, sequence_length, n_features)
             Observable emissions data (e.g., irradiance, temperature)
         timestamps : array-like, shape (n_samples,)
-            Timestamps for each observation (used to determine time slice)
+            Timestamps for each sequence (one timestamp per sequence)
             
         Returns:
         --------
         X_scaled : array-like
-            Scaled emissions data
+            Preprocessed emissions data
         time_indices : array-like
             Time slice indices for each observation
         """
-        # Scale the data
-        if not self.trained:
-            X_scaled = self.scaler.fit_transform(X)
-        else:
-            X_scaled = self.scaler.transform(X)
+        # Reshape data for PCA
+        n_samples, sequence_length, n_features = X.shape
+        X_reshaped = X.reshape(-1, n_features)
+        
+        # Fit PCA if not already fitted
+        if not hasattr(self.pca, 'components_'):
+            self.pca.fit(X_reshaped)
+            if self.n_components is None:
+                # Find number of components that explain 95% of variance
+                cumsum = np.cumsum(self.pca.explained_variance_ratio_)
+                self.n_components = np.argmax(cumsum >= 0.95) + 1
+                print(f"Using {self.n_components} PCA components (explains {cumsum[self.n_components-1]:.2%} of variance)")
+        
+        # Transform data
+        X_transformed = self.pca.transform(X_reshaped)
+        X_scaled = X_transformed.reshape(n_samples, sequence_length, -1)
         
         # Process timestamps into time slice indices
         if timestamps is not None:
-            # Convert timestamps to hours and map to time slices
+            # Convert timestamps to numpy array if not already
+            timestamps = np.array(timestamps)
+            
+            # Validate timestamp dimensions
+            assert timestamps.ndim == 1, f"Timestamps must be 1D, got {timestamps.ndim}D"
+            assert len(timestamps) == n_samples, f"Timestamps length ({len(timestamps)}) must match number of samples ({n_samples})"
+            
+            # Convert timestamps to hours
             if isinstance(timestamps[0], (pd.Timestamp, np.datetime64)):
-                time_indices = np.array([ts.hour for ts in pd.DatetimeIndex(timestamps)])
+                # Convert to hours and repeat for sequence length
+                hours = np.array([ts.hour for ts in timestamps])
             else:
                 # Assume timestamps are already hour indicators (0-23)
-                time_indices = np.array(timestamps)
+                hours = timestamps
+            
+            # Create time indices by repeating hours for sequence length
+            time_indices = np.repeat(hours[:, np.newaxis], sequence_length, axis=1)
+            
         else:
             # Default to time slice 0 for all observations if no timestamps provided
-            time_indices = np.zeros(len(X), dtype=int)
+            time_indices = np.zeros((n_samples, sequence_length), dtype=int)
             
         return X_scaled, time_indices
     
@@ -131,13 +159,42 @@ class SolarTDMC:
     
     def _initialize_parameters(self, X_scaled, time_indices):
         """Initialize model parameters using clustering."""
+        print(f"Input data shape: {X_scaled.shape}")
+        
+        # If n_emissions wasn't specified, determine it from the data
+        if self.n_emissions is None:
+            self.n_emissions = X_scaled.shape[-1]
+            print(f"Setting n_emissions to: {self.n_emissions}")
+            
+        # Initialize emission parameters with correct dimensions
+        self.emission_means = np.zeros((self.n_states, self.n_emissions))
+        self.emission_covars = np.zeros((self.n_states, self.n_emissions, self.n_emissions))
+        print(f"Initialized emission_means shape: {self.emission_means.shape}")
+        print(f"Initialized emission_covars shape: {self.emission_covars.shape}")
+        
+        # Reshape 3D sequence data into 2D for clustering
+        # X_scaled shape: (n_sequences, sequence_length, n_features)
+        n_sequences, sequence_length, n_features = X_scaled.shape
+        print(f"n_sequences: {n_sequences}, sequence_length: {sequence_length}, n_features: {n_features}")
+        
+        X_reshaped = X_scaled.reshape(-1, n_features)  # Flatten sequences
+        print(f"Reshaped data shape: {X_reshaped.shape}")
+        
         # Use K-means to initialize state assignments
         kmeans = KMeans(n_clusters=self.n_states, random_state=42)
-        state_assignments = kmeans.fit_predict(X_scaled)
+        state_assignments = kmeans.fit_predict(X_reshaped)
+        print(f"State assignments shape: {state_assignments.shape}")
+        
+        # Reshape state assignments back to match sequences
+        state_assignments = state_assignments.reshape(n_sequences, sequence_length)
+        print(f"Reshaped state assignments shape: {state_assignments.shape}")
         
         # Initialize emission parameters based on clusters
         for s in range(self.n_states):
-            state_data = X_scaled[state_assignments == s]
+            # Get all observations assigned to this state
+            state_data = X_reshaped[state_assignments.flatten() == s]
+            print(f"State {s} data shape: {state_data.shape}")
+            
             if len(state_data) > 0:
                 self.emission_means[s] = np.mean(state_data, axis=0)
                 # Add stronger regularization to ensure non-singular covariance
@@ -149,8 +206,8 @@ class SolarTDMC:
                 self.emission_covars[s] = cov + 1e-3 * np.eye(self.n_emissions)
             else:
                 # If no data for this state, use global statistics
-                self.emission_means[s] = np.mean(X_scaled, axis=0)
-                self.emission_covars[s] = np.cov(X_scaled.T) + 1e-3 * np.eye(self.n_emissions)
+                self.emission_means[s] = np.mean(X_reshaped, axis=0)
+                self.emission_covars[s] = np.cov(X_reshaped.T) + 1e-3 * np.eye(self.n_emissions)
         
         # Initialize time-dependent transition matrices with small uniform prior
         self.transitions = np.ones((self.time_slices, self.n_states, self.n_states)) / self.n_states
@@ -183,51 +240,59 @@ class SolarTDMC:
     def _forward_backward(self, X_scaled, time_indices):
         """Perform forward-backward algorithm for the TDMC."""
         n_samples = len(X_scaled)
+        sequence_length = X_scaled.shape[1]
+        
+        # Initialize emission probabilities
+        emission_probs = np.zeros((n_samples, sequence_length, self.n_states))
         
         # Compute emission probabilities for all observations and states
-        emission_probs = np.zeros((n_samples, self.n_states))
         for s in range(self.n_states):
             try:
                 mvn = multivariate_normal(
                     mean=self.emission_means[s],
                     cov=self.emission_covars[s]
                 )
-                emission_probs[:, s] = mvn.pdf(X_scaled)
+                # Calculate probabilities for each time step in each sequence
+                for t in range(sequence_length):
+                    emission_probs[:, t, s] = mvn.pdf(X_scaled[:, t, :])
             except:
                 # If multivariate normal fails, use a simple Gaussian approximation
-                emission_probs[:, s] = np.exp(-0.5 * np.sum(
-                    (X_scaled - self.emission_means[s])**2, axis=1
-                ))
+                for t in range(sequence_length):
+                    emission_probs[:, t, s] = np.exp(-0.5 * np.sum(
+                        (X_scaled[:, t, :] - self.emission_means[s])**2, axis=1
+                    ))
         
         # Add small constant to avoid numerical underflow
         emission_probs = np.maximum(emission_probs, 1e-300)
         
         # Initialize forward and backward variables
-        alpha = np.zeros((n_samples, self.n_states))
-        beta = np.zeros((n_samples, self.n_states))
-        scale = np.zeros(n_samples)
+        alpha = np.zeros((n_samples, sequence_length, self.n_states))
+        beta = np.zeros((n_samples, sequence_length, self.n_states))
+        scale = np.zeros((n_samples, sequence_length))
         
         # Forward pass with scaling
-        alpha[0] = self.initial_probs * emission_probs[0]
-        scale[0] = np.sum(alpha[0])
-        alpha[0] /= scale[0]
+        alpha[:, 0] = self.initial_probs * emission_probs[:, 0]
+        scale[:, 0] = np.sum(alpha[:, 0], axis=1)
+        alpha[:, 0] = (alpha[:, 0].T / scale[:, 0]).T
         
-        for t in range(1, n_samples):
+        for t in range(1, sequence_length):
             for s2 in range(self.n_states):
-                alpha[t, s2] = np.sum(
-                    alpha[t-1] * self.transitions[time_indices[t-1], :, s2]
-                ) * emission_probs[t, s2]
-            scale[t] = np.sum(alpha[t])
-            alpha[t] /= scale[t]
+                alpha[:, t, s2] = np.sum(
+                    alpha[:, t-1] * self.transitions[time_indices[:, t-1], :, s2],
+                    axis=1
+                ) * emission_probs[:, t, s2]
+            scale[:, t] = np.sum(alpha[:, t], axis=1)
+            alpha[:, t] = (alpha[:, t].T / scale[:, t]).T
         
         # Backward pass with scaling
-        beta[-1] = 1.0
-        for t in range(n_samples-2, -1, -1):
+        beta[:, -1] = 1.0
+        for t in range(sequence_length-2, -1, -1):
             for s1 in range(self.n_states):
-                beta[t, s1] = np.sum(
-                    beta[t+1] * self.transitions[time_indices[t], s1, :] * emission_probs[t+1]
+                beta[:, t, s1] = np.sum(
+                    beta[:, t+1] * self.transitions[time_indices[:, t], s1, :] * emission_probs[:, t+1],
+                    axis=1
                 )
-            beta[t] /= scale[t+1]
+            beta[:, t] = (beta[:, t].T / scale[:, t+1]).T
         
         return alpha, beta, scale, emission_probs
     
@@ -248,18 +313,18 @@ class SolarTDMC:
             prev_log_likelihood = log_likelihood
             
             # M-step: Update parameters
-            n_samples = len(X_scaled)
+            n_samples, sequence_length = X_scaled.shape[:2]
             
             # Update initial state distribution
             gamma = alpha * beta
-            self.initial_probs = gamma[0] / np.sum(gamma[0])
+            self.initial_probs = gamma[:, 0].sum(axis=0) / np.sum(gamma[:, 0])
             
             # Update transition matrices
             for t in range(self.time_slices):
                 # Get indices where time_indices equals t, but exclude the last element
                 # since we need to look ahead one step
-                time_slice_indices = np.where(time_indices[:-1] == t)[0]
-                if len(time_slice_indices) == 0:
+                time_slice_mask = (time_indices[:, :-1] == t)
+                if np.sum(time_slice_mask) == 0:
                     continue
                     
                 # Compute xi for this time slice
@@ -268,10 +333,10 @@ class SolarTDMC:
                     for s2 in range(self.n_states):
                         # Use the valid indices to compute xi
                         xi[s1, s2] = np.sum(
-                            alpha[time_slice_indices, s1] * 
+                            alpha[:, :-1, s1][time_slice_mask] * 
                             self.transitions[t, s1, s2] * 
-                            emission_probs[time_slice_indices + 1, s2] * 
-                            beta[time_slice_indices + 1, s2]
+                            emission_probs[:, 1:, s2][time_slice_mask] * 
+                            beta[:, 1:, s2][time_slice_mask]
                         )
                 
                 # Update transitions with smoothing
@@ -281,15 +346,23 @@ class SolarTDMC:
             
             # Update emission parameters
             for s in range(self.n_states):
-                gamma_s = gamma[:, s]
+                gamma_s = gamma[:, :, s]
                 gamma_s = np.maximum(gamma_s, 1e-300)  # Avoid numerical issues
                 
                 # Update mean
-                self.emission_means[s] = np.sum(gamma_s[:, np.newaxis] * X_scaled, axis=0) / np.sum(gamma_s)
+                self.emission_means[s] = np.sum(
+                    gamma_s[:, :, np.newaxis] * X_scaled, 
+                    axis=(0, 1)
+                ) / np.sum(gamma_s)
                 
                 # Update covariance with regularization
                 diff = X_scaled - self.emission_means[s]
-                cov = np.dot(gamma_s * diff.T, diff) / np.sum(gamma_s)
+                cov = np.sum(
+                    gamma_s[:, :, np.newaxis, np.newaxis] * 
+                    np.einsum('...i,...j->...ij', diff, diff),
+                    axis=(0, 1)
+                ) / np.sum(gamma_s)
+                
                 # Ensure positive definiteness
                 min_eig = np.min(np.real(np.linalg.eigvals(cov)))
                 if min_eig < 0:
@@ -424,7 +497,7 @@ class SolarTDMC:
             raise ValueError("Model not trained yet")
         
         # Determine current state
-        X_last_scaled = self.scaler.transform(X_last.reshape(1, -1))
+        X_last_scaled = self._preprocess_data(X_last.reshape(1, -1))[0]
         
         # Calculate emission probabilities for current state
         state_probs = np.zeros(self.n_states)
@@ -487,18 +560,6 @@ class SolarTDMC:
             forecast_std = np.sqrt(forecast_var)
             confidence_lower[step] = forecasts[step] - 1.96 * forecast_std
             confidence_upper[step] = forecasts[step] + 1.96 * forecast_std
-        
-        # Inverse transform to original scale using the new method
-        transform_info = {
-            'transforms': [
-                {'type': 'scale', 'applied': True}
-            ],
-            'target_col_original': -1  # Use all columns
-        }
-        
-        forecasts = self._inverse_transform_target(forecasts, self.scaler, transform_info)
-        confidence_lower = self._inverse_transform_target(confidence_lower, self.scaler, transform_info)
-        confidence_upper = self._inverse_transform_target(confidence_upper, self.scaler, transform_info)
         
         return forecasts, (confidence_lower, confidence_upper)
     
@@ -663,3 +724,365 @@ class SolarTDMC:
         model.trained = model_data['trained']
         
         return model
+
+    def plot_state_characteristics(self):
+        """
+        Visualize the characteristics of each hidden state.
+        """
+        if not self.trained:
+            raise ValueError("Model not trained yet")
+        
+        # Get state info
+        state_info = self.get_state_characteristics()
+        
+        # Prepare data for plotting
+        state_names = list(state_info.keys())
+        n_states = len(state_names)
+        n_emissions = self.n_emissions
+        
+        # Only plot if we have 1 or 2 emissions
+        if n_emissions > 2:
+            print("Cannot visualize state characteristics for more than 2 emission variables.")
+            return None
+        
+        if n_emissions == 1:
+            # For 1D emissions, plot means as bar chart
+            plt.figure(figsize=(10, 6))
+            emission_means = [state_info[state]['mean_emissions'][0] for state in state_names]
+            
+            plt.bar(state_names, emission_means)
+            plt.title('Average Radiation by State')
+            plt.xlabel('State')
+            plt.ylabel('Radiation (W/m²)')
+            plt.grid(True, axis='y', alpha=0.3)
+            
+        else:  # 2D emissions
+            # For 2D emissions, create scatter plot
+            plt.figure(figsize=(10, 8))
+            
+            x_vals = [state_info[state]['mean_emissions'][0] for state in state_names]
+            y_vals = [state_info[state]['mean_emissions'][1] for state in state_names]
+            
+            plt.scatter(x_vals, y_vals, s=200, c=range(n_states), cmap='viridis')
+            
+            # Add state labels
+            for i, state in enumerate(state_names):
+                plt.annotate(
+                    state, 
+                    (x_vals[i], y_vals[i]),
+                    xytext=(5, 5),
+                    textcoords='offset points',
+                    fontsize=12
+                )
+            
+            plt.title('State Characteristics')
+            plt.xlabel('Radiation (W/m²)')
+            plt.ylabel('Temperature (°C)')
+            plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return plt.gcf()
+
+    def plot_forecast_horizon_accuracy(self, X_test, y_test, timestamps_test, horizons=[1, 3, 6, 12, 24]):
+        """
+        Plot prediction accuracy across different forecast horizons.
+        
+        Parameters:
+        -----------
+        X_test : array-like
+            Test feature data
+        y_test : array-like
+            Test target values
+        timestamps_test : array-like
+            Test timestamps
+        horizons : list of int
+            Forecast horizons to evaluate (in hours)
+        """
+        rmse_values = []
+        
+        for horizon in horizons:
+            predictions = []
+            actuals = []
+            
+            # Make predictions at each horizon
+            for i in range(len(X_test) - horizon):
+                # Get current features and timestamp
+                current_X = X_test[i]
+                current_time = timestamps_test[i]
+                
+                # Forecast
+                forecast, _ = self.forecast(
+                    current_X, 
+                    current_time, 
+                    forecast_horizon=horizon
+                )
+                
+                # Get the forecast at exactly the specified horizon
+                predictions.append(forecast[horizon-1][0])  # First feature (radiation)
+                
+                # Get actual value at that horizon
+                actuals.append(y_test[i + horizon])
+            
+            # Calculate RMSE
+            rmse = np.sqrt(np.mean((np.array(actuals) - np.array(predictions))**2))
+            rmse_values.append(rmse)
+        
+        # Plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(horizons, rmse_values, 'bo-', linewidth=2)
+        plt.title('Forecast Accuracy vs. Horizon')
+        plt.xlabel('Forecast Horizon (hours)')
+        plt.ylabel('RMSE')
+        plt.grid(True, alpha=0.3)
+        plt.xticks(horizons)
+        
+        return plt.gcf()
+
+    def plot_transition_heatmaps(self, hours=None):
+        """
+        Create heatmaps of state transition probabilities for specified hours.
+        
+        Parameters:
+        -----------
+        hours : list of int, optional
+            Specific hours to visualize (e.g., [8, 12, 16, 20])
+            If None, uses [6, 12, 18, 0] (morning, noon, evening, midnight)
+        """
+        if not self.trained:
+            raise ValueError("Model not trained yet")
+            
+        if hours is None:
+            hours = [6, 12, 18, 0]  # Default key times of day
+        
+        n_hours = len(hours)
+        fig, axes = plt.subplots(1, n_hours, figsize=(5*n_hours, 4))
+        
+        for i, hour in enumerate(hours):
+            ax = axes[i] if n_hours > 1 else axes
+            
+            # Create heatmap
+            im = ax.imshow(self.transitions[hour], cmap='Blues', vmin=0, vmax=1)
+            
+            # Add probability values as text
+            for s1 in range(self.n_states):
+                for s2 in range(self.n_states):
+                    text = ax.text(s2, s1, f"{self.transitions[hour, s1, s2]:.2f}",
+                                  ha="center", va="center",
+                                  color="white" if self.transitions[hour, s1, s2] > 0.5 else "black")
+            
+            # Labels
+            ax.set_title(f"Hour {hour}")
+            ax.set_xticks(range(self.n_states))
+            ax.set_yticks(range(self.n_states))
+            ax.set_xticklabels(self.state_names)
+            ax.set_yticklabels(self.state_names)
+            
+            if i == 0:
+                ax.set_ylabel("From State")
+            if i == n_hours // 2:
+                ax.set_xlabel("To State")
+        
+        # Add colorbar
+        fig.subplots_adjust(right=0.9)
+        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        fig.colorbar(im, cax=cbar_ax)
+        
+        fig.suptitle("State Transition Probabilities by Hour", fontsize=16, y=1.05)
+        plt.tight_layout()
+        
+        return fig
+
+    def plot_hidden_states(self, X_sample, timestamps=None):
+        """
+        Visualize the hidden states predicted by the TDMC model.
+        
+        Parameters:
+        -----------
+        X_sample : array-like
+            Sample feature data
+        timestamps : array-like, optional
+            Corresponding timestamps
+        """
+        if not self.trained:
+            raise ValueError("Model not trained yet")
+            
+        # Predict hidden states
+        states = self.predict_states(X_sample, timestamps)
+        
+        # Extract radiation values (assuming first column is radiation)
+        radiation = X_sample[:, 0]  
+        
+        # Create plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+        
+        # Plot radiation data
+        if timestamps is not None:
+            ax1.plot(timestamps, radiation, 'b-')
+            ax2.scatter(timestamps, states, c=states, cmap='viridis', s=30)
+        else:
+            ax1.plot(radiation, 'b-')
+            ax2.scatter(range(len(states)), states, c=states, cmap='viridis', s=30)
+        
+        # Labels and formatting
+        ax1.set_title('Solar Irradiance')
+        ax1.set_ylabel('Radiation (W/m²)')
+        ax1.grid(True, alpha=0.3)
+        
+        ax2.set_title('Predicted Hidden States')
+        ax2.set_ylabel('State')
+        ax2.set_yticks(range(self.n_states))
+        ax2.set_yticklabels(self.state_names)
+        ax2.grid(True, alpha=0.3)
+        
+        if timestamps is not None:
+            fig.autofmt_xdate()
+        
+        plt.tight_layout()
+        return fig
+
+    def plot_prediction_vs_actual(self, y_true, y_pred, timestamps=None, confidence_intervals=None, title="Solar Irradiance Prediction"):
+        """
+        Plot predicted vs actual solar irradiance values.
+        
+        Parameters:
+        -----------
+        y_true : array-like
+            Actual observed irradiance values
+        y_pred : array-like
+            Predicted irradiance values from the model
+        timestamps : array-like, optional
+            Timestamps for x-axis (if available)
+        confidence_intervals : tuple of (lower, upper), optional
+            Lower and upper bounds of prediction confidence intervals
+        title : str
+            Plot title
+        """
+        plt.figure(figsize=(15, 6))
+        
+        # Plot with timestamps if available
+        if timestamps is not None:
+            plt.plot(timestamps, y_true, 'b-', label='Actual Irradiance', alpha=0.7)
+            plt.plot(timestamps, y_pred, 'r-', label='Predicted Irradiance', alpha=0.7)
+            
+            # Add confidence intervals if available
+            if confidence_intervals is not None:
+                lower_bound, upper_bound = confidence_intervals
+                plt.fill_between(timestamps, lower_bound, upper_bound, 
+                                color='r', alpha=0.2, label='95% Confidence Interval')
+            
+            plt.gcf().autofmt_xdate()  # Rotate date labels
+        else:
+            # Plot with simple indices
+            plt.plot(y_true, 'b-', label='Actual Irradiance', alpha=0.7)
+            plt.plot(y_pred, 'r-', label='Predicted Irradiance', alpha=0.7)
+            
+            # Add confidence intervals if available
+            if confidence_intervals is not None:
+                lower_bound, upper_bound = confidence_intervals
+                plt.fill_between(range(len(y_true)), lower_bound, upper_bound, 
+                                color='r', alpha=0.2, label='95% Confidence Interval')
+        
+        plt.title(title)
+        plt.xlabel('Time' if timestamps is not None else 'Sample Index')
+        plt.ylabel('Solar Irradiance (W/m²)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        # Calculate error metrics
+        mse = np.mean((y_true - y_pred)**2)
+        rmse = np.sqrt(mse)
+        mae = np.mean(np.abs(y_true - y_pred))
+        
+        # Calculate normalized metrics for non-zero actual values
+        non_zero_mask = y_true > 0
+        if np.sum(non_zero_mask) > 0:
+            nrmse = rmse / np.mean(y_true[non_zero_mask])
+            mape = np.mean(np.abs((y_true[non_zero_mask] - y_pred[non_zero_mask]) / 
+                                  y_true[non_zero_mask])) * 100
+        else:
+            nrmse = np.nan
+            mape = np.nan
+        
+        print(f"MSE: {mse:.2f}")
+        print(f"RMSE: {rmse:.2f}")
+        print(f"MAE: {mae:.2f}")
+        print(f"NRMSE: {nrmse:.2f}")
+        print(f"MAPE: {mape:.2f}%")
+        
+        return plt.gcf()
+
+    def plot_transition_matrix(self, time_idx=None, figsize=(10, 8)):
+        """
+        Plot the transition matrix for a specific time slice or all time slices.
+        
+        Parameters:
+        -----------
+        time_idx : int or None
+            If None, plot all transition matrices in a grid.
+            If int, plot the transition matrix for that specific time slice.
+        figsize : tuple
+            Figure size for the plot.
+        """
+        if not self.trained:
+            raise ValueError("Model not trained yet")
+            
+        if time_idx is not None:
+            if not 0 <= time_idx < self.time_slices:
+                raise ValueError(f"time_idx must be between 0 and {self.time_slices-1}")
+            
+            plt.figure(figsize=figsize)
+            plt.imshow(self.transitions[time_idx], cmap='viridis', aspect='auto')
+            plt.colorbar(label='Transition Probability')
+            plt.title(f'Transition Matrix for Time Slice {time_idx}')
+            plt.xlabel('Next State')
+            plt.ylabel('Current State')
+            plt.show()
+        else:
+            # Plot all transition matrices in a grid
+            n_cols = min(4, self.time_slices)
+            n_rows = (self.time_slices + n_cols - 1) // n_cols
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(figsize[0], figsize[1] * n_rows / n_cols))
+            axes = axes.flatten()
+            
+            for i in range(self.time_slices):
+                im = axes[i].imshow(self.transitions[i], cmap='viridis', aspect='auto')
+                axes[i].set_title(f'Time Slice {i}')
+                axes[i].set_xlabel('Next State')
+                axes[i].set_ylabel('Current State')
+            
+            # Remove empty subplots
+            for i in range(self.time_slices, len(axes)):
+                fig.delaxes(axes[i])
+            
+            # Add colorbar
+            fig.colorbar(im, ax=axes, label='Transition Probability')
+            plt.tight_layout()
+            plt.show()
+
+    def inverse_transform(self, X_transformed):
+        """
+        Transform PCA-reduced data back to original feature space.
+        
+        Parameters:
+        -----------
+        X_transformed : array-like
+            Data in PCA space
+            
+        Returns:
+        --------
+        X_original : array-like
+            Data in original feature space
+        """
+        if not hasattr(self.pca, 'components_'):
+            raise ValueError("PCA has not been fitted yet")
+            
+        # Reshape if necessary
+        if len(X_transformed.shape) == 3:
+            n_samples, sequence_length, n_components = X_transformed.shape
+            X_reshaped = X_transformed.reshape(-1, n_components)
+            X_original = self.pca.inverse_transform(X_reshaped)
+            return X_original.reshape(n_samples, sequence_length, -1)
+        else:
+            return self.pca.inverse_transform(X_transformed)

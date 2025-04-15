@@ -8,6 +8,41 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import mean_squared_error
 import math
+from datetime import datetime
+
+def extract_timestamps(df):
+    """
+    Extract proper datetime timestamps from the dataset.
+    
+    Parameters:
+    -----------
+    df : pandas DataFrame
+        Your weather data with UNIXTime, Data, and Time columns
+        
+    Returns:
+    --------
+    timestamps : pandas Series
+        Proper datetime objects for each row
+    """
+    # Method 1: If you have UNIXTime column (most reliable)
+    if 'UNIXTime' in df.columns:
+        timestamps = pd.to_datetime(df['UNIXTime'], unit='s')
+        return timestamps
+    
+    # Method 2: If you have separate Date and Time columns
+    elif 'Data' in df.columns and 'Time' in df.columns:
+        # Combine date and time
+        datetime_strings = df['Data'] + ' ' + df['Time']
+        timestamps = pd.to_datetime(datetime_strings, format='%m/%d/%Y %H:%M:%S')
+        return timestamps
+    
+    # Method 3: Fallback - create artificial timestamps based on row indices
+    else:
+        print("Warning: No proper timestamp columns found. Creating artificial timestamps.")
+        base_time = datetime(2023, 1, 1)  # Use a default date
+        # Assuming 5-minute intervals based on your sample data
+        timestamps = [base_time + pd.Timedelta(minutes=5*i) for i in range(len(df))]
+        return pd.Series(timestamps)
 
 def create_solar_elevation_proxy(time_str, sunrise_str, sunset_str):
     """Creates a continuous feature representing approximate solar elevation
@@ -99,11 +134,20 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         feature_selection_mode: 'all', 'basic', or 'minimal' for different feature set sizes
         
     Returns:
-        X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, log_transform_info
+        X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, log_transform_info, timestamps
     """
-    # Sort by UNIXTime (ascending) to ensure chronological order
-    if 'UNIXTime' in df.columns:
-        df = df.sort_values('UNIXTime')
+    # Extract timestamps first
+    timestamps = extract_timestamps(df)
+    
+    # Add timestamps as a column to the dataframe for sorting
+    df['Timestamp'] = timestamps
+    
+    # Sort by timestamps to ensure chronological order
+    df = df.sort_values('Timestamp')
+    timestamps = df['Timestamp']
+    
+    # Remove the temporary Timestamp column
+    df = df.drop('Timestamp', axis=1)
     
     # Process time features
     
@@ -324,24 +368,29 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
     
     # Create sequences
     X, y = [], []
+    timestamps_for_predictions = []
+    
     for i in range(len(scaled_data) - window_size):
         # Use all features for input X
         X.append(scaled_data.iloc[i:i+window_size][feature_cols].values)
         # Use only target column for output y
         y.append(scaled_data[target_col_actual].iloc[i+window_size])
+        # Store timestamp for the prediction point
+        timestamps_for_predictions.append(timestamps.iloc[i+window_size])
     
     X = np.array(X)
     y = np.array(y).reshape(-1, 1)
+    timestamps_for_predictions = np.array(timestamps_for_predictions)
     
     # Split into train, validation, and test sets (maintaining temporal order)
     # First split into train+val and test
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=test_size, shuffle=False
+    X_temp, X_test, y_temp, y_test, timestamps_temp, timestamps_test = train_test_split(
+        X, y, timestamps_for_predictions, test_size=test_size, shuffle=False
     )
     
     # Then split train+val into train and validation
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=val_size, shuffle=False
+    X_train, X_val, y_train, y_val, timestamps_train, timestamps_val = train_test_split(
+        X_temp, y_temp, timestamps_temp, test_size=val_size, shuffle=False
     )
     
     # Print shapes for debugging
@@ -366,4 +415,4 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
     if log_transform_info['applied']:
         combined_transform_info['transforms'].append(log_transform_info)
     
-    return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info
+    return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info, timestamps_train, timestamps_val, timestamps_test
