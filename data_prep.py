@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import mean_squared_error
 import math
 from datetime import datetime
+from sklearn.decomposition import PCA
 
 def extract_timestamps(df):
     """
@@ -416,3 +417,50 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         combined_transform_info['transforms'].append(log_transform_info)
     
     return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info, timestamps_train, timestamps_val, timestamps_test
+
+def pca_transform(X, timestamps=None, n_components=None, pca=None):
+    """
+    Transform input data using PCA.
+    
+    Parameters:
+    -----------
+    X : array-like, shape (n_samples, sequence_length, n_features)
+        Input data to transform
+    timestamps : array-like, shape (n_samples,), optional
+        Timestamps for each sequence
+    n_components : int or None, optional
+        Number of PCA components to use. If None, will use enough components
+        to explain 95% of the variance.
+    pca : sklearn.decomposition.PCA or None, optional
+        Pre-fitted PCA object. If None, a new one will be created and fitted.
+        
+    Returns:
+    --------
+    X_transformed : array-like
+        Transformed data
+    timestamps : array-like
+        Original timestamps (unchanged)
+    pca : sklearn.decomposition.PCA
+        Fitted PCA object
+    """
+    # Reshape data for PCA
+    n_samples, sequence_length, n_features = X.shape
+    X_reshaped = X.reshape(-1, n_features)
+    
+    # Create or use provided PCA
+    if pca is None:
+        pca = PCA(n_components=n_components)
+        pca.fit(X_reshaped)
+        if n_components is None:
+            # Find number of components that explain 95% of variance
+            cumsum = np.cumsum(pca.explained_variance_ratio_)
+            n_components = np.argmax(cumsum >= 0.95) + 1
+            print(f"Using {n_components} PCA components (explains {cumsum[n_components-1]:.2%} of variance)")
+            pca = PCA(n_components=n_components)
+            pca.fit(X_reshaped)
+    
+    # Transform data
+    X_transformed = pca.transform(X_reshaped)
+    X_transformed = X_transformed.reshape(n_samples, sequence_length, -1)
+    
+    return X_transformed, timestamps, pca

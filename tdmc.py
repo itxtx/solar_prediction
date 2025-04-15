@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from scipy.stats import multivariate_normal
 from sklearn.decomposition import PCA
+from data_prep import pca_transform
 
 class SolarTDMC:
     """
@@ -57,74 +58,13 @@ class SolarTDMC:
         self.trained = False
         self.state_names = [f"State_{i}" for i in range(n_states)]
     
-    def _preprocess_data(self, X, timestamps=None):
-        """
-        Preprocess input data for the model.
-        
-        Parameters:
-        -----------
-        X : array-like, shape (n_samples, sequence_length, n_features)
-            Observable emissions data (e.g., irradiance, temperature)
-        timestamps : array-like, shape (n_samples,)
-            Timestamps for each sequence (one timestamp per sequence)
-            
-        Returns:
-        --------
-        X_scaled : array-like
-            Preprocessed emissions data
-        time_indices : array-like
-            Time slice indices for each observation
-        """
-        # Reshape data for PCA
-        n_samples, sequence_length, n_features = X.shape
-        X_reshaped = X.reshape(-1, n_features)
-        
-        # Fit PCA if not already fitted
-        if not hasattr(self.pca, 'components_'):
-            self.pca.fit(X_reshaped)
-            if self.n_components is None:
-                # Find number of components that explain 95% of variance
-                cumsum = np.cumsum(self.pca.explained_variance_ratio_)
-                self.n_components = np.argmax(cumsum >= 0.95) + 1
-                print(f"Using {self.n_components} PCA components (explains {cumsum[self.n_components-1]:.2%} of variance)")
-        
-        # Transform data
-        X_transformed = self.pca.transform(X_reshaped)
-        X_scaled = X_transformed.reshape(n_samples, sequence_length, -1)
-        
-        # Process timestamps into time slice indices
-        if timestamps is not None:
-            # Convert timestamps to numpy array if not already
-            timestamps = np.array(timestamps)
-            
-            # Validate timestamp dimensions
-            assert timestamps.ndim == 1, f"Timestamps must be 1D, got {timestamps.ndim}D"
-            assert len(timestamps) == n_samples, f"Timestamps length ({len(timestamps)}) must match number of samples ({n_samples})"
-            
-            # Convert timestamps to hours
-            if isinstance(timestamps[0], (pd.Timestamp, np.datetime64)):
-                # Convert to hours and repeat for sequence length
-                hours = np.array([ts.hour for ts in timestamps])
-            else:
-                # Assume timestamps are already hour indicators (0-23)
-                hours = timestamps
-            
-            # Create time indices by repeating hours for sequence length
-            time_indices = np.repeat(hours[:, np.newaxis], sequence_length, axis=1)
-            
-        else:
-            # Default to time slice 0 for all observations if no timestamps provided
-            time_indices = np.zeros((n_samples, sequence_length), dtype=int)
-            
-        return X_scaled, time_indices
-    
     def fit(self, X, timestamps=None, max_iter=100, tol=1e-4, state_names=None):
         """
         Fit the TDMC model to data.
         
         Parameters:
         -----------
-        X : array-like, shape (n_samples, n_emissions)
+        X : array-like, shape (n_samples, sequence_length, n_features)
             Observable emissions data (e.g., irradiance, temperature)
         timestamps : array-like, shape (n_samples,)
             Timestamps for each observation
@@ -140,8 +80,21 @@ class SolarTDMC:
         self : object
             Returns self
         """
-        # Preprocess data
-        X_scaled, time_indices = self._preprocess_data(X, timestamps)
+        # Data is already transformed, just use it directly
+        X_scaled = X
+        
+        # Convert timestamps to hour values and reshape to match sequence length
+        sequence_length = X.shape[1]
+        if timestamps is not None:
+            # Convert timestamps to hour values (0-23)
+            if isinstance(timestamps[0], (pd.Timestamp, np.datetime64)):
+                hours = np.array([ts.hour for ts in timestamps])
+            else:
+                hours = timestamps
+            # Reshape to match sequence length
+            time_indices = np.repeat(hours[:, np.newaxis], sequence_length, axis=1)
+        else:
+            time_indices = np.zeros((X.shape[0], sequence_length), dtype=int)
         
         # Initialize parameters using K-means
         self._initialize_parameters(X_scaled, time_indices)
@@ -378,8 +331,8 @@ class SolarTDMC:
         if not self.trained:
             raise ValueError("Model not trained yet")
         
-        # Preprocess data
-        X_scaled, time_indices = self._preprocess_data(X, timestamps)
+        # Preprocess data using the new pca_transform function
+        X_scaled, time_indices, _ = pca_transform(X, timestamps, self.n_components, self.pca)
         n_samples = len(X_scaled)
         
         # Compute emission probabilities
@@ -415,80 +368,6 @@ class SolarTDMC:
         
         return states
     
-    def _inverse_transform_target(self, y, target_scaler, transform_info):
-        """
-        Apply inverse transformations to recover original target values
-        
-        Args:
-            y: Transformed target values
-            target_scaler: Scaler used for the target
-            transform_info: Combined transform info dictionary
-            
-        Returns:
-            Original scale target values
-        """
-        # Make a copy to avoid modifying the original
-        y_transformed = y.copy()
-        
-        # Get the list of transforms in reverse order (to undo in reverse)
-        transforms = transform_info.get('transforms', [])[::-1]
-        
-        # Apply inverse transformations in reverse order
-        for transform in transforms:
-            transform_type = transform.get('type')
-            
-            if transform_type == 'log' and transform.get('applied', False):
-                # Undo log transform
-                if transform.get('offset', 0) > 0:
-                    # If log1p was used: exp(y) - offset
-                    y_transformed = np.exp(y_transformed) - transform.get('offset')
-                else:
-                    # If simple log was used
-                    y_transformed = np.exp(y_transformed)
-                    
-            elif transform_type == 'scale' and transform.get('applied', False):
-                # No direct inverse needed as the scaler will handle this
-                pass
-        
-        # Apply inverse scaling if scaler is provided
-        if target_scaler is not None:
-            # Create dummy array with the right shape for inverse_transform
-            if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
-                y_transformed = y_transformed.squeeze(axis=1)
-                
-            # Check if we need a dummy array (if y is just the target column)
-            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
-                # Create dummy array with zeros except for target column
-                dummy = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
-                
-                # Find target column index from transform_info
-                target_col = transform_info.get('target_col_original', -1)
-                if isinstance(target_col, str) and hasattr(target_scaler, 'feature_names_in_'):
-                    # If we have column names, find the index
-                    try:
-                        target_idx = np.where(target_scaler.feature_names_in_ == target_col)[0][0]
-                    except:
-                        # Default to last column if name not found
-                        target_idx = -1
-                else:
-                    # Default to the provided index or last column
-                    target_idx = -1 if isinstance(target_col, str) else target_col
-                
-                # Place values in the correct column
-                dummy[:, target_idx] = y_transformed
-                
-                # Apply inverse transform
-                transformed_dummy = target_scaler.inverse_transform(dummy)
-                
-                # Extract target column
-                y_transformed = transformed_dummy[:, target_idx]
-            else:
-                # If scaler was fitted only on target, just inverse transform directly
-                y_transformed = target_scaler.inverse_transform(
-                    y_transformed.reshape(-1, 1)).squeeze()
-        
-        return y_transformed
-
     def forecast(self, X_last, timestamps_last, forecast_horizon, weather_forecasts=None):
         """
         Forecast future solar irradiance.
@@ -496,17 +375,34 @@ class SolarTDMC:
         if not self.trained:
             raise ValueError("Model not trained yet")
         
-        # Determine current state
-        X_last_scaled = self._preprocess_data(X_last.reshape(1, -1))[0]
+        # Handle input shape
+        if len(X_last.shape) == 3:
+            # If input is already in (n_samples, sequence_length, n_features) format
+            X_last_scaled = X_last
+        else:
+            # If input is in (sequence_length, n_features) format, add batch dimension
+            X_last_scaled = X_last.reshape(1, X_last.shape[0], X_last.shape[1])
+        
+        # Preprocess the data using the new pca_transform function
+        X_last_scaled, _, _ = pca_transform(X_last_scaled, None, self.n_components, self.pca)
+        
+        # Take the last time step for state probability calculation
+        X_last_scaled = X_last_scaled[0, -1, :]  # Shape: (n_components,)
         
         # Calculate emission probabilities for current state
         state_probs = np.zeros(self.n_states)
         for s in range(self.n_states):
-            mvn = multivariate_normal(
-                mean=self.emission_means[s],
-                cov=self.emission_covars[s]
-            )
-            state_probs[s] = mvn.pdf(X_last_scaled)
+            try:
+                mvn = multivariate_normal(
+                    mean=self.emission_means[s],
+                    cov=self.emission_covars[s]
+                )
+                state_probs[s] = mvn.pdf(X_last_scaled)
+            except:
+                # Fallback to simple Gaussian approximation
+                state_probs[s] = np.exp(-0.5 * np.sum(
+                    (X_last_scaled - self.emission_means[s])**2
+                ))
         
         current_state = np.argmax(state_probs)
         
@@ -561,7 +457,8 @@ class SolarTDMC:
             confidence_lower[step] = forecasts[step] - 1.96 * forecast_std
             confidence_upper[step] = forecasts[step] + 1.96 * forecast_std
         
-        return forecasts, (confidence_lower, confidence_upper)
+        # Return only the first emission (radiation) and its confidence intervals
+        return forecasts[:, 0], (confidence_lower[:, 0], confidence_upper[:, 0])
     
     def get_state_characteristics(self):
         """
