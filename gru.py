@@ -1101,12 +1101,14 @@ class WeatherGRU(nn.Module):
         if y_true is not None:
             if not torch.is_tensor(y_true):
                 y_true = torch.tensor(y_true, dtype=torch.float32)
-            
+                
             y_true = y_true.numpy()
             
-            # Apply inverse transformations if needed
-            if target_scaler is not None or transform_info is not None:
-                y_true = self._inverse_transform_target(y_true, target_scaler, transform_info)
+            if target_scaler is not None:
+                # Use the inverse transform method for ground truth
+                y_true = self._inverse_transform_target(
+                    y_true.squeeze(), target_scaler, transform_info
+                )
             
             ax.plot(y_true, 'r-', label='Actual', linewidth=2)
         
