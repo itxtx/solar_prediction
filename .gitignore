@@ -9,6 +9,6 @@ __pycache__/
 
 .DS_Store
 
-.pt
+*.pt
 
 n.md

@@ -45,6 +45,8 @@ class WeatherGRU(nn.Module):
             'val_loss': [],
             'train_mape': [],
             'val_mape': [],
+            'val_rmse': [],
+            'val_r2': [],
             'learning_rates': [],
             'epochs': []
         }
@@ -222,6 +224,18 @@ class WeatherGRU(nn.Module):
         best_model_state = None
         early_stop_counter = 0
         
+        # Initialize history with additional metrics
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'train_mape': [],
+            'val_mape': [],
+            'val_rmse': [],
+            'val_r2': [],
+            'learning_rates': [],
+            'epochs': []
+        }
+        
         # Train the model
         for epoch in range(epochs):
             # Training phase
@@ -262,6 +276,8 @@ class WeatherGRU(nn.Module):
             self.eval()
             val_losses = []
             val_mapes = []
+            val_outputs = []
+            val_targets = []
             
             with torch.no_grad():
                 for inputs, targets in val_loader:
@@ -278,12 +294,22 @@ class WeatherGRU(nn.Module):
                     # Calculate MAPE
                     mape = torch.mean(torch.abs((targets - outputs) / (targets + 1e-8))) * 100
                     val_mapes.append(mape.item())
+                    
+                    # Store outputs and targets for additional metrics
+                    val_outputs.append(outputs.cpu().numpy())
+                    val_targets.append(targets.cpu().numpy())
             
             # Calculate average losses and metrics
             avg_train_loss = np.mean(train_losses)
             avg_val_loss = np.mean(val_losses)
             avg_train_mape = np.mean(train_mapes)
             avg_val_mape = np.mean(val_mapes)
+            
+            # Calculate additional validation metrics
+            val_outputs = np.concatenate(val_outputs)
+            val_targets = np.concatenate(val_targets)
+            val_rmse = np.sqrt(mean_squared_error(val_targets, val_outputs))
+            val_r2 = r2_score(val_targets, val_outputs)
             
             # Update learning rate based on scheduler
             if scheduler_type == "plateau":
@@ -299,6 +325,8 @@ class WeatherGRU(nn.Module):
             self.history['val_loss'].append(avg_val_loss)
             self.history['train_mape'].append(avg_train_mape)
             self.history['val_mape'].append(avg_val_mape)
+            self.history['val_rmse'].append(val_rmse)
+            self.history['val_r2'].append(val_r2)
             self.history['learning_rates'].append(current_lr)
             self.history['epochs'].append(epoch + 1)
             
@@ -309,6 +337,8 @@ class WeatherGRU(nn.Module):
                       f'Val Loss: {avg_val_loss:.4f} | '
                       f'Train MAPE: {avg_train_mape:.2f}% | '
                       f'Val MAPE: {avg_val_mape:.2f}% | '
+                      f'Val RMSE: {val_rmse:.4f} | '
+                      f'Val R²: {val_r2:.4f} | '
                       f'LR: {current_lr:.6f}')
             
             # Check for improvement
@@ -484,8 +514,8 @@ class WeatherGRU(nn.Module):
             print("No training history available. Please train the model first.")
             return None
         
-        # Create a figure with 2x2 subplots
-        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        # Create a figure with 3x2 subplots
+        fig, axes = plt.subplots(3, 2, figsize=figsize)
         axes = axes.flatten()
         
         # 1. Plot training and validation loss
@@ -518,12 +548,55 @@ class WeatherGRU(nn.Module):
         if log_scale:
             ax.set_yscale('log')
         
-        # 2. Plot MAPE
+        # 2. Plot RMSE
         ax = axes[1]
-        ax.plot(self.history['epochs'], self.history['train_mape'], 'b-', label='Training MAPE', 
-                linewidth=2, marker='o', markersize=4)
-        ax.plot(self.history['epochs'], self.history['val_mape'], 'r-', label='Validation MAPE', 
-                linewidth=2, marker='x', markersize=6)
+        ax.plot(self.history['epochs'], self.history['val_rmse'], 'g-', label='Validation RMSE', 
+                linewidth=2, marker='s', markersize=6)
+        
+        # Find best RMSE point
+        best_rmse_idx = np.argmin(self.history['val_rmse'])
+        best_rmse_epoch = self.history['epochs'][best_rmse_idx]
+        best_rmse = self.history['val_rmse'][best_rmse_idx]
+        
+        # Highlight best RMSE
+        ax.scatter(best_rmse_epoch, best_rmse, s=150, c='purple', marker='*', 
+                  label=f'Best RMSE (Epoch {best_rmse_epoch}, RMSE {best_rmse:.6f})', zorder=10)
+        
+        # Add gray vertical line at best RMSE
+        ax.axvline(x=best_rmse_epoch, color='gray', linestyle='--', alpha=0.5)
+        
+        # Add formatting
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('RMSE', fontsize=12)
+        ax.set_title('Validation RMSE Over Time', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        
+        # 3. Plot R²
+        ax = axes[2]
+        ax.plot(self.history['epochs'], self.history['val_r2'], 'm-', label='Validation R²', 
+                linewidth=2, marker='d', markersize=6)
+        
+        # Find best R² point
+        best_r2_idx = np.argmax(self.history['val_r2'])
+        best_r2_epoch = self.history['epochs'][best_r2_idx]
+        best_r2 = self.history['val_r2'][best_r2_idx]
+        
+        # Highlight best R²
+        ax.scatter(best_r2_epoch, best_r2, s=150, c='orange', marker='*', 
+                  label=f'Best R² (Epoch {best_r2_epoch}, R² {best_r2:.6f})', zorder=10)
+        
+        # Add formatting
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('R²', fontsize=12)
+        ax.set_title('Validation R² Over Time', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='lower right')
+        
+        # 4. Plot MAPE
+        ax = axes[3]
+        ax.plot(self.history['epochs'], self.history['val_mape'], 'r-', label='Validation MAPE (%)', 
+                linewidth=2, marker='o', markersize=6)
         
         # Find best MAPE point
         best_mape_idx = np.argmin(self.history['val_mape'])
@@ -531,37 +604,55 @@ class WeatherGRU(nn.Module):
         best_mape = self.history['val_mape'][best_mape_idx]
         
         # Highlight best MAPE
-        ax.scatter(best_mape_epoch, best_mape, s=150, c='purple', marker='*', 
+        ax.scatter(best_mape_epoch, best_mape, s=150, c='brown', marker='*', 
                   label=f'Best MAPE (Epoch {best_mape_epoch}, MAPE {best_mape:.2f}%)', zorder=10)
-        
-        # Add gray vertical line at best MAPE
-        ax.axvline(x=best_mape_epoch, color='gray', linestyle='--', alpha=0.5)
         
         # Add formatting
         ax.set_xlabel('Epoch', fontsize=12)
         ax.set_ylabel('MAPE (%)', fontsize=12)
-        ax.set_title('Training and Validation MAPE Over Time', fontsize=14, fontweight='bold')
+        ax.set_title('Validation MAPE Over Time', fontsize=14, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper right')
         
-        # 3. Plot learning rate
-        ax = axes[2]
-        ax.plot(self.history['epochs'], self.history['learning_rates'], 'g-', 
-                label='Learning Rate', linewidth=2, marker='s', markersize=6)
+        # 5. Plot Learning Rate
+        ax = axes[4]
+        ax.plot(self.history['epochs'], self.history['learning_rates'], 'c-', 
+                linewidth=2, marker='d', markersize=6)
         
         # Add formatting
         ax.set_xlabel('Epoch', fontsize=12)
         ax.set_ylabel('Learning Rate', fontsize=12)
-        ax.set_title('Learning Rate Over Time', fontsize=14, fontweight='bold')
+        ax.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper right')
+        
+        # Use log scale for learning rate
         ax.set_yscale('log')
         
-        # Hide the last subplot
-        axes[3].axis('off')
+        # 6. Plot Train vs Val Loss Ratio (to detect overfitting)
+        ax = axes[5]
+        loss_ratio = [v/t for t, v in zip(self.history['train_loss'], self.history['val_loss'])]
+        ax.plot(self.history['epochs'], loss_ratio, 'm-', 
+                linewidth=2, marker='^', markersize=6)
         
-        # Adjust layout
-        plt.tight_layout()
+        # Add horizontal line at ratio=1
+        ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7)
+        
+        # Add formatting
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Val Loss / Train Loss Ratio', fontsize=12)
+        ax.set_title('Overfitting Indicator', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        
+        # Add annotation for interpretation
+        if max(loss_ratio) > 1.5:
+            ax.text(0.5, 0.9, "Ratio > 1: Potential overfitting", 
+                   transform=ax.transAxes, ha='center', 
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+        
+        # Add a title for the entire figure
+        plt.suptitle('GRU Model Training Metrics', fontsize=16, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust for the suptitle
         
         return fig
     
@@ -697,7 +788,7 @@ class WeatherGRU(nn.Module):
         return fig
     
     def predict_with_uncertainty(self, X, mc_samples=30, device="cpu", 
-                            target_scaler=None, log_transform_info=None,
+                            target_scaler=None, transform_info=None,
                             return_samples=False, alpha=0.05):
         """
         Generate predictions with uncertainty estimates using MC Dropout
@@ -707,7 +798,7 @@ class WeatherGRU(nn.Module):
             mc_samples: Number of Monte Carlo forward passes
             device: Device for computation
             target_scaler: Scaler for inverse transformation
-            log_transform_info: Info about log transformation
+            transform_info: Info about transformations applied to target
             return_samples: Whether to return all MC samples
             alpha: Significance level for confidence intervals (default 0.05 for 95% CI)
             
@@ -751,20 +842,12 @@ class WeatherGRU(nn.Module):
         # Shape: (mc_samples, batch_size, output_dim)
         all_predictions = np.stack(all_predictions, axis=0)
         
-        # If we have a target scaler, apply inverse transformation to each sample
-        if target_scaler is not None:
-            # For each MC sample
+        # Apply inverse transformations if needed
+        if target_scaler is not None or transform_info is not None:
             for i in range(mc_samples):
-                # Create dummy array with right shape for inverse_transform
-                dummy = np.zeros((all_predictions.shape[1], target_scaler.n_features_in_))
-                # Place predictions in the target column (assuming last column)
-                dummy[:, -1] = all_predictions[i, :, 0]
-                # Inverse transform
-                all_predictions[i, :, 0] = target_scaler.inverse_transform(dummy)[:, -1]
-        
-        # If log transform was applied, reverse it
-        if log_transform_info and log_transform_info.get('applied', False):
-            all_predictions = np.exp(all_predictions)
+                all_predictions[i, :, 0] = self._inverse_transform_target(
+                    all_predictions[i, :, 0], target_scaler, transform_info
+                )
         
         # Calculate statistics across MC samples
         # Mean prediction for each input example
@@ -795,7 +878,7 @@ class WeatherGRU(nn.Module):
         return uncertainty_dict
 
     def plot_prediction_with_uncertainty(self, X, y_true=None, mc_samples=30, 
-                                    target_scaler=None, log_transform_info=None,
+                                    target_scaler=None, transform_info=None,
                                     figsize=(12, 8), device="cpu", alpha=0.05,
                                     indices=None, max_samples=5):
         """
@@ -806,7 +889,7 @@ class WeatherGRU(nn.Module):
             y_true: Ground truth values (optional)
             mc_samples: Number of Monte Carlo samples
             target_scaler: Scaler for inverse transformation
-            log_transform_info: Info about log transformation
+            transform_info: Info about transformations applied to target
             figsize: Figure size
             device: Computation device
             alpha: Significance level for confidence intervals
@@ -819,7 +902,7 @@ class WeatherGRU(nn.Module):
         # Get predictions with uncertainty
         uncertainty = self.predict_with_uncertainty(
             X, mc_samples=mc_samples, device=device,
-            target_scaler=target_scaler, log_transform_info=log_transform_info,
+            target_scaler=target_scaler, transform_info=transform_info,
             return_samples=True, alpha=alpha
         )
         
@@ -838,16 +921,9 @@ class WeatherGRU(nn.Module):
                 
             y_true = y_true.numpy()
             
-            if target_scaler is not None:
-                # Create dummy array with right shape
-                dummy = np.zeros((y_true.shape[0], target_scaler.n_features_in_))
-                # Place ground truth in target column
-                dummy[:, -1] = y_true.squeeze()
-                # Inverse transform
-                y_true = target_scaler.inverse_transform(dummy)[:, -1]
-                
-            if log_transform_info and log_transform_info.get('applied', False):
-                y_true = np.exp(y_true)
+            # Apply inverse transformations to ground truth if needed
+            if target_scaler is not None or transform_info is not None:
+                y_true = self._inverse_transform_target(y_true, target_scaler, transform_info)
         
         # Create figure
         fig, axs = plt.subplots(n_samples, 1, figsize=figsize, squeeze=False)

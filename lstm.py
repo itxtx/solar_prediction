@@ -781,7 +781,7 @@ class WeatherLSTM(nn.Module):
         return model
     
     def predict_with_uncertainty(self, X, mc_samples=30, device="cpu", 
-                            target_scaler=None, log_transform_info=None,
+                            target_scaler=None, transform_info=None,
                             return_samples=False, alpha=0.05):
         """
         Generate predictions with uncertainty estimates using MC Dropout
@@ -791,7 +791,7 @@ class WeatherLSTM(nn.Module):
             mc_samples: Number of Monte Carlo forward passes
             device: Device for computation
             target_scaler: Scaler for inverse transformation
-            log_transform_info: Info about log transformation
+            transform_info: Info about transformations applied to the target
             return_samples: Whether to return all MC samples
             alpha: Significance level for confidence intervals (default 0.05 for 95% CI)
             
@@ -839,16 +839,10 @@ class WeatherLSTM(nn.Module):
         if target_scaler is not None:
             # For each MC sample
             for i in range(mc_samples):
-                # Create dummy array with right shape for inverse_transform
-                dummy = np.zeros((all_predictions.shape[1], target_scaler.n_features_in_))
-                # Place predictions in the target column (assuming last column)
-                dummy[:, -1] = all_predictions[i, :, 0]
-                # Inverse transform
-                all_predictions[i, :, 0] = target_scaler.inverse_transform(dummy)[:, -1]
-        
-        # If log transform was applied, reverse it
-        if log_transform_info and log_transform_info.get('applied', False):
-            all_predictions = np.exp(all_predictions)
+                # Use the inverse transform method
+                all_predictions[i, :, 0] = self._inverse_transform_target(
+                    all_predictions[i, :, 0], target_scaler, transform_info
+                )
         
         # Calculate statistics across MC samples
         # Mean prediction for each input example
@@ -879,7 +873,7 @@ class WeatherLSTM(nn.Module):
         return uncertainty_dict
 
     def plot_prediction_with_uncertainty(self, X, y_true=None, mc_samples=30, 
-                                    target_scaler=None, log_transform_info=None,
+                                    target_scaler=None, transform_info=None,
                                     figsize=(12, 8), device="cpu", alpha=0.05,
                                     indices=None, max_samples=5):
         """
@@ -890,7 +884,7 @@ class WeatherLSTM(nn.Module):
             y_true: Ground truth values (optional)
             mc_samples: Number of Monte Carlo samples
             target_scaler: Scaler for inverse transformation
-            log_transform_info: Info about log transformation
+            transform_info: Info about transformations applied to the target
             figsize: Figure size
             device: Computation device
             alpha: Significance level for confidence intervals
@@ -903,7 +897,7 @@ class WeatherLSTM(nn.Module):
         # Get predictions with uncertainty
         uncertainty = self.predict_with_uncertainty(
             X, mc_samples=mc_samples, device=device,
-            target_scaler=target_scaler, log_transform_info=log_transform_info,
+            target_scaler=target_scaler, transform_info=transform_info,
             return_samples=True, alpha=alpha
         )
         
@@ -923,15 +917,10 @@ class WeatherLSTM(nn.Module):
             y_true = y_true.numpy()
             
             if target_scaler is not None:
-                # Create dummy array with right shape
-                dummy = np.zeros((y_true.shape[0], target_scaler.n_features_in_))
-                # Place ground truth in target column
-                dummy[:, -1] = y_true.squeeze()
-                # Inverse transform
-                y_true = target_scaler.inverse_transform(dummy)[:, -1]
-                
-            if log_transform_info and log_transform_info.get('applied', False):
-                y_true = np.exp(y_true)
+                # Use the inverse transform method for ground truth
+                y_true = self._inverse_transform_target(
+                    y_true.squeeze(), target_scaler, transform_info
+                )
         
         # Create figure
         fig, axs = plt.subplots(n_samples, 1, figsize=figsize, squeeze=False)
