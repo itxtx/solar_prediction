@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from hmmlearn import hmm
+from datetime import datetime, timedelta
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from scipy.stats import multivariate_normal
@@ -89,205 +90,6 @@ class SolarTDMC:
             
         return X_scaled, time_indices
     
-    def _initialize_parameters(self, X_scaled, time_indices):
-        """
-        Initialize model parameters using clustering.
-        
-        Parameters:
-        -----------
-        X_scaled : array-like
-            Scaled emissions data
-        time_indices : array-like
-            Time slice indices for each observation
-        """
-        # Use K-means to initialize state assignments
-        kmeans = KMeans(n_clusters=self.n_states, random_state=42)
-        state_assignments = kmeans.fit_predict(X_scaled)
-        
-        # Initialize emission parameters based on clusters
-        for s in range(self.n_states):
-            state_data = X_scaled[state_assignments == s]
-            if len(state_data) > 0:
-                self.emission_means[s] = np.mean(state_data, axis=0)
-                # Add small regularization to ensure non-singular covariance
-                self.emission_covars[s] = np.cov(state_data.T) + 1e-6 * np.eye(self.n_emissions)
-        
-        # Initialize time-dependent transition matrices
-        for t in range(self.time_slices):
-            # Get data for this time slice
-            time_slice_data = (time_indices == t)
-            if np.sum(time_slice_data) > 1:
-                # Count transitions within this time slice
-                states_t = state_assignments[time_slice_data]
-                for i in range(len(states_t) - 1):
-                    s1, s2 = states_t[i], states_t[i+1]
-                    self.transitions[t, s1, s2] += 1
-                
-                # Normalize to get probabilities
-                row_sums = self.transitions[t].sum(axis=1, keepdims=True)
-                row_sums[row_sums == 0] = 1  # Avoid division by zero
-                self.transitions[t] /= row_sums
-            else:
-                # Not enough data for this time slice, use uniform distribution
-                self.transitions[t] = np.ones((self.n_states, self.n_states)) / self.n_states
-        
-        # Initialize initial state distribution based on first observations for each time slice
-        initial_states = np.zeros(self.n_states)
-        for t in range(self.time_slices):
-            time_slice_data = (time_indices == t)
-            if np.sum(time_slice_data) > 0:
-                first_state = state_assignments[time_slice_data][0]
-                initial_states[first_state] += 1
-        
-        # Normalize to get probabilities
-        self.initial_probs = initial_states / np.sum(initial_states)
-        if np.sum(initial_states) == 0:
-            self.initial_probs = np.ones(self.n_states) / self.n_states
-    
-    def _forward_backward(self, X_scaled, time_indices):
-        """
-        Perform forward-backward algorithm for the TDMC.
-        
-        Parameters:
-        -----------
-        X_scaled : array-like, shape (n_samples, n_emissions)
-            Scaled emissions data
-        time_indices : array-like, shape (n_samples,)
-            Time slice indices for each observation
-            
-        Returns:
-        --------
-        alpha : array-like
-            Forward probabilities
-        beta : array-like
-            Backward probabilities
-        scale : array-like
-            Scaling factors
-        emission_probs : array-like
-            Emission probabilities
-        """
-        n_samples = len(X_scaled)
-        
-        # Compute emission probabilities for all observations and states
-        emission_probs = np.zeros((n_samples, self.n_states))
-        for s in range(self.n_states):
-            mvn = multivariate_normal(
-                mean=self.emission_means[s],
-                cov=self.emission_covars[s]
-            )
-            emission_probs[:, s] = mvn.pdf(X_scaled)
-        
-        # Initialize forward and backward variables
-        alpha = np.zeros((n_samples, self.n_states))
-        beta = np.zeros((n_samples, self.n_states))
-        scale = np.zeros(n_samples)
-        
-        # Forward pass
-        alpha[0] = self.initial_probs * emission_probs[0]
-        scale[0] = np.sum(alpha[0])
-        alpha[0] /= scale[0]
-        
-        for t in range(1, n_samples):
-            time_slice = time_indices[t-1]  # Use previous time's slice for transition
-            for s in range(self.n_states):
-                alpha[t, s] = np.sum(alpha[t-1] * self.transitions[time_slice, :, s]) * emission_probs[t, s]
-            
-            scale[t] = np.sum(alpha[t])
-            if scale[t] > 0:
-                alpha[t] /= scale[t]
-        
-        # Backward pass
-        beta[-1] = 1.0 / scale[-1]
-        
-        for t in range(n_samples-2, -1, -1):
-            time_slice = time_indices[t]
-            for s in range(self.n_states):
-                beta[t, s] = np.sum(self.transitions[time_slice, s, :] * emission_probs[t+1, :] * beta[t+1, :])
-            
-            beta[t] /= scale[t]
-        
-        return alpha, beta, scale, emission_probs
-    
-    def _baum_welch_update(self, X_scaled, time_indices, max_iter=100, tol=1e-4):
-        """
-        Perform Baum-Welch algorithm to estimate model parameters.
-        
-        Parameters:
-        -----------
-        X_scaled : array-like
-            Scaled emissions data
-        time_indices : array-like
-            Time slice indices for each observation
-        max_iter : int
-            Maximum number of iterations
-        tol : float
-            Convergence tolerance
-            
-        Returns:
-        --------
-        log_likelihood : float
-            Final log-likelihood of the model
-        """
-        n_samples = len(X_scaled)
-        prev_log_likelihood = -np.inf
-        
-        for iteration in range(max_iter):
-            # E-step: Forward-backward algorithm
-            alpha, beta, scale, emission_probs = self._forward_backward(X_scaled, time_indices)
-            
-            # Compute log-likelihood from scaling factors
-            log_likelihood = np.sum(np.log(scale))
-            
-            # Check convergence
-            if abs(log_likelihood - prev_log_likelihood) < tol:
-                break
-            prev_log_likelihood = log_likelihood
-            
-            # Compute posteriors (gamma) and transition posteriors (xi)
-            gamma = alpha * beta  # State posteriors
-            
-            # M-step: Update parameters
-            # Update emission parameters
-            for s in range(self.n_states):
-                # Weighted sum for mean
-                weighted_sum = np.sum(gamma[:, s].reshape(-1, 1) * X_scaled, axis=0)
-                self.emission_means[s] = weighted_sum / np.sum(gamma[:, s])
-                
-                # Weighted covariance
-                diff = X_scaled - self.emission_means[s]
-                weighted_cov = np.zeros((self.n_emissions, self.n_emissions))
-                for i in range(n_samples):
-                    weighted_cov += gamma[i, s] * np.outer(diff[i], diff[i])
-                self.emission_covars[s] = weighted_cov / np.sum(gamma[:, s])
-                # Add regularization
-                self.emission_covars[s] += 1e-6 * np.eye(self.n_emissions)
-            
-            # Update transition matrices for each time slice
-            for t in range(self.time_slices):
-                time_slice_indices = np.where(time_indices == t)[0]
-                if len(time_slice_indices) > 1:
-                    for i in range(len(time_slice_indices) - 1):
-                        idx = time_slice_indices[i]
-                        next_idx = time_slice_indices[i + 1]
-                        
-                        for s1 in range(self.n_states):
-                            for s2 in range(self.n_states):
-                                xi = alpha[idx, s1] * self.transitions[t, s1, s2] * \
-                                     emission_probs[next_idx, s2] * beta[next_idx, s2]
-                                
-                                # Accumulate transitions
-                                self.transitions[t, s1, s2] += xi
-                    
-                    # Normalize transitions for this time slice
-                    row_sums = self.transitions[t].sum(axis=1, keepdims=True)
-                    row_sums[row_sums == 0] = 1  # Avoid division by zero
-                    self.transitions[t] /= row_sums
-            
-            # Update initial state distribution
-            self.initial_probs = gamma[0] / np.sum(gamma[0])
-            
-        return log_likelihood
-    
     def fit(self, X, timestamps=None, max_iter=100, tol=1e-4, state_names=None):
         """
         Fit the TDMC model to data.
@@ -313,11 +115,11 @@ class SolarTDMC:
         # Preprocess data
         X_scaled, time_indices = self._preprocess_data(X, timestamps)
         
-        # Initialize parameters
+        # Initialize parameters using K-means
         self._initialize_parameters(X_scaled, time_indices)
         
         # Run Baum-Welch algorithm
-        log_likelihood = self._baum_welch_update(X_scaled, time_indices, max_iter, tol)
+        self._baum_welch_update(X_scaled, time_indices, max_iter, tol)
         
         # Set state names if provided
         if state_names is not None:
@@ -327,21 +129,178 @@ class SolarTDMC:
         self.trained = True
         return self
     
+    def _initialize_parameters(self, X_scaled, time_indices):
+        """Initialize model parameters using clustering."""
+        # Use K-means to initialize state assignments
+        kmeans = KMeans(n_clusters=self.n_states, random_state=42)
+        state_assignments = kmeans.fit_predict(X_scaled)
+        
+        # Initialize emission parameters based on clusters
+        for s in range(self.n_states):
+            state_data = X_scaled[state_assignments == s]
+            if len(state_data) > 0:
+                self.emission_means[s] = np.mean(state_data, axis=0)
+                # Add stronger regularization to ensure non-singular covariance
+                cov = np.cov(state_data.T)
+                # Ensure positive definiteness
+                min_eig = np.min(np.real(np.linalg.eigvals(cov)))
+                if min_eig < 0:
+                    cov -= min_eig * np.eye(self.n_emissions)
+                self.emission_covars[s] = cov + 1e-3 * np.eye(self.n_emissions)
+            else:
+                # If no data for this state, use global statistics
+                self.emission_means[s] = np.mean(X_scaled, axis=0)
+                self.emission_covars[s] = np.cov(X_scaled.T) + 1e-3 * np.eye(self.n_emissions)
+        
+        # Initialize time-dependent transition matrices with small uniform prior
+        self.transitions = np.ones((self.time_slices, self.n_states, self.n_states)) / self.n_states
+        
+        for t in range(self.time_slices):
+            # Get data for this time slice
+            time_slice_data = (time_indices == t)
+            if np.sum(time_slice_data) > 1:
+                # Count transitions within this time slice
+                states_t = state_assignments[time_slice_data]
+                for i in range(len(states_t) - 1):
+                    s1, s2 = states_t[i], states_t[i+1]
+                    self.transitions[t, s1, s2] += 1
+                
+                # Normalize to get probabilities with smoothing
+                row_sums = self.transitions[t].sum(axis=1, keepdims=True)
+                self.transitions[t] = (self.transitions[t] + 1e-6) / (row_sums + self.n_states * 1e-6)
+        
+        # Initialize initial state distribution with smoothing
+        initial_states = np.ones(self.n_states)  # Start with uniform prior
+        for t in range(self.time_slices):
+            time_slice_data = (time_indices == t)
+            if np.sum(time_slice_data) > 0:
+                first_state = state_assignments[time_slice_data][0]
+                initial_states[first_state] += 1
+        
+        # Normalize with smoothing
+        self.initial_probs = (initial_states + 1e-6) / (np.sum(initial_states) + self.n_states * 1e-6)
+    
+    def _forward_backward(self, X_scaled, time_indices):
+        """Perform forward-backward algorithm for the TDMC."""
+        n_samples = len(X_scaled)
+        
+        # Compute emission probabilities for all observations and states
+        emission_probs = np.zeros((n_samples, self.n_states))
+        for s in range(self.n_states):
+            try:
+                mvn = multivariate_normal(
+                    mean=self.emission_means[s],
+                    cov=self.emission_covars[s]
+                )
+                emission_probs[:, s] = mvn.pdf(X_scaled)
+            except:
+                # If multivariate normal fails, use a simple Gaussian approximation
+                emission_probs[:, s] = np.exp(-0.5 * np.sum(
+                    (X_scaled - self.emission_means[s])**2, axis=1
+                ))
+        
+        # Add small constant to avoid numerical underflow
+        emission_probs = np.maximum(emission_probs, 1e-300)
+        
+        # Initialize forward and backward variables
+        alpha = np.zeros((n_samples, self.n_states))
+        beta = np.zeros((n_samples, self.n_states))
+        scale = np.zeros(n_samples)
+        
+        # Forward pass with scaling
+        alpha[0] = self.initial_probs * emission_probs[0]
+        scale[0] = np.sum(alpha[0])
+        alpha[0] /= scale[0]
+        
+        for t in range(1, n_samples):
+            for s2 in range(self.n_states):
+                alpha[t, s2] = np.sum(
+                    alpha[t-1] * self.transitions[time_indices[t-1], :, s2]
+                ) * emission_probs[t, s2]
+            scale[t] = np.sum(alpha[t])
+            alpha[t] /= scale[t]
+        
+        # Backward pass with scaling
+        beta[-1] = 1.0
+        for t in range(n_samples-2, -1, -1):
+            for s1 in range(self.n_states):
+                beta[t, s1] = np.sum(
+                    beta[t+1] * self.transitions[time_indices[t], s1, :] * emission_probs[t+1]
+                )
+            beta[t] /= scale[t+1]
+        
+        return alpha, beta, scale, emission_probs
+    
+    def _baum_welch_update(self, X_scaled, time_indices, max_iter=100, tol=1e-4):
+        """Perform Baum-Welch algorithm to update model parameters."""
+        prev_log_likelihood = -np.inf
+        
+        for iteration in range(max_iter):
+            # E-step: Forward-backward algorithm
+            alpha, beta, scale, emission_probs = self._forward_backward(X_scaled, time_indices)
+            
+            # Compute log-likelihood from scaling factors
+            log_likelihood = np.sum(np.log(scale))
+            
+            # Check convergence
+            if abs(log_likelihood - prev_log_likelihood) < tol:
+                break
+            prev_log_likelihood = log_likelihood
+            
+            # M-step: Update parameters
+            n_samples = len(X_scaled)
+            
+            # Update initial state distribution
+            gamma = alpha * beta
+            self.initial_probs = gamma[0] / np.sum(gamma[0])
+            
+            # Update transition matrices
+            for t in range(self.time_slices):
+                # Get indices where time_indices equals t, but exclude the last element
+                # since we need to look ahead one step
+                time_slice_indices = np.where(time_indices[:-1] == t)[0]
+                if len(time_slice_indices) == 0:
+                    continue
+                    
+                # Compute xi for this time slice
+                xi = np.zeros((self.n_states, self.n_states))
+                for s1 in range(self.n_states):
+                    for s2 in range(self.n_states):
+                        # Use the valid indices to compute xi
+                        xi[s1, s2] = np.sum(
+                            alpha[time_slice_indices, s1] * 
+                            self.transitions[t, s1, s2] * 
+                            emission_probs[time_slice_indices + 1, s2] * 
+                            beta[time_slice_indices + 1, s2]
+                        )
+                
+                # Update transitions with smoothing
+                row_sums = np.sum(xi, axis=1, keepdims=True)
+                row_sums = np.maximum(row_sums, 1e-300)  # Avoid division by zero
+                self.transitions[t] = (xi + 1e-6) / (row_sums + self.n_states * 1e-6)
+            
+            # Update emission parameters
+            for s in range(self.n_states):
+                gamma_s = gamma[:, s]
+                gamma_s = np.maximum(gamma_s, 1e-300)  # Avoid numerical issues
+                
+                # Update mean
+                self.emission_means[s] = np.sum(gamma_s[:, np.newaxis] * X_scaled, axis=0) / np.sum(gamma_s)
+                
+                # Update covariance with regularization
+                diff = X_scaled - self.emission_means[s]
+                cov = np.dot(gamma_s * diff.T, diff) / np.sum(gamma_s)
+                # Ensure positive definiteness
+                min_eig = np.min(np.real(np.linalg.eigvals(cov)))
+                if min_eig < 0:
+                    cov -= min_eig * np.eye(self.n_emissions)
+                self.emission_covars[s] = cov + 1e-3 * np.eye(self.n_emissions)
+        
+        return log_likelihood
+    
     def predict_states(self, X, timestamps=None):
         """
         Predict the most likely hidden state sequence using Viterbi algorithm.
-        
-        Parameters:
-        -----------
-        X : array-like, shape (n_samples, n_emissions)
-            Observable emissions data
-        timestamps : array-like, shape (n_samples,)
-            Timestamps for each observation
-            
-        Returns:
-        --------
-        states : array-like
-            Most likely state sequence
         """
         if not self.trained:
             raise ValueError("Model not trained yet")
@@ -383,27 +342,83 @@ class SolarTDMC:
         
         return states
     
+    def _inverse_transform_target(self, y, target_scaler, transform_info):
+        """
+        Apply inverse transformations to recover original target values
+        
+        Args:
+            y: Transformed target values
+            target_scaler: Scaler used for the target
+            transform_info: Combined transform info dictionary
+            
+        Returns:
+            Original scale target values
+        """
+        # Make a copy to avoid modifying the original
+        y_transformed = y.copy()
+        
+        # Get the list of transforms in reverse order (to undo in reverse)
+        transforms = transform_info.get('transforms', [])[::-1]
+        
+        # Apply inverse transformations in reverse order
+        for transform in transforms:
+            transform_type = transform.get('type')
+            
+            if transform_type == 'log' and transform.get('applied', False):
+                # Undo log transform
+                if transform.get('offset', 0) > 0:
+                    # If log1p was used: exp(y) - offset
+                    y_transformed = np.exp(y_transformed) - transform.get('offset')
+                else:
+                    # If simple log was used
+                    y_transformed = np.exp(y_transformed)
+                    
+            elif transform_type == 'scale' and transform.get('applied', False):
+                # No direct inverse needed as the scaler will handle this
+                pass
+        
+        # Apply inverse scaling if scaler is provided
+        if target_scaler is not None:
+            # Create dummy array with the right shape for inverse_transform
+            if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
+                y_transformed = y_transformed.squeeze(axis=1)
+                
+            # Check if we need a dummy array (if y is just the target column)
+            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
+                # Create dummy array with zeros except for target column
+                dummy = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
+                
+                # Find target column index from transform_info
+                target_col = transform_info.get('target_col_original', -1)
+                if isinstance(target_col, str) and hasattr(target_scaler, 'feature_names_in_'):
+                    # If we have column names, find the index
+                    try:
+                        target_idx = np.where(target_scaler.feature_names_in_ == target_col)[0][0]
+                    except:
+                        # Default to last column if name not found
+                        target_idx = -1
+                else:
+                    # Default to the provided index or last column
+                    target_idx = -1 if isinstance(target_col, str) else target_col
+                
+                # Place values in the correct column
+                dummy[:, target_idx] = y_transformed
+                
+                # Apply inverse transform
+                transformed_dummy = target_scaler.inverse_transform(dummy)
+                
+                # Extract target column
+                y_transformed = transformed_dummy[:, target_idx]
+            else:
+                # If scaler was fitted only on target, just inverse transform directly
+                y_transformed = target_scaler.inverse_transform(
+                    y_transformed.reshape(-1, 1)).squeeze()
+        
+        return y_transformed
+
     def forecast(self, X_last, timestamps_last, forecast_horizon, weather_forecasts=None):
         """
         Forecast future solar irradiance.
-        
-        Parameters:
-        -----------
-        X_last : array-like, shape (n_emissions,)
-            Last observed emissions
-        timestamps_last : int or timestamp
-            Last timestamp
-        forecast_horizon : int
-            Number of steps ahead to forecast
-        weather_forecasts : array-like, optional
-            External weather forecasts to improve predictions
-            
-        Returns:
-        --------
-        forecasts : array-like
-            Predicted emissions for forecast horizon
-        confidence : array-like
-            Confidence intervals for predictions
         """
         if not self.trained:
             raise ValueError("Model not trained yet")
@@ -473,21 +488,23 @@ class SolarTDMC:
             confidence_lower[step] = forecasts[step] - 1.96 * forecast_std
             confidence_upper[step] = forecasts[step] + 1.96 * forecast_std
         
-        # Inverse transform to original scale
-        forecasts = self.scaler.inverse_transform(forecasts)
-        confidence_lower = self.scaler.inverse_transform(confidence_lower)
-        confidence_upper = self.scaler.inverse_transform(confidence_upper)
+        # Inverse transform to original scale using the new method
+        transform_info = {
+            'transforms': [
+                {'type': 'scale', 'applied': True}
+            ],
+            'target_col_original': -1  # Use all columns
+        }
+        
+        forecasts = self._inverse_transform_target(forecasts, self.scaler, transform_info)
+        confidence_lower = self._inverse_transform_target(confidence_lower, self.scaler, transform_info)
+        confidence_upper = self._inverse_transform_target(confidence_upper, self.scaler, transform_info)
         
         return forecasts, (confidence_lower, confidence_upper)
     
     def get_state_characteristics(self):
         """
         Get characteristics of each hidden state.
-        
-        Returns:
-        --------
-        state_info : dict
-            Dictionary containing information about each state
         """
         if not self.trained:
             raise ValueError("Model not trained yet")
@@ -514,11 +531,6 @@ class SolarTDMC:
     def plot_state_transitions(self, time_slice=12):
         """
         Plot transition probabilities for a specific time slice.
-        
-        Parameters:
-        -----------
-        time_slice : int
-            Time slice to visualize (e.g., hour of day)
         """
         if not self.trained:
             raise ValueError("Model not trained yet")
@@ -603,13 +615,13 @@ class SolarTDMC:
                           c=[f'C{s}'], marker='x', s=100, label=self.state_names[s])
             
             ax.set_title("Emission Distributions by State")
-            ax.set_xlabel("Emission 1 (Standardized)")
-            ax.set_ylabel("Emission 2 (Standardized)")
+            ax.set_xlabel("Radiation (Standardized)")
+            ax.set_ylabel("Temperature (Standardized)")
             ax.legend()
             
         fig.tight_layout()
         return fig
-    
+
     def save_model(self, filepath):
         """Save model to file"""
         model_data = {
@@ -651,242 +663,3 @@ class SolarTDMC:
         model.trained = model_data['trained']
         
         return model
-
-
-# Example usage with synthetic data
-def create_synthetic_solar_data(n_days=30, time_points_per_day=24, noise_level=0.2):
-    """Create synthetic solar irradiance data for testing"""
-    n_samples = n_days * time_points_per_day
-    
-    # Time indices (hour of day)
-    time_indices = np.tile(np.arange(time_points_per_day), n_days)
-    
-    # Base irradiance pattern (bell curve centered at noon)
-    hour_pattern = np.sin(np.pi * np.arange(time_points_per_day) / (time_points_per_day - 1))
-    base_irradiance = np.tile(hour_pattern, n_days)
-    
-    # Add weather state patterns (hidden states)
-    # 4 weather states: Sunny, Partly Cloudy, Cloudy, Rainy
-    state_durations = [24, 24, 12, 12]  # Each state lasts this many hours on average
-    transition_probs = [
-        [0.8, 0.2, 0.0, 0.0],  # Sunny -> Sunny (0.8), Partly Cloudy (0.2)
-        [0.3, 0.6, 0.1, 0.0],  # Partly Cloudy -> Sunny (0.3), Partly Cloudy (0.6), Cloudy (0.1)
-        [0.1, 0.3, 0.5, 0.1],  # Cloudy -> Sunny (0.1), Partly Cloudy (0.3), Cloudy (0.5), Rainy (0.1)
-        [0.0, 0.2, 0.3, 0.5]   # Rainy -> Partly Cloudy (0.2), Cloudy (0.3), Rainy (0.5)
-    ]
-    
-    # State modifiers for irradiance and temperature
-    state_irradiance_factor = [1.0, 0.7, 0.4, 0.2]  # How much each state affects irradiance
-    state_temp_modifier = [5, 2, 0, -3]  # How much each state affects temperature (°C)
-    
-    # Generate underlying weather states
-    states = np.zeros(n_samples, dtype=int)
-    states[0] = np.random.choice(4, p=[0.4, 0.3, 0.2, 0.1])  # Initial state
-    
-    for i in range(1, n_samples):
-        # Time-dependent transition probabilities (simplified)
-        hour = time_indices[i]
-        time_factor = 1.0
-        
-        # Higher chance of weather changes in the morning/evening
-        if 5 <= hour <= 9 or 17 <= hour <= 20:
-            time_factor = 1.5
-        
-        # Calculate transition probabilities for current state
-        current_state = states[i-1]
-        probs = np.array(transition_probs[current_state])
-        
-        # Apply time factor (more likely to change at certain hours)
-        if current_state != np.argmax(probs):  # If not self-transition
-            probs = probs * time_factor
-            probs = probs / np.sum(probs)  # Re-normalize
-        
-        # Determine next state
-        states[i] = np.random.choice(4, p=probs)
-    
-    # Generate observed data based on states
-    irradiance = np.zeros(n_samples)
-    temperature = np.zeros(n_samples)
-    
-    for i in range(n_samples):
-        state = states[i]
-        hour = time_indices[i]
-        
-        # Base irradiance from time of day
-        irradiance[i] = base_irradiance[i] * state_irradiance_factor[state]
-        
-        # Add seasonal component (assuming 30 days covers a month)
-        day = i // time_points_per_day
-        seasonal_factor = 0.9 + 0.2 * np.sin(2 * np.pi * day / n_days)
-        irradiance[i] *= seasonal_factor
-        
-        # Temperature model: daily pattern + state modifier
-        base_temp = 20 + 5 * np.sin(np.pi * hour / 12 - np.pi/2)  # Daily cycle centered at noon
-        temperature[i] = base_temp + state_temp_modifier[state]
-        
-        # Add noise
-        irradiance[i] += np.random.normal(0, noise_level * irradiance[i])
-        temperature[i] += np.random.normal(0, 2)  # 2°C noise for temperature
-    
-    # Ensure non-negative irradiance
-    irradiance = np.maximum(irradiance, 0)
-    
-    # Create dataframe
-    dates = []
-    for day in range(n_days):
-        for hour in range(time_points_per_day):
-            dates.append(pd.Timestamp('2023-06-01') + pd.Timedelta(days=day, hours=hour))
-    
-    df = pd.DataFrame({
-        'timestamp': dates,
-        'irradiance': irradiance,
-        'temperature': temperature,
-        'true_state': states  # Keep for evaluation
-    })
-    
-    return df
-
-# Example function to train and evaluate the model
-def train_and_evaluate_tdmc():
-    """Train and evaluate the TDMC model with synthetic data"""
-    # Generate synthetic data
-    print("Generating synthetic solar data...")
-    data = create_synthetic_solar_data(n_days=60, noise_level=0.15)
-    
-    # Extract features and timestamps
-    X = data[['irradiance', 'temperature']].values
-    timestamps = data['timestamp'].values
-    
-    # Split into train/test sets
-    train_days = 45
-    train_idx = train_days * 24
-    X_train, X_test = X[:train_idx], X[train_idx:]
-    timestamps_train, timestamps_test = timestamps[:train_idx], timestamps[train_idx:]
-    true_states_train, true_states_test = data['true_state'].values[:train_idx], data['true_state'].values[train_idx:]
-    
-    # Initialize and train the model
-    print("Training TDMC model...")
-    model = SolarTDMC(n_states=4, n_emissions=2, time_slices=24)
-    model.fit(
-        X_train, timestamps_train, 
-        max_iter=50, 
-        state_names=['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy']
-    )
-    
-    # Predict states
-    print("Predicting states...")
-    predicted_states = model.predict_states(X_test, timestamps_test)
-    
-    # Evaluate state prediction accuracy
-    # Note: HMM states may not align with true states, so this is simplified
-    state_accuracy = np.mean(predicted_states == true_states_test)
-    print(f"State prediction accuracy: {state_accuracy:.2f}")
-    print("(Note: State accuracy may be low due to label permutation in HMMs)")
-    
-    # Generate forecast
-    print("Generating forecasts...")
-    last_obs = X_test[0]
-    last_timestamp = timestamps_test[0]
-    forecast_horizon = 48  # 48 hours ahead
-    
-    forecasts, (conf_lower, conf_upper) = model.forecast(
-        last_obs, last_timestamp, forecast_horizon
-    )
-    
-    # Evaluate forecast error
-    actual = X_test[1:min(forecast_horizon+1, len(X_test))]
-    pred = forecasts[:min(forecast_horizon, len(X_test)-1)]
-    
-    mse = np.mean((actual[:, 0] - pred[:, 0])**2)  # MSE for irradiance
-    print(f"Mean Squared Error for irradiance forecast: {mse:.4f}")
-    
-    # Get state characteristics
-    state_info = model.get_state_characteristics()
-    print("\nState Characteristics:")
-    for state, info in state_info.items():
-        print(f"- {state}: Mean Irradiance = {info['mean_emissions'][0]:.2f}, "
-              f"Mean Temperature = {info['mean_emissions'][1]:.2f}°C")
-    
-    # Plot results
-    print("Plotting results...")
-    
-    # Actual vs Predicted irradiance
-    plt.figure(figsize=(12, 6))
-    plt.plot(actual[:, 0], label='Actual Irradiance')
-    plt.plot(pred[:, 0], label='Predicted Irradiance')
-    plt.fill_between(
-        range(len(pred)), 
-        conf_lower[:len(pred), 0], 
-        conf_upper[:len(pred), 0], 
-        alpha=0.3, label='95% Confidence Interval'
-    )
-    plt.title('Irradiance Forecast vs Actual')
-    plt.xlabel('Hours ahead')
-    plt.ylabel('Irradiance')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot state transitions
-    model.plot_state_transitions(time_slice=12)  # Noon transitions
-    
-    # Plot emissions by state
-    model.plot_emissions_by_state()
-    
-    return model, data
-
-# Example of how to use the model for solar production prediction
-def solar_production_prediction(model, solar_capacity_kw=5.0):
-    """Forecast solar energy production using the TDMC model"""
-    print("\nSolar Production Prediction Example")
-    
-    # Generate synthetic data for current conditions
-    current_data = create_synthetic_solar_data(n_days=1, time_points_per_day=24)
-    current_obs = current_data[['irradiance', 'temperature']].values[-1]
-    current_time = current_data['timestamp'].values[-1]
-    
-    # Generate forecast for next 3 days
-    forecast_horizon = 24 * 3
-    irradiance_forecast, confidence = model.forecast(current_obs, current_time, forecast_horizon)
-    
-    # Convert irradiance to energy production (kWh)
-    # Simple model: production = irradiance_ratio * capacity * efficiency
-    efficiency = 0.15  # 15% panel efficiency
-    production_forecast = irradiance_forecast[:, 0] * solar_capacity_kw * efficiency
-    
-    # Time series of forecast days
-    forecast_times = [current_time + pd.Timedelta(hours=i+1) for i in range(forecast_horizon)]
-    
-    # Plot production forecast
-    plt.figure(figsize=(12, 6))
-    plt.plot(forecast_times, production_forecast)
-    plt.title(f'Solar Energy Production Forecast ({solar_capacity_kw} kW System)')
-    plt.xlabel('Date')
-    plt.ylabel('Energy Production (kWh)')
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    plt.tight_layout()
-    
-    # Daily production summary
-    daily_production = {}
-    for day_idx in range(3):
-        start_idx = day_idx * 24
-        end_idx = start_idx + 24
-        if end_idx <= len(production_forecast):
-            day_production = sum(production_forecast[start_idx:end_idx])
-            day_date = forecast_times[start_idx].date()
-            daily_production[day_date] = day_production
-    
-    print("Daily Production Forecast:")
-    for date, prod in daily_production.items():
-        print(f"- {date}: {prod:.2f} kWh")
-    
-    return production_forecast, forecast_times
-
-if __name__ == "__main__":
-    # Train and evaluate the model
-    model, data = train_and_evaluate_tdmc()
-    
-    # Run production prediction example
-    solar_production_prediction(model, solar_capacity_kw=7.5)
-    
-    plt.show()

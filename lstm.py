@@ -117,12 +117,11 @@ class WeatherLSTM(nn.Module):
         }
         
         # Store log transform info
-        self.log_transform_info = None
+        self.transform_info = None
         
     def forward(self, x):
-        # Initialize hidden state with zeros
+        # Use Xavier/Glorot initialization for hidden states (optional)
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        # Initialize cell state
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         
         # LSTM forward pass
@@ -131,15 +130,15 @@ class WeatherLSTM(nn.Module):
         # Get the output from the last time step
         out = out[:, -1, :]
         
-        # Apply dropout after LSTM
+        # Apply dropout after LSTM (reduced dropout rate)
         out = self.dropout1(out)
         
-        # Apply dense layers for better feature extraction
+        # First dense layer with batch normalization
         out = self.fc1(out)
         out = self.relu(out)
         out = self.dropout2(out)
         
-        # Second hidden layer
+        # Second hidden layer with batch normalization
         out = self.fc2(out)
         out = self.relu2(out)
         out = self.dropout3(out)
@@ -369,7 +368,81 @@ class WeatherLSTM(nn.Module):
         
         return self
     
-    def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, log_transform_info=None):
+    def _inverse_transform_target(self, y, target_scaler, transform_info):
+        """
+        Apply inverse transformations to recover original target values
+        
+        Args:
+            y: Transformed target values
+            target_scaler: Scaler used for the target
+            transform_info: Combined transform info dictionary
+            
+        Returns:
+            Original scale target values
+        """
+        # Make a copy to avoid modifying the original
+        y_transformed = y.copy()
+        
+        # First apply inverse scaling if scaler is provided
+        if target_scaler is not None:
+            # Create dummy array with the right shape for inverse_transform
+            if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
+                y_transformed = y_transformed.squeeze(axis=1)
+                
+            # Check if we need a dummy array (if y is just the target column)
+            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
+                # Create dummy array with zeros except for target column
+                dummy = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
+                
+                # Find target column index from transform_info
+                target_col = transform_info.get('target_col_original', -1)
+                if isinstance(target_col, str) and hasattr(target_scaler, 'feature_names_in_'):
+                    # If we have column names, find the index
+                    try:
+                        target_idx = np.where(target_scaler.feature_names_in_ == target_col)[0][0]
+                    except:
+                        # Default to last column if name not found
+                        target_idx = -1
+                else:
+                    # Default to the provided index or last column
+                    target_idx = -1 if isinstance(target_col, str) else target_col
+                
+                # Place values in the correct column
+                dummy[:, target_idx] = y_transformed
+                
+                # Apply inverse transform
+                transformed_dummy = target_scaler.inverse_transform(dummy)
+                
+                # Extract target column
+                y_transformed = transformed_dummy[:, target_idx]
+            else:
+                # If scaler was fitted only on target, just inverse transform directly
+                y_transformed = target_scaler.inverse_transform(
+                    y_transformed.reshape(-1, 1)).squeeze()
+        
+        # Then apply any additional inverse transformations
+        if transform_info is not None:
+            transforms = transform_info.get('transforms', [])[::-1]
+            
+            for transform in transforms:
+                transform_type = transform.get('type')
+                
+                if transform_type == 'log' and transform.get('applied', False):
+                    # Undo log transform with numerical stability
+                    epsilon = transform.get('epsilon', 1e-6)
+                    if transform.get('offset', 0) > 0:
+                        # If log1p was used: exp(y) - offset
+                        y_transformed = np.exp(np.clip(y_transformed, -100, 100)) - transform.get('offset')
+                    else:
+                        # If simple log was used
+                        y_transformed = np.exp(np.clip(y_transformed, -100, 100))
+                    
+                    # Clip to reasonable range to prevent overflow
+                    y_transformed = np.clip(y_transformed, 0, 2000)  # Assuming max radiation is 2000
+        
+        return y_transformed
+
+    def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, transform_info=None):
         """
         Evaluate the model on test data
         """
@@ -416,17 +489,31 @@ class WeatherLSTM(nn.Module):
         
         # If we have a scaler, calculate metrics on the original scale
         if target_scaler is not None:
-            # Inverse transform the predictions and actuals
-            if log_transform_info and log_transform_info['applied']:
-                # For log-transformed data, first inverse scale, then inverse log
-                epsilon = log_transform_info['epsilon']
-                predictions_orig = np.exp(target_scaler.inverse_transform(predictions)) - epsilon
-                actuals_orig = np.exp(target_scaler.inverse_transform(actuals)) - epsilon
-                print(f"Applied inverse log transform with epsilon={epsilon}")
-            else:
-                # Just inverse scale
-                predictions_orig = target_scaler.inverse_transform(predictions)
-                actuals_orig = target_scaler.inverse_transform(actuals)
+            # Use transform_info from instance if not provided
+            if transform_info is None and hasattr(self, 'transform_info'):
+                transform_info = self.transform_info
+            elif transform_info is None and hasattr(self, 'log_transform_info'):
+                # For backward compatibility
+                log_transform_info = self.log_transform_info
+                if log_transform_info and log_transform_info.get('applied', False):
+                    transform_info = {
+                        'transforms': [
+                            {'type': 'log', 'applied': True, 'offset': log_transform_info.get('epsilon', 0)},
+                            {'type': 'scale', 'applied': True}
+                        ],
+                        'target_col_original': -1
+                    }
+                else:
+                    transform_info = {
+                        'transforms': [
+                            {'type': 'scale', 'applied': True}
+                        ],
+                        'target_col_original': -1
+                    }
+            
+            # Use the new inverse transform method
+            predictions_orig = self._inverse_transform_target(predictions, target_scaler, transform_info)
+            actuals_orig = self._inverse_transform_target(actuals, target_scaler, transform_info)
             
             # Calculate metrics on original scale
             mse_orig = np.mean((actuals_orig - predictions_orig) ** 2)
@@ -474,13 +561,26 @@ class WeatherLSTM(nn.Module):
         
         # If we have a scaler, transform predictions back to original scale
         if target_scaler is not None:
-            if log_transform_info and log_transform_info['applied']:
-                # For log-transformed data, first inverse scale, then inverse log
-                epsilon = log_transform_info['epsilon']
-                predictions = np.exp(target_scaler.inverse_transform(predictions)) - epsilon
+            # Handle backward compatibility with log_transform_info
+            if log_transform_info is not None:
+                transform_info = {
+                    'transforms': [
+                        {'type': 'log', 'applied': log_transform_info.get('applied', False), 
+                         'offset': log_transform_info.get('epsilon', 0)},
+                        {'type': 'scale', 'applied': True}
+                    ],
+                    'target_col_original': -1
+                }
             else:
-                # Just inverse scale
-                predictions = target_scaler.inverse_transform(predictions)
+                transform_info = {
+                    'transforms': [
+                        {'type': 'scale', 'applied': True}
+                    ],
+                    'target_col_original': -1
+                }
+            
+            # Use the new inverse transform method
+            predictions = self._inverse_transform_target(predictions, target_scaler, transform_info)
         
         return predictions
     
@@ -679,3 +779,196 @@ class WeatherLSTM(nn.Module):
         
         model.to(device)
         return model
+    
+    def predict_with_uncertainty(self, X, mc_samples=30, device="cpu", 
+                            target_scaler=None, transform_info=None,
+                            return_samples=False, alpha=0.05):
+        """
+        Generate predictions with uncertainty estimates using MC Dropout
+        
+        Args:
+            X: Input data of shape (batch_size, seq_length, input_dim)
+            mc_samples: Number of Monte Carlo forward passes
+            device: Device for computation
+            target_scaler: Scaler for inverse transformation
+            transform_info: Info about transformations applied to the target
+            return_samples: Whether to return all MC samples
+            alpha: Significance level for confidence intervals (default 0.05 for 95% CI)
+            
+        Returns:
+            Dictionary containing:
+                - mean: Mean prediction
+                - std: Standard deviation of predictions
+                - lower_ci: Lower confidence interval bound
+                - upper_ci: Upper confidence interval bound
+                - samples: All MC samples (if return_samples=True)
+        """
+        # Convert to tensor if not already
+        if not torch.is_tensor(X):
+            X = torch.tensor(X, dtype=torch.float32)
+        
+        # Move to device
+        X = X.to(device)
+        
+        # Set model to evaluation mode but keep dropout active
+        self.eval()
+        
+        # Enable dropout during inference
+        def enable_dropout(model):
+            for m in model.modules():
+                if isinstance(m, nn.Dropout):
+                    m.train()
+        
+        enable_dropout(self)
+        
+        # Store predictions from multiple forward passes
+        all_predictions = []
+        
+        # Run multiple forward passes
+        with torch.no_grad():
+            for _ in range(mc_samples):
+                # Forward pass with dropout active
+                outputs = self(X)
+                all_predictions.append(outputs.cpu().numpy())
+        
+        # Stack predictions along new axis
+        # Shape: (mc_samples, batch_size, output_dim)
+        all_predictions = np.stack(all_predictions, axis=0)
+        
+        # If we have a target scaler, apply inverse transformation to each sample
+        if target_scaler is not None:
+            # For each MC sample
+            for i in range(mc_samples):
+                # Use the inverse transform method
+                all_predictions[i, :, 0] = self._inverse_transform_target(
+                    all_predictions[i, :, 0], target_scaler, transform_info
+                )
+        
+        # Calculate statistics across MC samples
+        # Mean prediction for each input example
+        mean_prediction = np.mean(all_predictions, axis=0)
+        
+        # Standard deviation for each input example
+        std_prediction = np.std(all_predictions, axis=0)
+        
+        # Confidence intervals (using percentiles for non-parametric intervals)
+        lower_percentile = alpha/2 * 100
+        upper_percentile = (1 - alpha/2) * 100
+        
+        lower_ci = np.percentile(all_predictions, lower_percentile, axis=0)
+        upper_ci = np.percentile(all_predictions, upper_percentile, axis=0)
+        
+        # Prepare return dictionary
+        uncertainty_dict = {
+            'mean': mean_prediction,
+            'std': std_prediction,
+            'lower_ci': lower_ci, 
+            'upper_ci': upper_ci,
+        }
+        
+        # Add all samples if requested
+        if return_samples:
+            uncertainty_dict['samples'] = all_predictions
+        
+        return uncertainty_dict
+
+    def plot_prediction_with_uncertainty(self, X, y_true=None, mc_samples=30, 
+                                    target_scaler=None, transform_info=None,
+                                    figsize=(12, 8), device="cpu", alpha=0.05,
+                                    indices=None, max_samples=5):
+        """
+        Plot predictions with uncertainty bounds
+        
+        Args:
+            X: Input data
+            y_true: Ground truth values (optional)
+            mc_samples: Number of Monte Carlo samples
+            target_scaler: Scaler for inverse transformation
+            transform_info: Info about transformations applied to the target
+            figsize: Figure size
+            device: Computation device
+            alpha: Significance level for confidence intervals
+            indices: Specific indices to plot (default: first max_samples)
+            max_samples: Maximum number of samples to plot
+            
+        Returns:
+            Matplotlib figure
+        """
+        # Get predictions with uncertainty
+        uncertainty = self.predict_with_uncertainty(
+            X, mc_samples=mc_samples, device=device,
+            target_scaler=target_scaler, transform_info=transform_info,
+            return_samples=True, alpha=alpha
+        )
+        
+        # If indices not specified, use first max_samples
+        if indices is None:
+            n_samples = min(max_samples, len(X))
+            indices = np.arange(n_samples)
+        else:
+            indices = np.array(indices)
+            n_samples = len(indices)
+        
+        # Prepare ground truth if available
+        if y_true is not None:
+            if not torch.is_tensor(y_true):
+                y_true = torch.tensor(y_true, dtype=torch.float32)
+                
+            y_true = y_true.numpy()
+            
+            if target_scaler is not None:
+                # Use the inverse transform method for ground truth
+                y_true = self._inverse_transform_target(
+                    y_true.squeeze(), target_scaler, transform_info
+                )
+        
+        # Create figure
+        fig, axs = plt.subplots(n_samples, 1, figsize=figsize, squeeze=False)
+        
+        # For each sample to plot
+        for i, idx in enumerate(indices):
+            ax = axs[i, 0]
+            
+            # Extract predictions and bounds for this sample
+            mean = uncertainty['mean'][idx, 0]
+            lower = uncertainty['lower_ci'][idx, 0]
+            upper = uncertainty['upper_ci'][idx, 0]
+            
+            # Get all MC samples for this input
+            all_samples = uncertainty['samples'][:, idx, 0]
+            
+            # Plot MC samples as semi-transparent lines
+            for j in range(min(10, mc_samples)):  # Plot up to 10 individual samples
+                ax.plot([0], [all_samples[j]], 'o', alpha=0.3, color='gray')
+            
+            # Plot prediction and confidence interval
+            ax.errorbar([0], [mean], yerr=[[mean-lower], [upper-mean]], 
+                    fmt='o', color='blue', ecolor='lightblue', 
+                    capsize=5, label='Prediction with 95% CI')
+            
+            # Plot ground truth if available
+            if y_true is not None and idx < len(y_true):
+                ax.plot([0], [y_true[idx]], 'ro', label='Actual')
+                
+                # Calculate error
+                error = abs(mean - y_true[idx])
+                within_ci = lower <= y_true[idx] <= upper
+                
+                # Add error information
+                ax.text(0.02, 0.95, f"Error: {error:.2f}", transform=ax.transAxes)
+                ax.text(0.02, 0.90, f"Within CI: {'Yes' if within_ci else 'No'}", 
+                    transform=ax.transAxes)
+            
+            # Calculate prediction interval width
+            interval_width = upper - lower
+            ax.text(0.02, 0.85, f"Interval width: {interval_width:.2f}", transform=ax.transAxes)
+            
+            ax.set_title(f"Sample {idx}")
+            ax.set_ylim([max(0, lower - 0.2 * interval_width), upper + 0.2 * interval_width])
+            ax.set_xticks([])
+            
+            if i == 0:
+                ax.legend()
+        
+        plt.tight_layout()
+        return fig

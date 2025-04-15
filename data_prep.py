@@ -271,7 +271,7 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
     
     # Log transform target if specified
     target_col_actual = target_col
-    log_transform_info = {'applied': False, 'epsilon': 0}
+    log_transform_info = {'applied': False, 'type': None, 'epsilon': 0}
     
     # If we're using piecewise transform for Radiation as target, use the transformed column
     if target_col == 'Radiation' and transform_info['applied']:
@@ -283,7 +283,12 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         df[f'{target_col}_log'] = np.log(df[target_col] + epsilon)
         # Use the log-transformed column as the target
         target_col_actual = f'{target_col}_log'
-        log_transform_info = {'applied': True, 'epsilon': epsilon, 'original_col': target_col}
+        log_transform_info = {
+            'applied': True, 
+            'type': 'log',  # Add the 'type' key to match inverse_transform expectations
+            'epsilon': epsilon, 
+            'original_col': target_col
+        }
         print(f"Log-transformed {target_col} -> {target_col_actual}")
     
     # Choose the appropriate scaler based on the standardize_features flag
