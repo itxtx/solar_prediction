@@ -133,10 +133,18 @@ class WeatherGRU(nn.Module):
         if target_scaler is not None:
             # Create dummy array with right shape for inverse_transform
             dummy = np.zeros((predictions.shape[0], target_scaler.n_features_in_))
-            # Assume target is last column
-            dummy[:, -1] = predictions.squeeze()
-            # Inverse transform
-            predictions = target_scaler.inverse_transform(dummy)[:, -1].reshape(-1, steps)
+            # Handle both single and multiple prediction steps
+            if predictions.ndim == 1:
+                dummy[:, -1] = predictions
+            else:
+                # For multiple steps, we need to reshape predictions
+                predictions_reshaped = predictions.reshape(-1)
+                dummy = np.zeros((len(predictions_reshaped), target_scaler.n_features_in_))
+                dummy[:, -1] = predictions_reshaped
+                # Inverse transform and reshape back
+                predictions = target_scaler.inverse_transform(dummy)[:, -1].reshape(-1, steps)
+            if predictions.ndim == 1:
+                predictions = predictions.reshape(-1, 1)
         
         return predictions
     
@@ -990,27 +998,7 @@ class WeatherGRU(nn.Module):
         # Make a copy to avoid modifying the original
         y_transformed = y.copy()
         
-        # Get the list of transforms in reverse order (to undo in reverse)
-        transforms = transform_info.get('transforms', [])[::-1]
-        
-        # Apply inverse transformations in reverse order
-        for transform in transforms:
-            transform_type = transform.get('type')
-            
-            if transform_type == 'log' and transform.get('applied', False):
-                # Undo log transform
-                if transform.get('offset', 0) > 0:
-                    # If log1p was used: exp(y) - offset
-                    y_transformed = np.exp(y_transformed) - transform.get('offset')
-                else:
-                    # If simple log was used
-                    y_transformed = np.exp(y_transformed)
-                    
-            elif transform_type == 'scale' and transform.get('applied', False):
-                # No direct inverse needed as the scaler will handle this
-                pass
-        
-        # Apply inverse scaling if scaler is provided
+        # First apply inverse scaling if scaler is provided
         if target_scaler is not None:
             # Create dummy array with the right shape for inverse_transform
             if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
@@ -1047,4 +1035,104 @@ class WeatherGRU(nn.Module):
                 y_transformed = target_scaler.inverse_transform(
                     y_transformed.reshape(-1, 1)).squeeze()
         
+        # Then apply any additional inverse transformations
+        if transform_info is not None:
+            transforms = transform_info.get('transforms', [])[::-1]
+            
+            for transform in transforms:
+                transform_type = transform.get('type')
+                
+                if transform_type == 'log' and transform.get('applied', False):
+                    # Undo log transform with numerical stability
+                    epsilon = transform.get('epsilon', 1e-6)
+                    if transform.get('offset', 0) > 0:
+                        # If log1p was used: exp(y) - offset
+                        y_transformed = np.exp(np.clip(y_transformed, -100, 100)) - transform.get('offset')
+                    else:
+                        # If simple log was used
+                        y_transformed = np.exp(np.clip(y_transformed, -100, 100))
+                    
+                    # Clip to reasonable range to prevent overflow
+                    y_transformed = np.clip(y_transformed, 0, 2000)  # Assuming max radiation is 2000
+        
         return y_transformed
+
+    def plot_predictions(self, X, y_true=None, mc_samples=30, target_scaler=None, 
+                        transform_info=None, figsize=(12, 6), device="cpu", alpha=0.05):
+        """
+        Plot predictions with uncertainty intervals
+        
+        Args:
+            X: Input data
+            y_true: Ground truth values (optional)
+            mc_samples: Number of Monte Carlo samples for uncertainty estimation
+            target_scaler: Scaler for inverse transformation
+            transform_info: Info about transformations applied to target
+            figsize: Figure size
+            device: Device for computation
+            alpha: Significance level for confidence intervals (default 0.05 for 95% CI)
+            
+        Returns:
+            matplotlib.figure.Figure: The figure containing the plot
+        """
+        # Get predictions with uncertainty
+        uncertainty = self.predict_with_uncertainty(
+            X, mc_samples=mc_samples, device=device,
+            target_scaler=target_scaler, transform_info=transform_info,
+            return_samples=True, alpha=alpha
+        )
+        
+        # Extract predictions and bounds
+        mean_pred = uncertainty['mean'].squeeze()
+        lower_ci = uncertainty['lower_ci'].squeeze()
+        upper_ci = uncertainty['upper_ci'].squeeze()
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Plot uncertainty interval
+        ax.fill_between(range(len(mean_pred)), lower_ci, upper_ci, 
+                       color='lightblue', alpha=0.3, label='95% Confidence Interval')
+        
+        # Plot mean prediction
+        ax.plot(mean_pred, 'b-', label='Predicted', linewidth=2)
+        
+        # Plot actual values if provided
+        if y_true is not None:
+            if not torch.is_tensor(y_true):
+                y_true = torch.tensor(y_true, dtype=torch.float32)
+            
+            y_true = y_true.numpy()
+            
+            # Apply inverse transformations if needed
+            if target_scaler is not None or transform_info is not None:
+                y_true = self._inverse_transform_target(y_true, target_scaler, transform_info)
+            
+            ax.plot(y_true, 'r-', label='Actual', linewidth=2)
+        
+        # Add formatting
+        ax.set_title('Radiation Prediction - Test Set', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Time Step', fontsize=12)
+        ax.set_ylabel('Radiation', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        
+        # Calculate and display metrics if ground truth is available
+        if y_true is not None:
+            metrics = {
+                'rmse': np.sqrt(mean_squared_error(y_true, mean_pred)),
+                'mape': mean_absolute_percentage_error(y_true, mean_pred) * 100,
+                'r2': r2_score(y_true, mean_pred)
+            }
+            
+            # Add metrics to the plot
+            metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
+                          f"MAPE: {metrics['mape']:.2f}%\n"
+                          f"R²: {metrics['r2']:.4f}")
+            
+            ax.text(0.02, 0.95, metrics_text, transform=ax.transAxes, 
+                   verticalalignment='top', bbox=dict(boxstyle='round', 
+                   facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        return fig

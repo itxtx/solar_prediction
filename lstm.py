@@ -383,27 +383,7 @@ class WeatherLSTM(nn.Module):
         # Make a copy to avoid modifying the original
         y_transformed = y.copy()
         
-        # Get the list of transforms in reverse order (to undo in reverse)
-        transforms = transform_info.get('transforms', [])[::-1]
-        
-        # Apply inverse transformations in reverse order
-        for transform in transforms:
-            transform_type = transform.get('type')
-            
-            if transform_type == 'log' and transform.get('applied', False):
-                # Undo log transform
-                if transform.get('offset', 0) > 0:
-                    # If log1p was used: exp(y) - offset
-                    y_transformed = np.exp(y_transformed) - transform.get('offset')
-                else:
-                    # If simple log was used
-                    y_transformed = np.exp(y_transformed)
-                    
-            elif transform_type == 'scale' and transform.get('applied', False):
-                # No direct inverse needed as the scaler will handle this
-                pass
-        
-        # Apply inverse scaling if scaler is provided
+        # First apply inverse scaling if scaler is provided
         if target_scaler is not None:
             # Create dummy array with the right shape for inverse_transform
             if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
@@ -439,6 +419,26 @@ class WeatherLSTM(nn.Module):
                 # If scaler was fitted only on target, just inverse transform directly
                 y_transformed = target_scaler.inverse_transform(
                     y_transformed.reshape(-1, 1)).squeeze()
+        
+        # Then apply any additional inverse transformations
+        if transform_info is not None:
+            transforms = transform_info.get('transforms', [])[::-1]
+            
+            for transform in transforms:
+                transform_type = transform.get('type')
+                
+                if transform_type == 'log' and transform.get('applied', False):
+                    # Undo log transform with numerical stability
+                    epsilon = transform.get('epsilon', 1e-6)
+                    if transform.get('offset', 0) > 0:
+                        # If log1p was used: exp(y) - offset
+                        y_transformed = np.exp(np.clip(y_transformed, -100, 100)) - transform.get('offset')
+                    else:
+                        # If simple log was used
+                        y_transformed = np.exp(np.clip(y_transformed, -100, 100))
+                    
+                    # Clip to reasonable range to prevent overflow
+                    y_transformed = np.clip(y_transformed, 0, 2000)  # Assuming max radiation is 2000
         
         return y_transformed
 
