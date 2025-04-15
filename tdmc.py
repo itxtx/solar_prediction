@@ -342,6 +342,80 @@ class SolarTDMC:
         
         return states
     
+    def _inverse_transform_target(self, y, target_scaler, transform_info):
+        """
+        Apply inverse transformations to recover original target values
+        
+        Args:
+            y: Transformed target values
+            target_scaler: Scaler used for the target
+            transform_info: Combined transform info dictionary
+            
+        Returns:
+            Original scale target values
+        """
+        # Make a copy to avoid modifying the original
+        y_transformed = y.copy()
+        
+        # Get the list of transforms in reverse order (to undo in reverse)
+        transforms = transform_info.get('transforms', [])[::-1]
+        
+        # Apply inverse transformations in reverse order
+        for transform in transforms:
+            transform_type = transform.get('type')
+            
+            if transform_type == 'log' and transform.get('applied', False):
+                # Undo log transform
+                if transform.get('offset', 0) > 0:
+                    # If log1p was used: exp(y) - offset
+                    y_transformed = np.exp(y_transformed) - transform.get('offset')
+                else:
+                    # If simple log was used
+                    y_transformed = np.exp(y_transformed)
+                    
+            elif transform_type == 'scale' and transform.get('applied', False):
+                # No direct inverse needed as the scaler will handle this
+                pass
+        
+        # Apply inverse scaling if scaler is provided
+        if target_scaler is not None:
+            # Create dummy array with the right shape for inverse_transform
+            if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
+                y_transformed = y_transformed.squeeze(axis=1)
+                
+            # Check if we need a dummy array (if y is just the target column)
+            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
+                # Create dummy array with zeros except for target column
+                dummy = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
+                
+                # Find target column index from transform_info
+                target_col = transform_info.get('target_col_original', -1)
+                if isinstance(target_col, str) and hasattr(target_scaler, 'feature_names_in_'):
+                    # If we have column names, find the index
+                    try:
+                        target_idx = np.where(target_scaler.feature_names_in_ == target_col)[0][0]
+                    except:
+                        # Default to last column if name not found
+                        target_idx = -1
+                else:
+                    # Default to the provided index or last column
+                    target_idx = -1 if isinstance(target_col, str) else target_col
+                
+                # Place values in the correct column
+                dummy[:, target_idx] = y_transformed
+                
+                # Apply inverse transform
+                transformed_dummy = target_scaler.inverse_transform(dummy)
+                
+                # Extract target column
+                y_transformed = transformed_dummy[:, target_idx]
+            else:
+                # If scaler was fitted only on target, just inverse transform directly
+                y_transformed = target_scaler.inverse_transform(
+                    y_transformed.reshape(-1, 1)).squeeze()
+        
+        return y_transformed
+
     def forecast(self, X_last, timestamps_last, forecast_horizon, weather_forecasts=None):
         """
         Forecast future solar irradiance.
@@ -414,10 +488,17 @@ class SolarTDMC:
             confidence_lower[step] = forecasts[step] - 1.96 * forecast_std
             confidence_upper[step] = forecasts[step] + 1.96 * forecast_std
         
-        # Inverse transform to original scale
-        forecasts = self.scaler.inverse_transform(forecasts)
-        confidence_lower = self.scaler.inverse_transform(confidence_lower)
-        confidence_upper = self.scaler.inverse_transform(confidence_upper)
+        # Inverse transform to original scale using the new method
+        transform_info = {
+            'transforms': [
+                {'type': 'scale', 'applied': True}
+            ],
+            'target_col_original': -1  # Use all columns
+        }
+        
+        forecasts = self._inverse_transform_target(forecasts, self.scaler, transform_info)
+        confidence_lower = self._inverse_transform_target(confidence_lower, self.scaler, transform_info)
+        confidence_upper = self._inverse_transform_target(confidence_upper, self.scaler, transform_info)
         
         return forecasts, (confidence_lower, confidence_upper)
     
