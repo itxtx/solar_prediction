@@ -6,8 +6,6 @@ from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from scipy.stats import multivariate_normal
-from sklearn.decomposition import PCA
-from data_prep import pca_transform
 
 class SolarTDMC:
     """
@@ -36,9 +34,6 @@ class SolarTDMC:
         self.n_emissions = n_emissions
         self.time_slices = time_slices
         self.n_components = n_components
-        
-        # Initialize PCA
-        self.pca = PCA(n_components=n_components)
         
         # Initialize time-dependent transition matrices (one for each time slice)
         self.transitions = np.zeros((time_slices, n_states, n_states))
@@ -323,7 +318,8 @@ class SolarTDMC:
                 self.emission_covars[s] = cov + 1e-3 * np.eye(self.n_emissions)
         
         return log_likelihood
-    
+
+
     def predict_states(self, X, timestamps=None):
         """
         Predict the most likely hidden state sequence using Viterbi algorithm.
@@ -331,18 +327,42 @@ class SolarTDMC:
         if not self.trained:
             raise ValueError("Model not trained yet")
         
-        # Preprocess data using the new pca_transform function
-        X_scaled, time_indices, _ = pca_transform(X, timestamps, self.n_components, self.pca)
-        n_samples = len(X_scaled)
+        # Handle input shape
+        if len(X.shape) == 3:
+            # If input is already in (n_samples, sequence_length, n_features) format
+            X_scaled = X
+        else:
+            # If input is in (sequence_length, n_features) format, add batch dimension
+            X_scaled = X.reshape(1, X.shape[0], X.shape[1])
         
-        # Compute emission probabilities
+        # Convert timestamps to hour values and reshape to match sequence length
+        sequence_length = X_scaled.shape[1]
+        if timestamps is not None:
+            # Convert timestamps to hour values (0-23)
+            if isinstance(timestamps[0], (pd.Timestamp, np.datetime64)):
+                hours = np.array([ts.hour for ts in timestamps])
+            else:
+                hours = timestamps
+            # Reshape to match sequence length
+            time_indices = np.repeat(hours[:, np.newaxis], sequence_length, axis=1)
+        else:
+            time_indices = np.zeros((X_scaled.shape[0], sequence_length), dtype=int)
+        
+        n_samples = X_scaled.shape[0]
+        
+        # Compute emission probabilities for each sequence
         emission_probs = np.zeros((n_samples, self.n_states))
         for s in range(self.n_states):
             mvn = multivariate_normal(
                 mean=self.emission_means[s],
                 cov=self.emission_covars[s]
             )
-            emission_probs[:, s] = mvn.pdf(X_scaled)
+            # Calculate PDF for each time step in each sequence, then average
+            for i in range(n_samples):
+                step_probs = []
+                for t in range(sequence_length):
+                    step_probs.append(mvn.pdf(X_scaled[i, t]))
+                emission_probs[i, s] = np.mean(step_probs)
         
         # Initialize Viterbi variables
         viterbi = np.zeros((n_samples, self.n_states))
@@ -353,7 +373,7 @@ class SolarTDMC:
         
         # Recursion
         for t in range(1, n_samples):
-            time_slice = time_indices[t-1]
+            time_slice = time_indices[t-1, 0]  # Use first time index for each sequence
             for s in range(self.n_states):
                 # Calculate probabilities and find the best previous state
                 probs = viterbi[t-1] + np.log(self.transitions[time_slice, :, s] + 1e-10)
@@ -367,7 +387,7 @@ class SolarTDMC:
             states[t] = backpointers[t+1, states[t+1]]
         
         return states
-    
+
     def forecast(self, X_last, timestamps_last, forecast_horizon, weather_forecasts=None):
         """
         Forecast future solar irradiance.
@@ -383,11 +403,8 @@ class SolarTDMC:
             # If input is in (sequence_length, n_features) format, add batch dimension
             X_last_scaled = X_last.reshape(1, X_last.shape[0], X_last.shape[1])
         
-        # Preprocess the data using the new pca_transform function
-        X_last_scaled, _, _ = pca_transform(X_last_scaled, None, self.n_components, self.pca)
-        
         # Take the last time step for state probability calculation
-        X_last_scaled = X_last_scaled[0, -1, :]  # Shape: (n_components,)
+        X_last_point = X_last_scaled[0, -1, :]  # Shape: (n_features,)
         
         # Calculate emission probabilities for current state
         state_probs = np.zeros(self.n_states)
@@ -397,17 +414,20 @@ class SolarTDMC:
                     mean=self.emission_means[s],
                     cov=self.emission_covars[s]
                 )
-                state_probs[s] = mvn.pdf(X_last_scaled)
+                state_probs[s] = mvn.pdf(X_last_point)
             except:
                 # Fallback to simple Gaussian approximation
                 state_probs[s] = np.exp(-0.5 * np.sum(
-                    (X_last_scaled - self.emission_means[s])**2
+                    (X_last_point - self.emission_means[s])**2
                 ))
         
         current_state = np.argmax(state_probs)
         
-        # Generate future timestamps
-        if isinstance(timestamps_last, (pd.Timestamp, np.datetime64)):
+        # Generate future timestamps - handle None case properly
+        if timestamps_last is None:
+            # Default to starting from hour 0 if no timestamp is provided
+            future_time_indices = [(i % self.time_slices) for i in range(forecast_horizon)]
+        elif isinstance(timestamps_last, (pd.Timestamp, np.datetime64)):
             future_timestamps = [timestamps_last + pd.Timedelta(hours=i+1) for i in range(forecast_horizon)]
             future_time_indices = np.array([ts.hour for ts in future_timestamps])
         else:
@@ -957,29 +977,3 @@ class SolarTDMC:
             fig.colorbar(im, ax=axes, label='Transition Probability')
             plt.tight_layout()
             plt.show()
-
-    def inverse_transform(self, X_transformed):
-        """
-        Transform PCA-reduced data back to original feature space.
-        
-        Parameters:
-        -----------
-        X_transformed : array-like
-            Data in PCA space
-            
-        Returns:
-        --------
-        X_original : array-like
-            Data in original feature space
-        """
-        if not hasattr(self.pca, 'components_'):
-            raise ValueError("PCA has not been fitted yet")
-            
-        # Reshape if necessary
-        if len(X_transformed.shape) == 3:
-            n_samples, sequence_length, n_components = X_transformed.shape
-            X_reshaped = X_transformed.reshape(-1, n_components)
-            X_original = self.pca.inverse_transform(X_reshaped)
-            return X_original.reshape(n_samples, sequence_length, -1)
-        else:
-            return self.pca.inverse_transform(X_transformed)
