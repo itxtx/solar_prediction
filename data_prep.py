@@ -323,18 +323,17 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         target_col_actual = 'Radiation_transformed'
         print(f"Using transformed radiation as target: {target_col_actual}")
     elif log_transform and target_col in ['Temperature', 'Radiation', 'Speed']:
-        # Add a small constant to avoid log(0)
-        epsilon = 1e-6
-        df[f'{target_col}_log'] = np.log(df[target_col] + epsilon)
-        # Use the log-transformed column as the target
-        target_col_actual = f'{target_col}_log'
+        # --- CHANGE START ---
+        # Use log1p for better handling of values near zero
+        df[f'{target_col}_log1p'] = np.log1p(df[target_col])
+        # Use the log1p-transformed column as the target
+        target_col_actual = f'{target_col}_log1p'
         log_transform_info = {
-            'applied': True, 
-            'type': 'log',  # Add the 'type' key to match inverse_transform expectations
-            'epsilon': epsilon, 
+            'applied': True,
+            'type': 'log1p', # Indicate log1p was used
+            # 'epsilon': epsilon, # Epsilon no longer needed for log1p
             'original_col': target_col
-        }
-        print(f"Log-transformed {target_col} -> {target_col_actual}")
+    }
     
     # Choose the appropriate scaler based on the standardize_features flag
     ScalerClass = StandardScaler if standardize_features else MinMaxScaler

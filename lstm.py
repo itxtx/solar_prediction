@@ -324,7 +324,7 @@ class WeatherLSTM(nn.Module):
             val_r2 = r2_score(val_actuals, val_predictions)
             
             # Calculate MAPE with protection against zero values
-            epsilon = 1.0
+            epsilon = 1e-8
             val_mape = np.mean(np.abs((val_actuals - val_predictions) / (np.abs(val_actuals) + epsilon))) * 100
             
             # Store metrics in history
