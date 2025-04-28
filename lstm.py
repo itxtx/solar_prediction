@@ -368,79 +368,86 @@ class WeatherLSTM(nn.Module):
         
         return self
     
+ # Replace the existing _inverse_transform_target method in WeatherLSTM class
+
     def _inverse_transform_target(self, y, target_scaler, transform_info):
         """
-        Apply inverse transformations to recover original target values
-        
+        Apply inverse transformations to recover original target values.
+        Handles inverse scaling (MinMax or Standard) followed by inverse log1p.
+
         Args:
-            y: Transformed target values
-            target_scaler: Scaler used for the target
-            transform_info: Combined transform info dictionary
-            
+            y: Transformed target values (numpy array, 1D or 2D with one column)
+            target_scaler: Scaler object used for the target (e.g., MinMaxScaler, StandardScaler)
+            transform_info: Dictionary containing transformation details
+
         Returns:
-            Original scale target values
+            Original scale target values (numpy array, 1D)
         """
+        if y is None:
+            return None
+
+        # Ensure y is a NumPy array
+        if torch.is_tensor(y):
+            y = y.cpu().numpy()
+
         # Make a copy to avoid modifying the original
-        y_transformed = y.copy()
-        
-        # First apply inverse scaling if scaler is provided
+        y_processed = y.copy()
+
+        # Ensure y_processed is 2D for scaler
+        if y_processed.ndim == 1:
+            y_processed = y_processed.reshape(-1, 1)
+
+        applied_scaler = False
+        applied_log1p = False
+
+        # --- Step 1: Inverse Scaling ---
         if target_scaler is not None:
-            # Create dummy array with the right shape for inverse_transform
-            if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
-                y_transformed = y_transformed.squeeze(axis=1)
-                
-            # Check if we need a dummy array (if y is just the target column)
-            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
-                # Create dummy array with zeros except for target column
-                dummy = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
-                
-                # Find target column index from transform_info
-                target_col = transform_info.get('target_col_original', -1)
-                if isinstance(target_col, str) and hasattr(target_scaler, 'feature_names_in_'):
-                    # If we have column names, find the index
-                    try:
-                        target_idx = np.where(target_scaler.feature_names_in_ == target_col)[0][0]
-                    except:
-                        # Default to last column if name not found
-                        target_idx = -1
+            try:
+                # Assumes target_scaler was fit only on the target variable
+                y_processed = target_scaler.inverse_transform(y_processed)
+                applied_scaler = True
+                # print("DEBUG: Applied inverse scaling.") # Optional debug print
+            except Exception as e:
+                print(f"Warning: Error during inverse scaling: {e}. Proceeding without inverse scaling.")
+
+        # --- Step 2: Inverse Log1p ---
+        log_info = None
+        if transform_info and 'transforms' in transform_info:
+            # Find the log transform info entry
+            for t_info in transform_info['transforms']:
+                if t_info.get('type') in ['log', 'log1p']:
+                    log_info = t_info
+                    break
+
+        if log_info and log_info.get('applied', False):
+            log_type = log_info.get('type')
+            # print(f"DEBUG: Applying inverse for log type: {log_type}") # Optional debug print
+            try:
+                if log_type == 'log1p':
+                    # Inverse of log1p(x) is expm1(y) = exp(y) - 1
+                    # Clip input to expm1 for numerical stability
+                    clipped_input = np.clip(y_processed, -700, 700)
+                    y_processed = np.expm1(clipped_input)
+                    applied_log1p = True
+                elif log_type == 'log':
+                    # Inverse of log(x + epsilon) is exp(y) - epsilon
+                    epsilon = log_info.get('epsilon', 1e-8) # Default epsilon if not stored
+                    # Clip input to exp for numerical stability
+                    clipped_input = np.clip(y_processed, -700, 700)
+                    y_processed = np.exp(clipped_input) - epsilon
+                    applied_log1p = True
                 else:
-                    # Default to the provided index or last column
-                    target_idx = -1 if isinstance(target_col, str) else target_col
-                
-                # Place values in the correct column
-                dummy[:, target_idx] = y_transformed
-                
-                # Apply inverse transform
-                transformed_dummy = target_scaler.inverse_transform(dummy)
-                
-                # Extract target column
-                y_transformed = transformed_dummy[:, target_idx]
-            else:
-                # If scaler was fitted only on target, just inverse transform directly
-                y_transformed = target_scaler.inverse_transform(
-                    y_transformed.reshape(-1, 1)).squeeze()
-        
-        # Then apply any additional inverse transformations
-        if transform_info is not None:
-            transforms = transform_info.get('transforms', [])[::-1]
-            
-            for transform in transforms:
-                transform_type = transform.get('type')
-                
-                if transform_type == 'log' and transform.get('applied', False):
-                    # Undo log transform with numerical stability
-                    epsilon = transform.get('epsilon', 1e-6)
-                    if transform.get('offset', 0) > 0:
-                        # If log1p was used: exp(y) - offset
-                        y_transformed = np.exp(np.clip(y_transformed, -100, 100)) - transform.get('offset')
-                    else:
-                        # If simple log was used
-                        y_transformed = np.exp(np.clip(y_transformed, -100, 100))
-                    
-                    # Clip to reasonable range to prevent overflow
-                    y_transformed = np.clip(y_transformed, 0, 2000)  # Assuming max radiation is 2000
-        
-        return y_transformed
+                    print(f"Warning: Unknown log type '{log_type}' found in transform_info. Cannot apply inverse log.")
+
+                # Ensure non-negative results after inverse log/log1p
+                y_processed = np.maximum(0, y_processed)
+
+            except Exception as e:
+                print(f"Warning: Error during inverse log transform: {e}. Result might be inaccurate.")
+
+
+        # Return as a 1D array
+        return y_processed.flatten()
 
     def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, transform_info=None):
         """
