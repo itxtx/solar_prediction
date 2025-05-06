@@ -135,12 +135,14 @@ class WeatherLSTM(nn.Module):
         
         # First dense layer with batch normalization
         out = self.fc1(out)
-        out = self.relu(out)
+        #out = self.relu(out)
+        out = nn.LeakyReLU(negative_slope=0.02)(out)
         out = self.dropout2(out)
         
         # Second hidden layer with batch normalization
         out = self.fc2(out)
-        out = self.relu2(out)
+        #out = self.relu2(out)
+        out = nn.LeakyReLU(negative_slope=0.01)(out)
         out = self.dropout3(out)
         
         # Output layer
@@ -594,8 +596,8 @@ class WeatherLSTM(nn.Module):
                 # print(f"Test R² (original scale): {r2_original:.6f}") # Uncomment if used
                 print(f"Test MAPE (original scale): {mape_original:.2f}%")
                 print(f"Test MAPE (original scale, capped at 100% error per point): {mape_original_capped:.2f}%")
-                print(f"Target scaler mean: {target_scaler_object.mean_[0]:.4f}")
-                print(f"Target scaler scale: {target_scaler_object.scale_[0]:.4f}")
+                #print(f"Target scaler mean: {target_scaler_object.mean_[0]:.4f}")
+                #print(f"Target scaler scale: {target_scaler_object.scale_[0]:.4f}")
                 original_scale_metrics_results = {
                     'rmse': rmse_original, 
                     # 'r2': r2_original, # Uncomment if used

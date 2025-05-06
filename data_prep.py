@@ -51,6 +51,10 @@ def create_solar_elevation_proxy(time_str, sunrise_str, sunset_str):
     
     # Return value between 0-1 representing solar elevation
     return math.sin(position * math.pi/2)  # Creates sine curve peaking at 1.0 during midday
+
+
+
+# Assume piecewise_radiation_transform is defined globally as provided
 def piecewise_radiation_transform(radiation_values):
     """
     Applies different scaling to different radiation ranges.
@@ -69,49 +73,56 @@ def piecewise_radiation_transform(radiation_values):
     transformed[night_mask] = np.log1p(radiation_values[night_mask]) 
     
     # Morning/evening radiation (moderate scaling)
-    # For radiation = 10, transformed = log1p(10) + 0.5 * (10 - 10) = log1p(10)
-    # For radiation = 199, transformed = log1p(10) + 0.5 * (199 - 10) = log1p(10) + 0.5 * 189
     moderate_mask = (radiation_values >= 10) & (radiation_values < 200)
     transformed[moderate_mask] = np.log1p(9.999) + 0.05 * (radiation_values[moderate_mask] - 10) # Adjusted scaling factor
     
     # Midday/high radiation (reduced compression)
-    # For radiation = 200
     high_mask = radiation_values >= 200
-    # Max value from moderate transform (approx value at just under 200)
     moderate_max = np.log1p(9.999) + 0.05 * (199.999 - 10) 
     transformed[high_mask] = moderate_max + 0.002 * (radiation_values[high_mask] - 200) # Adjusted scaling factor
 
     return transformed
 
-def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size=0.25, 
-                         log_transform=False, min_target_threshold=None, # min_target_threshold is for original scale
+def prepare_weather_data(df_input, target_col, window_size=12, test_size=0.2, val_size=0.25, 
+                         log_transform=False, 
+                         min_radiation_for_log=0.1, # Floor for original radiation before log
+                         # --- NEW PARAMETERS FOR CLIPPING LOGGED VALUES ---
+                         clip_log_target=False, # Flag to enable/disable clipping of log_target
+                         log_clip_lower_percentile=1.0, # e.g., 1st percentile
+                         log_clip_upper_percentile=99.0, # e.g., 99th percentile
+                         # --- End of new parameters ---
                          use_piecewise_transform=False, use_solar_elevation=True,
                          standardize_features=False, feature_selection_mode='all',
-                         min_radiation_for_log=0.1): # NEW PARAMETER
+                         min_target_threshold=None): # min_target_threshold for original scale
     """
     Prepare weather time series data for LSTM training with enhanced features.
-    Includes a floor for radiation values before log transformation if target_col is 'Radiation'.
+    Includes flooring for radiation before log, and optional clipping of log-transformed target.
     
     Args:
-        df: DataFrame with weather data.
+        df_input: DataFrame with weather data. Will be copied.
         target_col: Column to predict (e.g., 'Temperature', 'Humidity', etc.).
         window_size: Size of the sliding window for sequence creation.
         test_size: Proportion of data to use for testing.
         val_size: Proportion of training data to use for validation.
         log_transform: Whether to apply log transformation to the target column.
-        min_target_threshold: Minimum threshold for target values (applied to original target_col).
+        min_radiation_for_log: Floor value for radiation before log transform if target is Radiation.
+        clip_log_target: Whether to clip the log-transformed target values.
+        log_clip_lower_percentile: Lower percentile for clipping log-transformed target.
+        log_clip_upper_percentile: Upper percentile for clipping log-transformed target.
         use_piecewise_transform: Whether to apply piecewise transform for Radiation.
         use_solar_elevation: Whether to add solar elevation proxy feature.
         standardize_features: Whether to use StandardScaler (True) instead of MinMaxScaler (False).
         feature_selection_mode: 'all', 'basic', or 'minimal' for different feature set sizes.
-        min_radiation_for_log: Floor value for radiation before log transform if target is Radiation.
+        min_target_threshold: Minimum threshold for target values (applied to original target_col).
         
     Returns:
         X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info
     """
+    df = df_input.copy() # Work on a copy
+
     # Sort by UNIXTime (ascending) to ensure chronological order
     if 'UNIXTime' in df.columns:
-        df = df.sort_values('UNIXTime').reset_index(drop=True) # Reset index after sorting
+        df = df.sort_values('UNIXTime').reset_index(drop=True)
     
     # --- Time Feature Processing ---
     def time_to_minutes(time_val):
@@ -140,52 +151,39 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         df['SunriseMinutes'] = df['TimeSunRise'].apply(time_to_minutes)
         df['SunsetMinutes'] = df['TimeSunSet'].apply(time_to_minutes)
         df['DaylightMinutes'] = df['SunsetMinutes'] - df['SunriseMinutes']
-        df.loc[df['DaylightMinutes'] < 0, 'DaylightMinutes'] += 1440 # Adjust for next day
+        df.loc[df['DaylightMinutes'] < 0, 'DaylightMinutes'] += 1440
 
         if 'TimeMinutes' in df.columns:
             df['IsDaylight'] = ((df['TimeMinutes'] >= df['SunriseMinutes']) & \
                                (df['TimeMinutes'] <= df['SunsetMinutes'])).astype(float)
             df['TimeSinceSunrise'] = (df['TimeMinutes'] - df['SunriseMinutes'])
-            # Adjust for times before sunrise on the same day or after sunset previous day
             df.loc[df['TimeSinceSunrise'] < 0, 'TimeSinceSunrise'] += 1440 
-            
             df['TimeUntilSunset'] = (df['SunsetMinutes'] - df['TimeMinutes'])
-             # Adjust for times after sunset or before sunrise next day
             df.loc[df['TimeUntilSunset'] < 0, 'TimeUntilSunset'] += 1440
-
             df['DaylightPosition'] = (df['TimeSinceSunrise'] / df['DaylightMinutes']).clip(0, 1)
             
             if use_solar_elevation:
                 print("Adding solar elevation proxy feature")
                 df['SolarElevation'] = 0.0
                 valid_idx = df[['TimeMinutes', 'SunriseMinutes', 'SunsetMinutes', 'DaylightMinutes']].dropna().index
-                # Ensure DaylightMinutes is not zero to avoid division by zero
                 valid_idx = valid_idx.intersection(df[df['DaylightMinutes'] > 0].index)
-
-                # Using DaylightPosition (0 to 1 from sunrise to sunset)
-                # sin(pi * x) gives a 0-1-0 curve for x in 0-1.
-                # sin(pi/2 * x) gives a 0-1 curve for x in 0-1 (quarter sine wave).
-                # Let's use sin(pi * x) for a more representative solar arch.
                 df.loc[valid_idx, 'SolarElevation'] = df.loc[valid_idx, 'DaylightPosition'].apply(
                     lambda x: math.sin(x * math.pi) if (x >= 0 and x <= 1) else 0
                 )
                 print(f"SolarElevation created for {len(valid_idx)} rows, {len(valid_idx)/len(df)*100:.1f}% of data")
 
     # --- Target Pre-processing and Transformation ---
-    # Apply minimum threshold to the original target variable if specified
     if min_target_threshold is not None and target_col in df.columns:
-        print(f"Applying minimum threshold of {min_target_threshold} to original '{target_col}'")
+        print(f"Applying min_target_threshold of {min_target_threshold} to original '{target_col}'")
         below_threshold_count = (df[target_col] < min_target_threshold).sum()
         if below_threshold_count > 0:
             print(f"Found {below_threshold_count} values in '{target_col}' below threshold ({below_threshold_count/len(df)*100:.2f}% of data). Clipping.")
             df[target_col] = df[target_col].clip(lower=min_target_threshold)
 
-    # Initialize current name for the target column being processed
-    target_col_processing = target_col
+    target_col_processing = target_col # This variable will track the name of the target column as it's transformed
     
-    # Details for transformations
     piecewise_transform_details = {'applied': False, 'type': None, 'original_col': None}
-    log_transform_details = {'applied': False, 'type': None, 'offset': 0, 'original_col': None}
+    log_transform_details = {'applied': False, 'type': None, 'offset': 0, 'original_col': None, 'clip_bounds': None} # Added clip_bounds
 
     # 1. Apply Piecewise Transform (if applicable)
     if target_col == 'Radiation' and use_piecewise_transform:
@@ -197,53 +195,66 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
 
     # 2. Apply Log Transform (if applicable, to the current state of target_col_processing)
     if log_transform:
-        is_radiation_type = (target_col_processing == 'Radiation' or target_col_processing == 'Radiation_transformed')
-        # Check original target name for other types if target_col_processing is still target_col
-        is_other_loggable_type = (target_col_processing == target_col and target_col in ['Temperature', 'Speed'])
+        # Determine if the current target_col_processing is eligible for log transform
+        # Eligible if it's 'Radiation' or 'Radiation_transformed' (if piecewise was applied to Radiation),
+        # or if it's 'Temperature' or 'Speed' (and no piecewise transform made it something else).
+        eligible_for_log = False
+        is_radiation_family = target_col_processing == 'Radiation' or \
+                              (piecewise_transform_details['applied'] and piecewise_transform_details['original_col'] == 'Radiation' and target_col_processing == 'Radiation_transformed')
+        is_other_loggable = target_col_processing in ['Temperature', 'Speed'] and not piecewise_transform_details['applied'] # only if not already piecewise transformed
 
-        if (is_radiation_type or is_other_loggable_type) and target_col_processing in df.columns:
-            epsilon = 1e-6 # Small constant to avoid log(0) or log of very small numbers
+        if is_radiation_family or is_other_loggable:
+            eligible_for_log = True
+
+        if eligible_for_log and target_col_processing in df.columns:
+            epsilon = 1e-6 
             original_values_for_log = df[target_col_processing].copy()
-            log_applied_to_col = target_col_processing 
+            log_input_col_name = target_col_processing # The column name that is being log-transformed
+            log_output_col_name = f'{log_input_col_name}_log'
 
-            if is_radiation_type:
-                print(f"Applying floor of {min_radiation_for_log} to '{log_applied_to_col}' before log transform.")
+            if is_radiation_family:
+                print(f"Applying floor of {min_radiation_for_log} to '{log_input_col_name}' before log transform.")
                 floored_values = np.maximum(original_values_for_log, min_radiation_for_log)
-                # Ensure argument to log is positive
-                df[f'{log_applied_to_col}_log'] = np.log(np.maximum(floored_values, epsilon / 10) + epsilon) 
+                df[log_output_col_name] = np.log(floored_values + epsilon) # Assumes min_radiation_for_log is positive
             else: # For Temperature, Speed
-                if (original_values_for_log <= 0).any():
-                     print(f"Warning: Column '{log_applied_to_col}' contains non-positive values. Clamping to 0 before adding epsilon for log transform.")
-                # Ensure argument to log is positive
-                df[f'{log_applied_to_col}_log'] = np.log(np.maximum(original_values_for_log, 0) + epsilon)
-            
-            new_target_col_name = f'{log_applied_to_col}_log'
+                # Ensure values are positive before log.
+                df[log_output_col_name] = np.log(np.maximum(original_values_for_log, epsilon) + epsilon) 
+
             log_transform_details = {
                 'applied': True, 'type': 'log', 'offset': epsilon, 
-                'original_col': log_applied_to_col # The column name that was fed into the log function
+                'original_col': log_input_col_name, # Column that was fed into log
+                'clip_bounds': None # Initialize, will be updated if clipping is applied
             }
-            target_col_processing = new_target_col_name 
+            target_col_processing = log_output_col_name 
             print(f"Log-transformed '{log_transform_details['original_col']}' -> '{target_col_processing}'")
-        elif target_col_processing not in df.columns:
+
+            # --- NEW: Clipping of log-transformed target values ---
+            if clip_log_target:
+                log_values = df[target_col_processing].values
+                lower_bound = np.percentile(log_values, log_clip_lower_percentile)
+                upper_bound = np.percentile(log_values, log_clip_upper_percentile)
+                
+                log_transform_details['clip_bounds'] = (float(lower_bound), float(upper_bound)) # Store clip bounds
+
+                print(f"Clipping '{target_col_processing}' to range [{lower_bound:.4f}, {upper_bound:.4f}] "
+                      f"(based on {log_clip_lower_percentile}th and {log_clip_upper_percentile}th percentiles).")
+                df[target_col_processing] = np.clip(log_values, lower_bound, upper_bound)
+        
+        elif not eligible_for_log:
+             print(f"Log transform not applied to '{target_col_processing}' as it's not an eligible type or configuration.")
+        elif target_col_processing not in df.columns : # Should not happen if logic is correct
              print(f"Warning: Column '{target_col_processing}' designated for log transform not found. Skipping log transform.")
-        else: # Not eligible or not found
-            print(f"Log transform not applied to '{target_col_processing}' as it's not an eligible type (e.g., Humidity) or configuration.")
     
-    # Final name of the target column to be scaled and used for y
-    target_col_actual = target_col_processing
+    target_col_actual = target_col_processing # This is the final name of the target column before scaling
 
     # --- Feature Engineering & Selection ---
-    if target_col_actual in ['Temperature', 'Radiation', 'Speed', 'Radiation_transformed', f"{target_col}_log", f"Radiation_transformed_log"]: # Check if target_col_actual is one of these
-        # Use the state of the target column *before* scaling for this indicator
-        # If target_col_actual is already logged, this quantile might be on log scale.
-        # It's often better to define 'is_low' based on the original scale or a consistent transformed scale.
-        # For simplicity, using target_col_actual here. Consider defining based on 'target_col' or 'target_col_processing' before log.
-        low_threshold_col_ref = target_col # Base this on the original target for clearer interpretation
+    # (Using original target_col for the _is_low feature for consistency)
+    if target_col in ['Temperature', 'Radiation', 'Speed']: 
+        low_threshold_col_ref = target_col 
         if low_threshold_col_ref in df.columns:
             low_threshold = df[low_threshold_col_ref].quantile(0.1)
             df[f'{low_threshold_col_ref}_is_low'] = (df[low_threshold_col_ref] < low_threshold).astype(float)
             print(f"Added '{low_threshold_col_ref}_is_low' feature (threshold: {low_threshold:.4f} based on original '{low_threshold_col_ref}')")
-
 
     base_feature_cols_map = {
         'minimal': ['Radiation', 'Temperature', 'Humidity', 'TimeMinutesSin', 'TimeMinutesCos'],
@@ -252,14 +263,12 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
     }
     base_feature_cols = [col for col in base_feature_cols_map.get(feature_selection_mode, base_feature_cols_map['all']) if col in df.columns]
 
-    # Add low value indicator for the original target column if created
     low_indicator_col = f'{target_col}_is_low'
     if low_indicator_col in df.columns and low_indicator_col not in base_feature_cols:
         base_feature_cols.append(low_indicator_col)
         
     if 'SolarElevation' in df.columns and use_solar_elevation and 'SolarElevation' not in base_feature_cols:
         base_feature_cols.append('SolarElevation')
-        print("Added SolarElevation to features")
 
     time_features = ['SunriseMinutes', 'SunsetMinutes', 'DaylightMinutes', 'TimeSinceSunrise', 
                      'TimeUntilSunset', 'DaylightPosition', 'TimeMinutesSin', 'TimeMinutesCos', 
@@ -270,30 +279,24 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         if feature in df.columns and feature not in feature_cols and df[feature].isna().sum() == 0:
             feature_cols.append(feature)
             
-    # Ensure target_col_actual is not in feature_cols to prevent data leakage if it shares a base name
-    # with an original feature (e.g. if target_col_actual is 'Radiation' and 'Radiation' is also a feature)
-    # However, if target_col_actual is 'Radiation_transformed_log', original 'Radiation' can be a feature.
-    # This is usually handled by LSTM structure, but good to be mindful.
-    # For now, we assume feature_cols are distinct inputs from the target_col_actual.
     if target_col_actual in feature_cols:
-        print(f"Warning: Final target column '{target_col_actual}' is also in feature_cols. Removing it from features to avoid direct leakage.")
+        print(f"Warning: Final target column '{target_col_actual}' is also in feature_cols. Removing it from features.")
         feature_cols = [f for f in feature_cols if f != target_col_actual]
 
-
-    feature_cols = [col for col in feature_cols if col in df.columns] # Final check
+    feature_cols = [col for col in feature_cols if col in df.columns] 
     if not feature_cols:
         raise ValueError("No feature columns selected or available in the DataFrame after processing.")
         
     df_for_scaling = df[feature_cols + ([target_col_actual] if target_col_actual not in feature_cols else [])].copy()
-    df_for_scaling = df_for_scaling.fillna(method='ffill').fillna(method='bfill') # Fill NaNs in selected features and target
+    df_for_scaling = df_for_scaling.fillna(method='ffill').fillna(method='bfill')
 
     # --- Scaling ---
     ScalerClass = StandardScaler if standardize_features else MinMaxScaler
     scaler_name = "StandardScaler" if standardize_features else "MinMaxScaler"
     print(f"Using {scaler_name} for feature and target scaling.")
     
-    scalers = {}
-    scaled_data_df = pd.DataFrame(index=df_for_scaling.index) # Preserve index
+    scalers = {} # Use 'scalers' to match existing return structure
+    scaled_data_df = pd.DataFrame(index=df_for_scaling.index) 
 
     for col in feature_cols:
         scaler = ScalerClass() if standardize_features else ScalerClass(feature_range=(0, 1))
@@ -301,26 +304,27 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         scaled_data_df[col] = scaler.fit_transform(values).flatten()
         scalers[col] = scaler
 
-    if target_col_actual not in df.columns:
-        raise ValueError(f"Final target column '{target_col_actual}' not found in DataFrame before scaling. Transformations might have failed or column was dropped.")
+    if target_col_actual not in df_for_scaling.columns: # Check in df_for_scaling
+        raise ValueError(f"Final target column '{target_col_actual}' not found in DataFrame subset for scaling.")
 
     target_scaler = ScalerClass() if standardize_features else ScalerClass(feature_range=(0, 1))
     target_values_to_scale = df_for_scaling[target_col_actual].values.reshape(-1, 1)
     
-    print(f"DEBUG [PREPARE DATA]: Stats for target '{target_col_actual}' BEFORE scaling: "
+    print(f"DEBUG [PREPARE DATA]: Stats for target '{target_col_actual}' BEFORE scaling (after potential log and clip): "
           f"Mean={np.mean(target_values_to_scale):.4f}, Std={np.std(target_values_to_scale):.4f}, "
           f"Min={np.min(target_values_to_scale):.4f}, Max={np.max(target_values_to_scale):.4f}")
           
     scaled_data_df[target_col_actual] = target_scaler.fit_transform(target_values_to_scale).flatten()
-    scalers[target_col_actual] = target_scaler
+    scalers[target_col_actual] = target_scaler # Store the target scaler
     
     print(f"DEBUG [PREPARE DATA]: Stats for target '{target_col_actual}' AFTER scaling: "
           f"Mean={np.mean(scaled_data_df[target_col_actual]):.4f}, Std={np.std(scaled_data_df[target_col_actual]):.4f}, "
           f"Min={np.min(scaled_data_df[target_col_actual]):.4f}, Max={np.max(scaled_data_df[target_col_actual]):.4f}")
+    if isinstance(target_scaler, StandardScaler):
+        print(f"DEBUG [PREPARE DATA]: Target Scaler learned mean: {target_scaler.mean_[0]:.4f}, scale (std): {target_scaler.scale_[0]:.4f}")
 
     # --- Create Sequences ---
     X, y = [], []
-    # Ensure there's enough data for at least one sequence
     if len(scaled_data_df) <= window_size:
         raise ValueError(f"Data length ({len(scaled_data_df)}) is less than or equal to window_size ({window_size}). Cannot create sequences.")
 
@@ -329,18 +333,22 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         y.append(scaled_data_df[target_col_actual].iloc[i+window_size])
     
     X = np.array(X)
-    y = np.array(y).reshape(-1, 1) # Ensure y is 2D for scikit-learn/Keras
+    y = np.array(y).reshape(-1, 1) 
     
     # --- Train/Validation/Test Split ---
     X_temp, X_test, y_temp, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
-    # Adjust val_size relative to the new temporary training set size
     actual_val_size = val_size / (1 - test_size) if (1 - test_size) > 0 else 0 
-    if actual_val_size >= 1.0 or actual_val_size <=0: # val_size could be too large for the remaining data
-        print(f"Warning: Adjusted validation size ({actual_val_size:.2f}) is invalid. Splitting temp data 50/50 if possible, or using all for training if too small.")
-        if len(X_temp) < 2 : # Not enough data to split
-             X_train, X_val, y_train, y_val = X_temp, np.array([]).reshape(0, X_temp.shape[1] if X_temp.ndim > 1 else 0, X_temp.shape[-1]), y_temp, np.array([]).reshape(0,1)
-        else:
-             X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=min(0.5, len(X_temp)-1 / len(X_temp) ), shuffle=False) # ensure at least 1 sample for train
+    if actual_val_size >= 1.0 or actual_val_size <=0: 
+        print(f"Warning: Adjusted validation size ({actual_val_size:.2f}) is invalid or results in no validation samples. Adjusting split.")
+        if len(X_temp) < 2 : 
+             X_train, X_val, y_train, y_val = X_temp, np.array([]).reshape(0, X_temp.shape[1] if X_temp.ndim > 1 and X_temp.shape[1] > 0 else 0, X_temp.shape[-1] if X_temp.ndim > 2 else 0 ), y_temp, np.array([]).reshape(0,1)
+             if len(X_temp) >=2 : X_val = np.array([]).reshape(0, X_temp.shape[1], X_temp.shape[2]) # ensure 3D for val if X_temp is 3D
+             else: X_val = np.array([]).reshape(0,0,0) # default for safety
+        else: # Split roughly, ensuring train gets at least one sample
+             val_test_size_adjusted = 0.5 if len(X_temp) > 1 else 0 
+             if len(X_temp) * (1-val_test_size_adjusted) < 1: val_test_size_adjusted = (len(X_temp)-1)/len(X_temp) if len(X_temp)>0 else 0
+
+             X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=val_test_size_adjusted, shuffle=False) 
     else:
         X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=actual_val_size, shuffle=False)
     
@@ -353,7 +361,7 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
     combined_transform_info = {
         'transforms': [],
         'target_col_original': target_col, 
-        'target_col_transformed': target_col_actual # Final name of target col after all transforms
+        'target_col_transformed_final': target_col_actual # Final name of target col after all transforms
     }
     if piecewise_transform_details['applied']:
         combined_transform_info['transforms'].append(piecewise_transform_details)
@@ -361,4 +369,3 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         combined_transform_info['transforms'].append(log_transform_details)
         
     return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info
-
