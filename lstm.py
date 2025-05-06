@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, PowerTransformer
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, r2_score
@@ -371,107 +371,173 @@ class WeatherLSTM(nn.Module):
         return self
         
     def _inverse_transform_target(self, y, target_scaler, transform_info):
-            """
-            Apply inverse transformations to recover original target values.
-            Handles both MinMaxScaler and StandardScaler for the target, and log transform.
+        """
+        Apply inverse transformations to recover original target values.
+        Handles scaler (MinMaxScaler/StandardScaler) and structural transforms (Log, Yeo-Johnson).
 
-            Args:
-                y: Transformed target values (numpy array).
-                target_scaler: Scaler object (e.g., MinMaxScaler, StandardScaler) used for the target.
-                               Should be fitted only on the target column.
-                transform_info: Dictionary containing information about transformations applied,
-                                including log transformation details.
-                                Example:
-                                {
-                                    'transforms': [
-                                        {'applied': True, 'type': 'log', 'offset': 1e-06, 'original_col': 'Radiation'}
-                                    ],
-                                    'target_col_original': 'Radiation',
-                                    'target_col_transformed': 'Radiation_log'
-                                }
+        The expected order of forward transformations on the target variable is:
+        1. Optional structural transformations (e.g., Log, Yeo-Johnson).
+        2. Scaling (e.g., MinMaxScaler, StandardScaler), handled by `target_scaler`.
 
-            Returns:
-                Original scale target values (numpy array).
-            """
-            # Make a copy to avoid modifying the original array
-            y_transformed = y.copy()
+        The inverse transformations are applied in the reverse order:
+        1. Inverse Scaling.
+        2. Inverse Structural Transformations.
 
-            # --- 1. Apply Inverse Scaling ---
-            if target_scaler is not None:
-                # Ensure y_transformed is 1D if it's a column vector, for consistency
-                # before reshaping for the scaler.
-                if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
-                    y_transformed = y_transformed.squeeze(axis=1)
+        Args:
+            y: Transformed target values from the model (numpy array).
+            target_scaler: Scaler object (e.g., MinMaxScaler, StandardScaler) used for the target.
+                           Should have been fitted on the target column *after* any structural transformations.
+                           If no scaling was applied after structural transforms, this can be None.
+            transform_info: Dictionary containing information about transformations applied.
+                            Example structure:
+                            {
+                                'transforms': [
+                                    # Applied in order: first Log, then Yeo-Johnson (example)
+                                    {'applied': True, 'type': 'log', 'offset': 1e-06, 'original_col': 'Radiation'},
+                                    {'applied': True, 'type': 'yeo-johnson', 'lambda': 0.5, 'original_col': 'Radiation'}
+                                ],
+                                'target_col_original': 'Radiation',
+                                # 'target_col_transformed': 'Radiation_yj_scaled' # Name of column fed to model (optional info)
+                            }
+                            If only scaling was done, 'transforms' might be empty or absent.
+                            If only Yeo-Johnson and then StandardScaler:
+                            {
+                                'transforms': [
+                                     {'applied': True, 'type': 'yeo-johnson', 'lambda': 0.5, 'original_col': 'Radiation'}
+                                ],
+                                'target_col_original': 'Radiation'
+                            }
+                            (target_scaler would be the StandardScaler instance)
 
-                # The following 'if' block is for a complex case where the target_scaler
-                # was fitted on multiple features including the target.
-                # Given prepare_weather_data fits scalers individually, target_scaler.n_features_in_
-                # for 'Radiation_log' should be 1, so the 'else' block should be taken.
-                if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
-                    # This part handles scalers fitted on multi-feature arrays.
-                    # It reconstructs a dummy array to perform inverse_transform.
-                    print("Warning: target_scaler seems to be fitted on multiple features. Ensure 'target_col_original' and feature names are correctly set in transform_info and scaler.")
-                    dummy_array = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
-                    
-                    target_col_name_original = transform_info.get('target_col_original', -1) # Fallback to -1 if not found
-                    target_idx = -1 # Default to last column
+        Returns:
+            Original scale target values (numpy array).
+        """
+        # Make a copy to avoid modifying the original array
+        y_processed = y.copy()
 
-                    if isinstance(target_col_name_original, str) and hasattr(target_scaler, 'feature_names_in_') and target_scaler.feature_names_in_ is not None:
-                        try:
-                            # Convert feature_names_in_ to a list for robust searching
-                            feature_names = list(target_scaler.feature_names_in_)
-                            target_idx = feature_names.index(target_col_name_original)
-                        except ValueError:
-                            print(f"Warning: Target column '{target_col_name_original}' not found in scaler's feature_names_in_: {target_scaler.feature_names_in_}. Defaulting to last column.")
-                            target_idx = -1 # Default to last column
-                    elif isinstance(target_col_name_original, int):
-                        target_idx = target_col_name_original
-                    else:
-                        print(f"Warning: 'target_col_original' ('{target_col_name_original}') is not a valid string or int index. Defaulting to last column for multi-feature scaler.")
-                        target_idx = -1
+        # --- 1. Apply Inverse Scaling (MinMaxScaler or StandardScaler) ---
+        # This step reverses the last scaling transformation applied to the target.
+        if target_scaler is not None:
+            # Ensure y_processed is 1D if it's a column vector, for consistency before reshaping for the scaler.
+            if len(y_processed.shape) > 1 and y_processed.shape[1] == 1:
+                y_processed = y_processed.squeeze(axis=1)
 
-                    dummy_array[:, target_idx] = y_transformed
-                    transformed_dummy = target_scaler.inverse_transform(dummy_array)
-                    y_transformed = transformed_dummy[:, target_idx]
+            # Check if the scaler was fitted on multiple features (complex case)
+            # or a single feature (typical for target variable scaling).
+            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
+                print("Warning: target_scaler appears to be fitted on multiple features. "
+                      "Ensure 'target_col_original' (or the name of the target column as seen by the scaler) "
+                      "and feature names are correctly set in transform_info and scaler for accurate inverse transform.")
+                dummy_array = np.zeros((y_processed.shape[0], target_scaler.n_features_in_))
+                
+                # Determine the column name that the target corresponds to *within the scaler*.
+                # This could be target_col_original or target_col_transformed (if it holds the name after structural change but before scaling).
+                # The original function used 'target_col_original'. Let's assume this is the intended key.
+                target_col_name_in_scaler = transform_info.get('target_col_original', -1)
+                target_idx = -1 # Default to last column
+
+                if isinstance(target_col_name_in_scaler, str) and \
+                   hasattr(target_scaler, 'feature_names_in_') and \
+                   target_scaler.feature_names_in_ is not None:
+                    try:
+                        feature_names = list(target_scaler.feature_names_in_)
+                        target_idx = feature_names.index(target_col_name_in_scaler)
+                    except ValueError:
+                        print(f"Warning: Target column '{target_col_name_in_scaler}' not found in scaler's "
+                              f"feature_names_in_: {list(target_scaler.feature_names_in_)}. Defaulting to last column index.")
+                        target_idx = -1 # Default to last column if name not found
+                elif isinstance(target_col_name_in_scaler, int):
+                    target_idx = target_col_name_in_scaler # Assume it's a valid index
                 else:
-                    # This path is taken if the scaler was fitted only on the target variable (e.g., 'Radiation_log').
-                    # This is typical for both MinMaxScaler and StandardScaler when processed individually.
-                    # Scaler's inverse_transform expects a 2D array [n_samples, n_features].
-                    # If y_transformed is 1D, reshape it to [n_samples, 1].
-                    if len(y_transformed.shape) == 1:
-                        y_to_unscale = y_transformed.reshape(-1, 1)
-                    else: # Should already be 2D if not squeezed from a column vector earlier
-                        y_to_unscale = y_transformed
-                    
-                    y_unscaled = target_scaler.inverse_transform(y_to_unscale)
-                    y_transformed = y_unscaled.squeeze() # Squeeze back to 1D if it became [n_samples, 1]
+                    print(f"Warning: 'target_col_original' ('{target_col_name_in_scaler}') for multi-feature scaler "
+                          f"is not a valid string name or integer index. Defaulting to last column index.")
+                    target_idx = -1
 
-            # --- 2. Apply Additional Inverse Transformations (e.g., Log) ---
-            if transform_info is not None and 'transforms' in transform_info:
-                # Apply transforms in reverse order (though only 'log' is typical here from transform_info['transforms'])
-                for transform_details in transform_info.get('transforms', [])[::-1]:
-                    transform_type = transform_details.get('type')
-                    
-                    if transform_type == 'log' and transform_details.get('applied', False):
-                        # Get the offset value (e.g., epsilon used in log(X + offset))
-                        # Your transform_info now correctly provides 'offset'
-                        offset_val = transform_details.get('offset', 0)
+                dummy_array[:, target_idx] = y_processed
+                unscaled_dummy = target_scaler.inverse_transform(dummy_array)
+                y_processed = unscaled_dummy[:, target_idx]
+            else:
+                # This path is taken if the scaler was fitted only on the target variable (e.g., 'Radiation_log' or 'Radiation_yj').
+                # Scaler's inverse_transform expects a 2D array [n_samples, n_features].
+                if len(y_processed.shape) == 1:
+                    y_to_unscale = y_processed.reshape(-1, 1)
+                else: # Should already be 2D if not squeezed from a column vector earlier
+                    y_to_unscale = y_processed
+                
+                y_unscaled = target_scaler.inverse_transform(y_to_unscale)
+                y_processed = y_unscaled.squeeze() # Squeeze back to 1D if it became [n_samples, 1]
+        else:
+            # If target_scaler is None, we assume y_processed is already unscaled
+            # but might still need inverse structural transformations (e.g., inverse log, inverse Yeo-Johnson).
+            # If y_processed is a column vector, squeeze it to 1D for consistency.
+            if len(y_processed.shape) > 1 and y_processed.shape[1] == 1:
+                 y_processed = y_processed.squeeze(axis=1)
+            elif len(y_processed.shape) == 0: # if it's a scalar
+                 y_processed = np.array([y_processed]) # ensure it's at least 1D for subsequent steps
 
-                        # Apply inverse log transformation (np.exp)
-                        # Clip input to np.exp to prevent overflow/underflow with very large/small numbers
-                        y_exp = np.exp(np.clip(y_transformed, -100, 100)) # Clipping for numerical stability
 
-                        # Subtract the offset if one was used (e.g., for log(X + epsilon))
-                        if offset_val != 0: # Check if an offset was specified and is non-zero
-                            y_transformed = y_exp - offset_val
-                        else:
-                            y_transformed = y_exp # No offset to subtract
-                        
-                        # Final clip to a sensible range for the original data (e.g., radiation >= 0)
-                        # This range (0 to 2000) should be based on your domain knowledge for 'Radiation'.
-                        y_transformed = np.clip(y_transformed, 0, 2000) 
+        # --- 2. Apply Inverse Structural Transformations (e.g., Log, Yeo-Johnson) ---
+        # These are applied in the reverse order of their original application.
+        if transform_info is not None and 'transforms' in transform_info:
+            target_column_name = transform_info.get('target_col_original')
             
-            return y_transformed
+            for transform_details in transform_info.get('transforms', [])[::-1]: # Iterate in reverse
+                # Ensure this transformation detail is for the target column
+                if transform_details.get('original_col') != target_column_name:
+                    continue
+                
+                if not transform_details.get('applied', False):
+                    continue # Skip if this transform was not actually applied to the target
+
+                transform_type = transform_details.get('type')
+                
+                if transform_type == 'log':
+                    offset_val = transform_details.get('offset', 0)
+                    # Clip input to np.exp to prevent overflow/underflow with very large/small numbers
+                    # float64 max exponent is around 709. Values below -700 become ~0.
+                    y_exp_input = np.clip(y_processed, -700, 700) # Clipping for numerical stability
+                    y_exp = np.exp(y_exp_input)
+
+                    if offset_val != 0:
+                        y_processed = y_exp - offset_val
+                    else:
+                        y_processed = y_exp
+                
+                elif transform_type == 'yeo-johnson':
+                    learned_lambda = transform_details.get('lambda')
+                    if learned_lambda is not None:
+                        print(f"Applying inverse Yeo-Johnson transform (lambda={learned_lambda:.4f}) for column '{target_column_name}'")
+                        
+                        # Recreate the transformer. standardize=False because any scaling
+                        # should have been handled by the separate target_scaler.
+                        power_transformer_inverse = PowerTransformer(method='yeo-johnson', standardize=False)
+                        power_transformer_inverse.lambdas_ = np.array([learned_lambda]) # Must be an array-like
+                        
+                        # Ensure y_processed is 2D for inverse_transform
+                        if len(y_processed.shape) == 1:
+                            y_to_unpower = y_processed.reshape(-1, 1)
+                        elif len(y_processed.shape) == 0: # scalar case
+                            y_to_unpower = np.array([[y_processed]])
+                        else: # Already 2D (or more, though not expected here)
+                            y_to_unpower = y_processed
+                            
+                        y_processed = power_transformer_inverse.inverse_transform(y_to_unpower).flatten()
+                    else:
+                        print(f"Warning: Yeo-Johnson transform applied for '{target_column_name}', "
+                              f"but lambda not found in transform_info. Skipping inverse Yeo-Johnson.")
+                
+                # Add elif blocks here for other inverse structural transformations if needed (e.g., Box-Cox)
+
+        # --- 3. Final Clipping (Domain-Specific) ---
+        # This is an example for 'Radiation' data, adjust as needed for your specific target.
+        if transform_info and transform_info.get('target_col_original') == 'Radiation':
+            # Example: Clip to a sensible range based on domain knowledge.
+            # Radiation typically >= 0. Upper bound might also be relevant.
+            y_processed = np.clip(y_processed, 0, 2000) # As per original function's example
+            # Or more generally, just ensure non-negativity if that's the only strict constraint:
+            # y_processed = np.maximum(y_processed, 0) 
+            
+        return y_processed
         
     def evaluate(self, X_test_data, y_test_data, device="cpu", 
                     target_scaler_object=None, transform_info_dict=None):
@@ -540,9 +606,11 @@ class WeatherLSTM(nn.Module):
 
             # --- 4. Call the Diagnostic Analysis Function (Method of this class) ---
             self.analyze_transformed_space_predictions( # Call the method using self
-                actuals_std_log_np,          # Input 1: True values in standardized log space
-                model_predictions_std_log_np, # Input 2: Model predictions in standardized log space
-                std_dev_log=std_dev_of_log_data # Input 3: Standard deviation from the scaler (optional)
+                actuals_std_transformed=actuals_std_log_np,          # Input 1: True values in standardized log space
+                predictions_std_transformed=model_predictions_std_log_np, # Input 2: Model predictions in standardized log space
+                transform_type=transform_info_dict.get('transforms', [])[0].get('type', 'log'), # Input 3: Transformation type
+                transform_params=transform_info_dict.get('transforms', [])[0].get('params', {}), # Input 4: Transformation parameters
+                underlying_transformed_data_std_dev=std_dev_of_log_data # Input 5: Standard deviation from the scaler (optional)
             )
 
             # --- 5. Proceed with Scaled Metrics Calculation (using the same arrays) ---
@@ -612,86 +680,107 @@ class WeatherLSTM(nn.Module):
                     {'scaled_rmse': rmse_scaled, 'scaled_mape': mape_scaled_capped, **original_scale_metrics_results})
 
         
-    def analyze_transformed_space_predictions(self, actuals_std_log, predictions_std_log, std_dev_log=None):
+    def analyze_transformed_space_predictions(self,
+                                            actuals_std_transformed,
+                                            predictions_std_transformed,
+                                            transform_type, # 'log' or 'yeo-johnson' or 'box-cox' etc.
+                                            transform_params=None, # Dict for params like {'lambda': 0.5} or {'offset': 0.01}
+                                            underlying_transformed_data_std_dev=None): # Std dev of (log(data) or yj(data)) BEFORE standardization
         """
-        Analyzes model predictions in the standardized log space.
+        Analyzes model predictions in the standardized transformed space.
+        This space results from applying a transformation (e.g., log, Yeo-Johnson)
+        and then standardizing the result.
 
         Args:
-            actuals_std_log (np.array): True target values in the standardized log space.
-            predictions_std_log (np.array): Model's predictions in the standardized log space.
-            std_dev_log (float, optional): The standard deviation used to standardize the 
-                                           log-transformed data. Used to estimate the original
-                                           multiplicative factor.
+            actuals_std_transformed (np.array): True target values in the standardized transformed space.
+            predictions_std_transformed (np.array): Model's predictions in the standardized transformed space.
+            transform_type (str): Type of the primary transformation used before standardization
+                                  (e.g., 'log', 'yeo-johnson').
+            transform_params (dict, optional): Parameters of the transformation, if any.
+                                               For 'log', could be {'offset': value}.
+                                               For 'yeo-johnson', could be {'lambda': value}.
+            underlying_transformed_data_std_dev (float, optional):
+                                  The standard deviation of the data *after* the primary transformation
+                                  (e.g., log(data) or yj(data)) but *before* it was standardized.
+                                  Required for specific interpretations like the multiplicative factor C for log transforms.
         """
-        print("\n--- Analysis in Standardized Log Space ---")
+        space_name = f"Standardized {transform_type.capitalize()} Space"
+        print(f"\n--- Analysis in {space_name} ---")
 
         # Ensure inputs are flat numpy arrays for consistent calculations
-        actuals_std_log = np.array(actuals_std_log).flatten()
-        predictions_std_log = np.array(predictions_std_log).flatten()
+        actuals_std_transformed = np.array(actuals_std_transformed).flatten()
+        predictions_std_transformed = np.array(predictions_std_transformed).flatten()
 
         # 1. Calculate Residuals
-        residuals_std_log = actuals_std_log - predictions_std_log
-        print(f"Number of samples: {len(actuals_std_log)}")
+        residuals_std_transformed = actuals_std_transformed - predictions_std_transformed
+        print(f"Number of samples: {len(actuals_std_transformed)}")
 
         # 2. Analyze Residuals
-        mean_residuals_std_log = np.mean(residuals_std_log)
-        std_residuals_std_log = np.std(residuals_std_log)
+        mean_residuals_std_transformed = np.mean(residuals_std_transformed)
+        std_residuals_std_transformed = np.std(residuals_std_transformed)
         
-        print(f"Mean of Residuals (actuals - predictions) in Standardized Log Space (K_prime): {mean_residuals_std_log:.4f}")
-        print(f"Std Dev of Residuals in Standardized Log Space: {std_residuals_std_log:.4f}")
+        print(f"Mean of Residuals (Actuals - Predictions) in {space_name} (K_prime): {mean_residuals_std_transformed:.4f}")
+        print(f"Std Dev of Residuals in {space_name}: {std_residuals_std_transformed:.4f}")
 
-        if std_dev_log is not None and std_dev_log != 0:
-            # K_prime = -log(C) / std_dev_log  => log(C) = -K_prime * std_dev_log => C = exp(-K_prime * std_dev_log)
-            # This K_prime is (actual - prediction), so if prediction = actual - K_prime,
-            # then the bias K in prediction = actual + K is K = -K_prime.
-            # The multiplicative factor C was derived from: Predicted_Original approx C * Actual_Original
-            # Which led to: Predicted_Standardized_Log approx True_Standardized_Log + log(C) / std_dev_log
-            # So, K_model_bias = log(C) / std_dev_log
-            # And K_prime (mean_residuals) = True_Standardized_Log - Predicted_Standardized_Log 
-            #                               = True_Standardized_Log - (True_Standardized_Log + K_model_bias)
-            #                               = -K_model_bias
-            # So, K_model_bias = -mean_residuals_std_log
-            # log(C) = K_model_bias * std_dev_log = -mean_residuals_std_log * std_dev_log
-            # C = exp(-mean_residuals_std_log * std_dev_log)
-            
-            estimated_multiplicative_factor_C = np.exp(-mean_residuals_std_log * std_dev_log)
-            print(f"Estimated Multiplicative Factor (C) in Original Scale (from mean residual): {estimated_multiplicative_factor_C:.4f}")
-            print(f"(This C is such that Predicted_Original approx C * Actual_Original)")
-            # The following line was in the original function, kept for context if needed by the user.
-            # print(f"The observed slope was 0.079. Does this match C? If not, there might be other non-linearities or issues.")
-
+        if transform_type == 'log':
+            if underlying_transformed_data_std_dev is not None and underlying_transformed_data_std_dev != 0:
+                # Derivation:
+                # K_prime (mean_residuals_std_transformed) is the mean of:
+                # ( (log(Actual_orig) - mean_log) / std_dev_log ) - ( (log(Predicted_orig) - mean_log) / std_dev_log )
+                # = ( log(Actual_orig) - log(Predicted_orig) ) / std_dev_log
+                # = log(Actual_orig / Predicted_orig) / std_dev_log
+                # If we hypothesize Predicted_Original approx C * Actual_Original, then Actual_orig / Predicted_orig = 1/C.
+                # So, K_prime = log(1/C) / std_dev_log = -log(C) / std_dev_log
+                # Therefore, log(C) = -K_prime * std_dev_log
+                # C = exp(-K_prime * std_dev_log)
+                # Here, K_prime is mean_residuals_std_transformed, and std_dev_log is underlying_transformed_data_std_dev
+                
+                estimated_multiplicative_factor_C = np.exp(-mean_residuals_std_transformed * underlying_transformed_data_std_dev)
+                print(f"Estimated Multiplicative Factor (C) in Original Scale (from mean residual for log transform): {estimated_multiplicative_factor_C:.4f}")
+                print(f"  (This C implies Predicted_Original approx C * Actual_Original for log-transformed data)")
+                if transform_params and 'offset' in transform_params:
+                    print(f"  Log transform offset used: {transform_params['offset']}")
+            else:
+                print("  Cannot estimate Multiplicative Factor (C) for log transform without 'underlying_transformed_data_std_dev'.")
+        elif transform_type == 'yeo-johnson':
+            print("  Interpretation of a simple multiplicative factor (C) is specific to log transforms and not directly applicable for Yeo-Johnson.")
+            if transform_params and 'lambda' in transform_params:
+                print(f"  Yeo-Johnson Lambda (λ): {transform_params['lambda']:.4f}")
+        # Add other transform types here if needed
 
         # 3. Plot Histogram of Residuals
         plt.figure(figsize=(10, 6))
-        plt.hist(residuals_std_log, bins=50, alpha=0.7, color='blue', edgecolor='black')
-        plt.axvline(mean_residuals_std_log, color='red', linestyle='dashed', linewidth=2, label=f'Mean Residual: {mean_residuals_std_log:.4f}')
-        plt.title('Histogram of Residuals in Standardized Log Space')
-        plt.xlabel('Residual (Actual_Std_Log - Predicted_Std_Log)')
+        plt.hist(residuals_std_transformed, bins=50, alpha=0.7, color='blue', edgecolor='black')
+        plt.axvline(mean_residuals_std_transformed, color='red', linestyle='dashed', linewidth=2, label=f'Mean Residual: {mean_residuals_std_transformed:.4f}')
+        plt.title(f'Histogram of Residuals in {space_name}')
+        plt.xlabel(f'Residual (Actual_Std_{transform_type.capitalize()} - Predicted_Std_{transform_type.capitalize()})')
         plt.ylabel('Frequency')
         plt.legend()
         plt.grid(True)
         plt.show()
 
-        # 4. Plot Predictions vs. Actuals in Standardized Log Space
+        # 4. Plot Predictions vs. Actuals in Standardized Transformed Space
         plt.figure(figsize=(10, 8))
-        plt.scatter(actuals_std_log, predictions_std_log, alpha=0.5, label='Predicted vs. Actual')
+        plt.scatter(actuals_std_transformed, predictions_std_transformed, alpha=0.5, label='Predicted vs. Actual')
         
         # Add y=x line (perfect prediction)
-        min_val = min(np.min(actuals_std_log), np.min(predictions_std_log))
-        max_val = max(np.max(actuals_std_log), np.max(predictions_std_log))
+        min_val = min(np.min(actuals_std_transformed), np.min(predictions_std_transformed))
+        max_val = max(np.max(actuals_std_transformed), np.max(predictions_std_transformed))
         plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal (y=x)')
         
-        # Add y = x - K_prime line (representing the mean bias)
-        # K_prime is mean_residuals_std_log
-        # So, predictions_std_log = actuals_std_log - mean_residuals_std_log
-        plt.plot([min_val, max_val], [min_val - mean_residuals_std_log, max_val - mean_residuals_std_log], 'g:', lw=2, label=f'Observed Trend (y = x - K\') (K\'={mean_residuals_std_log:.4f})')
+        # Add y = x - K_prime line (representing the mean bias in this space)
+        # K_prime is mean_residuals_std_transformed
+        # So, predictions_std_transformed approx actuals_std_transformed - mean_residuals_std_transformed
+        plt.plot([min_val, max_val], 
+                 [min_val - mean_residuals_std_transformed, max_val - mean_residuals_std_transformed], 
+                 'g:', lw=2, label=f'Observed Trend (y = x - K\') (K\'={mean_residuals_std_transformed:.4f})')
         
-        plt.title('Predictions vs. Actuals in Standardized Log Space')
-        plt.xlabel('Actual Standardized Log Values')
-        plt.ylabel('Predicted Standardized Log Values')
+        plt.title(f'Predictions vs. Actuals in {space_name}')
+        plt.xlabel(f'Actual Standardized {transform_type.capitalize()} Values')
+        plt.ylabel(f'Predicted Standardized {transform_type.capitalize()} Values')
         plt.legend()
         plt.grid(True)
-        plt.axis('equal') # Ensures a 1:1 aspect ratio for easier visual assessment of slope
+        plt.axis('equal') # Ensures a 1:1 aspect ratio for easier visual assessment
         plt.show()
 
     def predict(self, X, batch_size=64, device="cpu", target_scaler=None, log_transform_info=None):
