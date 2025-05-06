@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, r2_score
@@ -93,17 +93,17 @@ class WeatherLSTM(nn.Module):
         self.dropout1 = nn.Dropout(dropout_prob)
         
         # Fully connected layers for better feature extraction
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
         self.relu = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout_prob)  # Additional dropout between FC layers
         
         # Add a second hidden layer for more capacity
-        self.fc2 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+        self.fc2 = nn.Linear(hidden_dim // 4, hidden_dim // 2)
         self.relu2 = nn.ReLU()
         self.dropout3 = nn.Dropout(dropout_prob)
         
         # Output layer
-        self.fc3 = nn.Linear(hidden_dim // 4, output_dim)
+        self.fc3 = nn.Linear(hidden_dim // 2, output_dim)
         
         # Training history
         self.history = {
@@ -324,7 +324,7 @@ class WeatherLSTM(nn.Module):
             val_r2 = r2_score(val_actuals, val_predictions)
             
             # Calculate MAPE with protection against zero values
-            epsilon = 1.0
+            epsilon = 1.0 
             val_mape = np.mean(np.abs((val_actuals - val_predictions) / (np.abs(val_actuals) + epsilon))) * 100
             
             # Store metrics in history
@@ -376,7 +376,7 @@ class WeatherLSTM(nn.Module):
             Args:
                 y: Transformed target values (numpy array).
                 target_scaler: Scaler object (e.g., MinMaxScaler, StandardScaler) used for the target.
-                            Should be fitted only on the target column.
+                               Should be fitted only on the target column.
                 transform_info: Dictionary containing information about transformations applied,
                                 including log transformation details.
                                 Example:
@@ -470,118 +470,227 @@ class WeatherLSTM(nn.Module):
                         y_transformed = np.clip(y_transformed, 0, 2000) 
             
             return y_transformed
+        
+    def evaluate(self, X_test_data, y_test_data, device="cpu", 
+                    target_scaler_object=None, transform_info_dict=None):
+            """
+            Evaluates the model and includes diagnostic analysis in the transformed space.
+            Args:
+                X_test_data (np.array or torch.Tensor): Test features.
+                y_test_data (np.array or torch.Tensor): True target values in standardized log space.
+                device (str): Computation device ('cpu' or 'cuda').
+                target_scaler_object (sklearn.preprocessing.Scaler): Fitted scaler for the target variable (e.g., StandardScaler for 'Radiation_log').
+                transform_info_dict (dict): Dictionary with transformation details.
+            """
+            self.eval()  # Set the model to evaluation mode
+            self.to(device)
 
-    def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, transform_info=None):
-        """
-        Evaluate the model on test data
-        """
-        self.eval()
-        self.to(device)
-        test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
-        test_loader = DataLoader(test_dataset, batch_size=64)
-        
-        predictions = []
-        actuals = []
+            # --- 1. Prepare Actuals in Standardized Log Space ---
+            # y_test_data are the true target values, already in the standardized log space.
+            # Ensure it's a flattened NumPy array.
+            if torch.is_tensor(y_test_data): # Convert to numpy if it's a tensor
+                actuals_std_log_np = y_test_data.cpu().numpy().flatten()
+            else:
+                actuals_std_log_np = np.array(y_test_data).flatten()
 
-        with torch.no_grad():
-            for inputs, targets in test_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = self(inputs)
-                
-                predictions.extend(outputs.cpu().numpy())
-                actuals.extend(targets.cpu().numpy())
-        
-        predictions = np.array(predictions)
-        actuals = np.array(actuals)
 
-        # Calculate metrics on scaled data
-        # Use epsilon for MAPE calculation to avoid division by zero
-        epsilon = 1e-8
-        
-        # Calculate MSE and RMSE
-        mse_scaled = np.mean((actuals - predictions) ** 2)
-        rmse_scaled = np.sqrt(mse_scaled)
-        
-        # Calculate R²
-        r2_scaled = r2_score(actuals, predictions)
-        
-        # Calculate MAPE with protection against zero values
-        # Clip absolute percentage errors to 100% to avoid extreme values
-        abs_percentage_errors = np.abs((actuals - predictions) / (np.abs(actuals) + epsilon)) * 100
-        abs_percentage_errors = np.clip(abs_percentage_errors, 0, 100)
-        mape_scaled = np.mean(abs_percentage_errors)
-        
-        print(f"Scaled Metrics:")
-        print(f"Test RMSE: {rmse_scaled:.6f}")
-        print(f"Test R²: {r2_scaled:.6f}")
-        print(f"Test MAPE (capped at 100%): {mape_scaled:.2f}%")
-        
+            # --- 2. Get Model Predictions in Standardized Log Space ---
+            # Convert X_test_data to a PyTorch tensor and move to the specified device.
+            if isinstance(X_test_data, np.ndarray):
+                inputs_tensor = torch.FloatTensor(X_test_data).to(device)
+            elif torch.is_tensor(X_test_data):
+                inputs_tensor = X_test_data.to(device)
+            else:
+                raise ValueError("X_test_data must be a NumPy array or a PyTorch tensor.")
 
-        if target_scaler is not None:
-            #print('target_scaler', target_scaler)
-            #print("--- CURRENT PROBLEMATIC Target Scaler (MinMaxScaler) ---")
-            #print(f"Learned Min (data_min_): {target_scaler.data_min_[0]:.4f}") # This is 'learned_min_log'
-            #print(f"Learned Max (data_max_): {target_scaler.data_max_[0]:.4f}") # This is 'learned_max_log'
-            #print(f"Learned Range (data_range_): {target_scaler.data_range_[0]:.4f}")
-            # Also, these are available:
-            #print(f"Scaler min_ attribute: {target_scaler.min_[0]:.4f}") # Min of scaled output, usually 0
-            #print(f"Scaler scale_ attribute: {target_scaler.scale_[0]:.4f}") # Scale factor for data_range_
-            # If we have a scaler, calculate metrics on the original scale            
-                
+            model_predictions_std_log_np = None
+            with torch.no_grad():  # Ensure no gradients are computed during evaluation
+                outputs_tensor = self(inputs_tensor)  # Get raw model outputs
+                # Move predictions to CPU and convert to a flattened NumPy array.
+                model_predictions_std_log_np = outputs_tensor.cpu().numpy().flatten()
             
-            # Use transform_info from instance if not provided
-            if transform_info is None and hasattr(self, 'transform_info'):
-                transform_info = self.transform_info
-            elif transform_info is None and hasattr(self, 'log_transform_info'):
-                # For backward compatibility
-                log_transform_info = self.log_transform_info
-                if log_transform_info and log_transform_info.get('applied', False):
-                    transform_info = {
-                        'transforms': [
-                            {'type': 'log', 'applied': True, 'offset': log_transform_info.get('offset', 0)},
-                            {'type': 'scale', 'applied': True}
-                        ],
-                        'target_col_original': -1
-                    }
+            print(f"DEBUG [EVALUATE]: Shape of actuals_std_log_np: {actuals_std_log_np.shape}")
+            print(f"DEBUG [EVALUATE]: Shape of model_predictions_std_log_np: {model_predictions_std_log_np.shape}")
+            if actuals_std_log_np.shape != model_predictions_std_log_np.shape:
+                print(f"WARNING [EVALUATE]: Shape mismatch between actuals ({actuals_std_log_np.shape}) and predictions ({model_predictions_std_log_np.shape}). This might cause issues.")
+
+
+            # --- 3. Extract Standard Deviation from the Scaler ---
+            # This is std_dev_log, used for estimating the original multiplicative factor C.
+            std_dev_of_log_data = None
+            if target_scaler_object is not None:
+                if isinstance(target_scaler_object, StandardScaler) and hasattr(target_scaler_object, 'scale_'):
+                    # For StandardScaler, .scale_ attribute holds the standard deviations.
+                    # Assuming it was fitted on a single feature (e.g., 'Radiation_log'), 
+                    # it will be the first (and only) element.
+                    std_dev_of_log_data = target_scaler_object.scale_[0]
+                    print(f"DEBUG [EVALUATE]: Extracted std_dev_log for analysis: {std_dev_of_log_data:.4f}")
+                # Check for MinMaxScaler, though it doesn't directly give std_dev, it might be passed mistakenly
+                elif isinstance(target_scaler_object, MinMaxScaler):
+                    print(f"DEBUG [EVALUATE]: target_scaler_object is a MinMaxScaler. "
+                        "Standard deviation for multiplicative factor estimation is typically derived from StandardScaler on log-transformed data.")
                 else:
-                    transform_info = {
-                        'transforms': [
-                            {'type': 'scale', 'applied': True}
-                        ],
-                        'target_col_original': -1
-                    }
-            #print(f"DEBUG: Shape of 'predictions' (transformed): {predictions.shape}")
-            #print(f"DEBUG: Max 'predictions' (transformed): {np.max(predictions):.4f}, Min: {np.min(predictions):.4f}, Mean: {np.mean(predictions):.4f}")
-            #print(f"DEBUG: Max 'actuals' (transformed): {np.max(actuals):.4f}, Min: {np.min(actuals):.4f}, Mean: {np.mean(actuals):.4f}")
+                    print(f"DEBUG [EVALUATE]: target_scaler_object is of type {type(target_scaler_object)}, "
+                        "not a fitted StandardScaler with a 'scale_' attribute. "
+                        "Cannot extract std_dev_log for C estimation.")
+            else:
+                print("DEBUG [EVALUATE]: target_scaler_object is None. Cannot extract std_dev_log for C estimation.")
 
-            # If you can, find an index where the problem is severe:
-            # For example, if you know actuals_orig[i] is ~1000 and predictions_orig[i] is ~100
-            # print(f"DEBUG: Problem sample - Transformed Prediction: {predictions[i]}, Transformed Actual: {actuals[i]}")
-            # Use the new inverse transform method
-            predictions_orig = self._inverse_transform_target(predictions, target_scaler, transform_info)
-            actuals_orig = self._inverse_transform_target(actuals, target_scaler, transform_info)
+            # --- 4. Call the Diagnostic Analysis Function (Method of this class) ---
+            self.analyze_transformed_space_predictions( # Call the method using self
+                actuals_std_log_np,          # Input 1: True values in standardized log space
+                model_predictions_std_log_np, # Input 2: Model predictions in standardized log space
+                std_dev_log=std_dev_of_log_data # Input 3: Standard deviation from the scaler (optional)
+            )
+
+            # --- 5. Proceed with Scaled Metrics Calculation (using the same arrays) ---
+            print("\n--- Scaled Metrics (Calculated in Evaluate Method) ---")
+            # Ensure actuals and predictions are 1D for metric calculations if they expect that
+            mse_scaled = np.mean((actuals_std_log_np - model_predictions_std_log_np) ** 2)
+            rmse_scaled = np.sqrt(mse_scaled)
+            # r2_scaled = r2_score(actuals_std_log_np, model_predictions_std_log_np) # Requires sklearn.metrics
             
-            # Calculate metrics on original scale
-            mse_orig = np.mean((actuals_orig - predictions_orig) ** 2)
-            rmse_orig = np.sqrt(mse_orig)
-            r2_orig = r2_score(actuals_orig, predictions_orig)
-            
-            # Calculate MAPE with protection against zero values
-            # Use epsilon and clip values to avoid extreme percentages
-            epsilon = 1e-8
-            abs_percentage_errors = np.abs((actuals_orig - predictions_orig) / (np.abs(actuals_orig) + epsilon)) * 100
-            abs_percentage_errors = np.clip(abs_percentage_errors, 0, 100)  # Cap at 100%
-            mape_orig = np.mean(abs_percentage_errors)
-            
-            print(f"\nOriginal Scale Metrics:")
-            print(f"Test RMSE: {rmse_orig:.6f}")
-            print(f"Test R²: {r2_orig:.6f}")
-            print(f"Test MAPE (capped at 100%): {mape_orig:.2f}%")
-            
-            return predictions_orig, actuals_orig, (rmse_orig, r2_orig, mape_orig)
+            # Calculate MAPE on scaled data (optional, but good for comparison if loss uses it)
+            epsilon_mape = 1e-8 # To avoid division by zero
+            mape_scaled = np.mean(np.abs((actuals_std_log_np - model_predictions_std_log_np) / (np.abs(actuals_std_log_np) + epsilon_mape))) * 100
+            # Cap MAPE for stability if needed, similar to CombinedLoss
+            mape_scaled_capped = np.mean(np.clip(np.abs((actuals_std_log_np - model_predictions_std_log_np) / (np.abs(actuals_std_log_np) + epsilon_mape)), 0, 100.0/100.0)) * 100 # Clip at 100%
+
+            print(f"Test RMSE (scaled): {rmse_scaled:.6f}")
+            # print(f"Test R² (scaled): {r2_scaled:.6f}") # Uncomment if r2_score is used
+            print(f"Test MAPE (scaled): {mape_scaled:.2f}%")
+            print(f"Test MAPE (scaled, capped at 100% error per point): {mape_scaled_capped:.2f}%")
+
+
+            # --- 6. Proceed with Inverse Transformation and Original Scale Metrics ---
+            predictions_original_scale = None
+            actuals_original_scale = None
+            original_scale_metrics_results = {'rmse': np.nan, 'mape': np.nan} # Initialize with NaN
+
+            if target_scaler_object is not None and transform_info_dict is not None:
+                print("\n--- Calculating Original Scale Metrics ---")
+                # Note: _inverse_transform_target expects NumPy arrays
+                predictions_original_scale = self._inverse_transform_target(
+                    model_predictions_std_log_np.reshape(-1, 1), # Reshape to column vector
+                    target_scaler_object, 
+                    transform_info_dict
+                ).flatten() # Ensure it's flat for metrics
+                actuals_original_scale = self._inverse_transform_target(
+                    actuals_std_log_np.reshape(-1, 1), # Reshape to column vector
+                    target_scaler_object, 
+                    transform_info_dict
+                ).flatten() # Ensure it's flat for metrics
+                
+                mse_original = np.mean((actuals_original_scale - predictions_original_scale) ** 2)
+                rmse_original = np.sqrt(mse_original)
+                # r2_original = r2_score(actuals_original_scale, predictions_original_scale) # Uncomment if used
+                
+                # MAPE for original scale
+                mape_original = np.mean(np.abs((actuals_original_scale - predictions_original_scale) / (np.abs(actuals_original_scale) + epsilon_mape))) * 100
+                mape_original_capped = np.mean(np.clip(np.abs((actuals_original_scale - predictions_original_scale) / (np.abs(actuals_original_scale) + epsilon_mape)), 0, 1.0)) * 100
+
+
+                print(f"Test RMSE (original scale): {rmse_original:.6f}")
+                # print(f"Test R² (original scale): {r2_original:.6f}") # Uncomment if used
+                print(f"Test MAPE (original scale): {mape_original:.2f}%")
+                print(f"Test MAPE (original scale, capped at 100% error per point): {mape_original_capped:.2f}%")
+                print(f"Target scaler mean: {target_scaler_object.mean_[0]:.4f}")
+                print(f"Target scaler scale: {target_scaler_object.scale_[0]:.4f}")
+                original_scale_metrics_results = {
+                    'rmse': rmse_original, 
+                    # 'r2': r2_original, # Uncomment if used
+                    'mape': mape_original_capped
+                }
+            else:
+                print("Skipping original scale metrics: target_scaler_object or transform_info_dict is None.")
+
+            # Return values as appropriate for your application
+            return (model_predictions_std_log_np, actuals_std_log_np, 
+                    predictions_original_scale, actuals_original_scale,
+                    {'scaled_rmse': rmse_scaled, 'scaled_mape': mape_scaled_capped, **original_scale_metrics_results})
+
         
-        return predictions, actuals, (rmse_scaled, r2_scaled, mape_scaled)
+    def analyze_transformed_space_predictions(self, actuals_std_log, predictions_std_log, std_dev_log=None):
+        """
+        Analyzes model predictions in the standardized log space.
+
+        Args:
+            actuals_std_log (np.array): True target values in the standardized log space.
+            predictions_std_log (np.array): Model's predictions in the standardized log space.
+            std_dev_log (float, optional): The standard deviation used to standardize the 
+                                           log-transformed data. Used to estimate the original
+                                           multiplicative factor.
+        """
+        print("\n--- Analysis in Standardized Log Space ---")
+
+        # Ensure inputs are flat numpy arrays for consistent calculations
+        actuals_std_log = np.array(actuals_std_log).flatten()
+        predictions_std_log = np.array(predictions_std_log).flatten()
+
+        # 1. Calculate Residuals
+        residuals_std_log = actuals_std_log - predictions_std_log
+        print(f"Number of samples: {len(actuals_std_log)}")
+
+        # 2. Analyze Residuals
+        mean_residuals_std_log = np.mean(residuals_std_log)
+        std_residuals_std_log = np.std(residuals_std_log)
         
+        print(f"Mean of Residuals (actuals - predictions) in Standardized Log Space (K_prime): {mean_residuals_std_log:.4f}")
+        print(f"Std Dev of Residuals in Standardized Log Space: {std_residuals_std_log:.4f}")
+
+        if std_dev_log is not None and std_dev_log != 0:
+            # K_prime = -log(C) / std_dev_log  => log(C) = -K_prime * std_dev_log => C = exp(-K_prime * std_dev_log)
+            # This K_prime is (actual - prediction), so if prediction = actual - K_prime,
+            # then the bias K in prediction = actual + K is K = -K_prime.
+            # The multiplicative factor C was derived from: Predicted_Original approx C * Actual_Original
+            # Which led to: Predicted_Standardized_Log approx True_Standardized_Log + log(C) / std_dev_log
+            # So, K_model_bias = log(C) / std_dev_log
+            # And K_prime (mean_residuals) = True_Standardized_Log - Predicted_Standardized_Log 
+            #                               = True_Standardized_Log - (True_Standardized_Log + K_model_bias)
+            #                               = -K_model_bias
+            # So, K_model_bias = -mean_residuals_std_log
+            # log(C) = K_model_bias * std_dev_log = -mean_residuals_std_log * std_dev_log
+            # C = exp(-mean_residuals_std_log * std_dev_log)
+            
+            estimated_multiplicative_factor_C = np.exp(-mean_residuals_std_log * std_dev_log)
+            print(f"Estimated Multiplicative Factor (C) in Original Scale (from mean residual): {estimated_multiplicative_factor_C:.4f}")
+            print(f"(This C is such that Predicted_Original approx C * Actual_Original)")
+            # The following line was in the original function, kept for context if needed by the user.
+            # print(f"The observed slope was 0.079. Does this match C? If not, there might be other non-linearities or issues.")
+
+
+        # 3. Plot Histogram of Residuals
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals_std_log, bins=50, alpha=0.7, color='blue', edgecolor='black')
+        plt.axvline(mean_residuals_std_log, color='red', linestyle='dashed', linewidth=2, label=f'Mean Residual: {mean_residuals_std_log:.4f}')
+        plt.title('Histogram of Residuals in Standardized Log Space')
+        plt.xlabel('Residual (Actual_Std_Log - Predicted_Std_Log)')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        # 4. Plot Predictions vs. Actuals in Standardized Log Space
+        plt.figure(figsize=(10, 8))
+        plt.scatter(actuals_std_log, predictions_std_log, alpha=0.5, label='Predicted vs. Actual')
+        
+        # Add y=x line (perfect prediction)
+        min_val = min(np.min(actuals_std_log), np.min(predictions_std_log))
+        max_val = max(np.max(actuals_std_log), np.max(predictions_std_log))
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal (y=x)')
+        
+        # Add y = x - K_prime line (representing the mean bias)
+        # K_prime is mean_residuals_std_log
+        # So, predictions_std_log = actuals_std_log - mean_residuals_std_log
+        plt.plot([min_val, max_val], [min_val - mean_residuals_std_log, max_val - mean_residuals_std_log], 'g:', lw=2, label=f'Observed Trend (y = x - K\') (K\'={mean_residuals_std_log:.4f})')
+        
+        plt.title('Predictions vs. Actuals in Standardized Log Space')
+        plt.xlabel('Actual Standardized Log Values')
+        plt.ylabel('Predicted Standardized Log Values')
+        plt.legend()
+        plt.grid(True)
+        plt.axis('equal') # Ensures a 1:1 aspect ratio for easier visual assessment of slope
+        plt.show()
 
     def predict(self, X, batch_size=64, device="cpu", target_scaler=None, log_transform_info=None):
         """
@@ -598,7 +707,7 @@ class WeatherLSTM(nn.Module):
         predictions = []
         
         with torch.no_grad():
-            for (inputs,) in loader:
+            for (inputs,) in loader: # Note: DataLoader returns a tuple, so (inputs,) unpacks it
                 inputs = inputs.to(device)
                 outputs = self(inputs)
                 predictions.extend(outputs.cpu().numpy())
@@ -608,17 +717,20 @@ class WeatherLSTM(nn.Module):
         # If we have a scaler, transform predictions back to original scale
         if target_scaler is not None:
             # Handle backward compatibility with log_transform_info
-            if log_transform_info is not None:
-                transform_info = {
+            if log_transform_info is not None: # This is the old parameter name
+                # Construct the new transform_info structure
+                current_transform_info = {
                     'transforms': [
                         {'type': 'log', 'applied': log_transform_info.get('applied', False), 
-                         'offset': log_transform_info.get('epsilon', 0)},
-                        {'type': 'scale', 'applied': True}
+                         'offset': log_transform_info.get('epsilon', log_transform_info.get('offset', 0))}, # check for epsilon or offset
+                        {'type': 'scale', 'applied': True} # Assume scaling was always applied if target_scaler is present
                     ],
-                    'target_col_original': -1
+                    'target_col_original': -1 # Default or get from log_transform_info if available
                 }
-            else:
-                transform_info = {
+            elif hasattr(self, 'transform_info') and self.transform_info is not None: # Use the class attribute
+                 current_transform_info = self.transform_info
+            else: # Default if no info is provided
+                current_transform_info = {
                     'transforms': [
                         {'type': 'scale', 'applied': True}
                     ],
@@ -626,7 +738,7 @@ class WeatherLSTM(nn.Module):
                 }
             
             # Use the new inverse transform method
-            predictions = self._inverse_transform_target(predictions, target_scaler, transform_info)
+            predictions = self._inverse_transform_target(predictions, target_scaler, current_transform_info)
         
         return predictions
     
@@ -663,7 +775,7 @@ class WeatherLSTM(nn.Module):
         
         # Highlight best model
         ax.scatter(best_val_loss_epoch, best_val_loss, s=150, c='green', marker='*', 
-                  label=f'Best Model (Epoch {best_val_loss_epoch}, Loss {best_val_loss:.6f})', zorder=10)
+                   label=f'Best Model (Epoch {best_val_loss_epoch}, Loss {best_val_loss:.6f})', zorder=10)
         
         # Add gray vertical line at best model
         ax.axvline(x=best_val_loss_epoch, color='gray', linestyle='--', alpha=0.5)
@@ -691,7 +803,7 @@ class WeatherLSTM(nn.Module):
         
         # Highlight best RMSE
         ax.scatter(best_rmse_epoch, best_rmse, s=150, c='purple', marker='*', 
-                  label=f'Best RMSE (Epoch {best_rmse_epoch}, RMSE {best_rmse:.6f})', zorder=10)
+                   label=f'Best RMSE (Epoch {best_rmse_epoch}, RMSE {best_rmse:.6f})', zorder=10)
         
         # Add gray vertical line at best RMSE
         ax.axvline(x=best_rmse_epoch, color='gray', linestyle='--', alpha=0.5)
@@ -715,7 +827,7 @@ class WeatherLSTM(nn.Module):
         
         # Highlight best R²
         ax.scatter(best_r2_epoch, best_r2, s=150, c='orange', marker='*', 
-                  label=f'Best R² (Epoch {best_r2_epoch}, R² {best_r2:.6f})', zorder=10)
+                   label=f'Best R² (Epoch {best_r2_epoch}, R² {best_r2:.6f})', zorder=10)
         
         # Add formatting
         ax.set_xlabel('Epoch', fontsize=12)
@@ -736,7 +848,7 @@ class WeatherLSTM(nn.Module):
         
         # Highlight best MAPE
         ax.scatter(best_mape_epoch, best_mape, s=150, c='brown', marker='*', 
-                  label=f'Best MAPE (Epoch {best_mape_epoch}, MAPE {best_mape:.2f}%)', zorder=10)
+                   label=f'Best MAPE (Epoch {best_mape_epoch}, MAPE {best_mape:.2f}%)', zorder=10)
         
         # Add formatting
         ax.set_xlabel('Epoch', fontsize=12)
@@ -761,7 +873,9 @@ class WeatherLSTM(nn.Module):
         
         # 6. Plot Train vs Val Loss Ratio (to detect overfitting)
         ax = axes[5]
-        loss_ratio = [v/t for t, v in zip(self.history['train_loss'], self.history['val_loss'])]
+        # Ensure train_loss is not zero to avoid division by zero error
+        train_loss_safe = [max(t, 1e-9) for t in self.history['train_loss']] # Add small epsilon
+        loss_ratio = [v/t for t, v in zip(train_loss_safe, self.history['val_loss'])]
         ax.plot(self.history['epochs'], loss_ratio, 'm-', 
                 linewidth=2, marker='^', markersize=6)
         
@@ -775,7 +889,7 @@ class WeatherLSTM(nn.Module):
         ax.grid(True, alpha=0.3)
         
         # Add annotation for interpretation
-        if max(loss_ratio) > 1.5:
+        if max(loss_ratio) > 1.5: # Check if max ratio is available and greater than 1.5
             ax.text(0.5, 0.9, "Ratio > 1: Potential overfitting", 
                    transform=ax.transAxes, ha='center', 
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
@@ -797,24 +911,28 @@ class WeatherLSTM(nn.Module):
                 'input_dim': self.input_dim,
                 'hidden_dim': self.hidden_dim,
                 'output_dim': self.output_dim,
-                'num_layers': self.num_layers
+                'num_layers': self.num_layers,
+                'dropout_prob': self.dropout_prob # Save dropout_prob as well
             },
-            'history': self.history
+            'history': self.history,
+            'transform_info': self.transform_info # Save transform_info
         }, path)
         print(f"Model saved to {path}")
     
-    def load(cls, path, device="cpu"):
+    @classmethod # Use classmethod for loading
+    def load(cls, path, device="cpu"): # Add cls as first argument
         """
         Load model from file
         """
         checkpoint = torch.load(path, map_location=device)
         config = checkpoint['model_config']
         
-        model = cls(
+        model = cls( # Use cls to instantiate the class
             input_dim=config['input_dim'],
             hidden_dim=config['hidden_dim'],
             num_layers=config['num_layers'],
-            output_dim=config['output_dim']
+            output_dim=config['output_dim'],
+            dropout_prob=config.get('dropout_prob', 0.3) # Load dropout_prob, default if not found
         )
         
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -822,13 +940,19 @@ class WeatherLSTM(nn.Module):
         # Load history if available
         if 'history' in checkpoint:
             model.history = checkpoint['history']
-        
+
+        # Load transform_info if available
+        if 'transform_info' in checkpoint:
+            model.transform_info = checkpoint['transform_info']
+        else: # For backward compatibility if old model was saved without transform_info
+            model.transform_info = None 
+            
         model.to(device)
         return model
     
     def predict_with_uncertainty(self, X, mc_samples=30, device="cpu", 
-                            target_scaler=None, transform_info=None,
-                            return_samples=False, alpha=0.05):
+                                 target_scaler=None, transform_info=None,
+                                 return_samples=False, alpha=0.05):
         """
         Generate predictions with uncertainty estimates using MC Dropout
         
@@ -837,7 +961,8 @@ class WeatherLSTM(nn.Module):
             mc_samples: Number of Monte Carlo forward passes
             device: Device for computation
             target_scaler: Scaler for inverse transformation
-            transform_info: Info about transformations applied to the target
+            transform_info: Info about transformations applied to the target. 
+                            If None, uses self.transform_info.
             return_samples: Whether to return all MC samples
             alpha: Significance level for confidence intervals (default 0.05 for 95% CI)
             
@@ -857,15 +982,15 @@ class WeatherLSTM(nn.Module):
         X = X.to(device)
         
         # Set model to evaluation mode but keep dropout active
-        self.eval()
+        self.eval() 
         
         # Enable dropout during inference
-        def enable_dropout(model):
-            for m in model.modules():
+        def enable_dropout(model_to_set): # Renamed to avoid conflict
+            for m in model_to_set.modules():
                 if isinstance(m, nn.Dropout):
-                    m.train()
+                    m.train() # Activates dropout
         
-        enable_dropout(self)
+        enable_dropout(self) # Apply to the current model instance
         
         # Store predictions from multiple forward passes
         all_predictions = []
@@ -881,13 +1006,17 @@ class WeatherLSTM(nn.Module):
         # Shape: (mc_samples, batch_size, output_dim)
         all_predictions = np.stack(all_predictions, axis=0)
         
+        # Use self.transform_info if transform_info argument is None
+        current_transform_info = transform_info if transform_info is not None else self.transform_info
+
         # If we have a target scaler, apply inverse transformation to each sample
         if target_scaler is not None:
             # For each MC sample
             for i in range(mc_samples):
                 # Use the inverse transform method
+                # Assuming output_dim is 1, so we access all_predictions[i, :, 0]
                 all_predictions[i, :, 0] = self._inverse_transform_target(
-                    all_predictions[i, :, 0], target_scaler, transform_info
+                    all_predictions[i, :, 0], target_scaler, current_transform_info
                 )
         
         # Calculate statistics across MC samples
@@ -919,9 +1048,9 @@ class WeatherLSTM(nn.Module):
         return uncertainty_dict
 
     def plot_prediction_with_uncertainty(self, X, y_true=None, mc_samples=30, 
-                                    target_scaler=None, transform_info=None,
-                                    figsize=(12, 8), device="cpu", alpha=0.05,
-                                    indices=None, max_samples=5):
+                                         target_scaler=None, transform_info=None,
+                                         figsize=(12, 8), device="cpu", alpha=0.05,
+                                         indices=None, max_samples_to_plot=5): # Renamed max_samples to avoid conflict
         """
         Plot predictions with uncertainty bounds
         
@@ -930,91 +1059,107 @@ class WeatherLSTM(nn.Module):
             y_true: Ground truth values (optional)
             mc_samples: Number of Monte Carlo samples
             target_scaler: Scaler for inverse transformation
-            transform_info: Info about transformations applied to the target
+            transform_info: Info about transformations applied to the target.
+                            If None, uses self.transform_info.
             figsize: Figure size
             device: Computation device
             alpha: Significance level for confidence intervals
-            indices: Specific indices to plot (default: first max_samples)
-            max_samples: Maximum number of samples to plot
+            indices: Specific indices to plot (default: first max_samples_to_plot)
+            max_samples_to_plot: Maximum number of samples to plot
             
         Returns:
             Matplotlib figure
         """
+        # Use self.transform_info if transform_info argument is None
+        current_transform_info = transform_info if transform_info is not None else self.transform_info
+
         # Get predictions with uncertainty
         uncertainty = self.predict_with_uncertainty(
             X, mc_samples=mc_samples, device=device,
-            target_scaler=target_scaler, transform_info=transform_info,
+            target_scaler=target_scaler, transform_info=current_transform_info,
             return_samples=True, alpha=alpha
         )
         
-        # If indices not specified, use first max_samples
+        # If indices not specified, use first max_samples_to_plot
         if indices is None:
-            n_samples = min(max_samples, len(X))
-            indices = np.arange(n_samples)
+            n_plot_samples = min(max_samples_to_plot, len(X)) # n_samples was conflicting
+            indices_to_plot = np.arange(n_plot_samples) # Renamed indices
         else:
-            indices = np.array(indices)
-            n_samples = len(indices)
+            indices_to_plot = np.array(indices)
+            n_plot_samples = len(indices_to_plot)
         
         # Prepare ground truth if available
         if y_true is not None:
-            if not torch.is_tensor(y_true):
-                y_true = torch.tensor(y_true, dtype=torch.float32)
-                
-            y_true = y_true.numpy()
+            y_true_np = y_true.copy() # Work with a copy
+            if not isinstance(y_true_np, np.ndarray): # Ensure it's a numpy array
+                 y_true_np = np.array(y_true_np)
             
             if target_scaler is not None:
                 # Use the inverse transform method for ground truth
-                y_true = self._inverse_transform_target(
-                    y_true.squeeze(), target_scaler, transform_info
+                y_true_np = self._inverse_transform_target(
+                    y_true_np.squeeze(), target_scaler, current_transform_info # Squeeze if it's a column vector
                 )
         
         # Create figure
-        fig, axs = plt.subplots(n_samples, 1, figsize=figsize, squeeze=False)
+        fig, axs = plt.subplots(n_plot_samples, 1, figsize=figsize, squeeze=False)
         
         # For each sample to plot
-        for i, idx in enumerate(indices):
+        for i, idx in enumerate(indices_to_plot):
             ax = axs[i, 0]
             
             # Extract predictions and bounds for this sample
-            mean = uncertainty['mean'][idx, 0]
-            lower = uncertainty['lower_ci'][idx, 0]
-            upper = uncertainty['upper_ci'][idx, 0]
+            mean_val = uncertainty['mean'][idx, 0] # Renamed mean to mean_val
+            lower_val = uncertainty['lower_ci'][idx, 0] # Renamed lower to lower_val
+            upper_val = uncertainty['upper_ci'][idx, 0] # Renamed upper to upper_val
             
             # Get all MC samples for this input
-            all_samples = uncertainty['samples'][:, idx, 0]
+            all_mc_samples = uncertainty['samples'][:, idx, 0] # Renamed all_samples
             
-            # Plot MC samples as semi-transparent lines
-            for j in range(min(10, mc_samples)):  # Plot up to 10 individual samples
-                ax.plot([0], [all_samples[j]], 'o', alpha=0.3, color='gray')
+            # Plot MC samples as semi-transparent lines/points
+            # Plotting many individual lines can be slow, so plot as points or a few representative lines
+            # Here, we plot individual points for a subset of MC samples
+            num_mc_to_plot = min(10, mc_samples) # Plot up to 10 individual MC samples
+            for j in range(num_mc_to_plot): 
+                ax.plot([0], [all_mc_samples[j]], 'o', alpha=0.2, color='gray', markersize=3) # Smaller markersize
             
             # Plot prediction and confidence interval
-            ax.errorbar([0], [mean], yerr=[[mean-lower], [upper-mean]], 
-                    fmt='o', color='blue', ecolor='lightblue', 
-                    capsize=5, label='Prediction with 95% CI')
+            ax.errorbar([0], [mean_val], yerr=[[mean_val-lower_val], [upper_val-mean_val]], 
+                        fmt='o', color='blue', ecolor='lightblue', 
+                        capsize=5, label=f'{int((1-alpha)*100)}% CI Prediction') # More descriptive label
             
             # Plot ground truth if available
-            if y_true is not None and idx < len(y_true):
-                ax.plot([0], [y_true[idx]], 'ro', label='Actual')
+            if y_true is not None and idx < len(y_true_np):
+                ax.plot([0], [y_true_np[idx]], 'ro', label='Actual')
                 
                 # Calculate error
-                error = abs(mean - y_true[idx])
-                within_ci = lower <= y_true[idx] <= upper
+                error = abs(mean_val - y_true_np[idx])
+                within_ci = lower_val <= y_true_np[idx] <= upper_val
                 
                 # Add error information
-                ax.text(0.02, 0.95, f"Error: {error:.2f}", transform=ax.transAxes)
-                ax.text(0.02, 0.90, f"Within CI: {'Yes' if within_ci else 'No'}", 
-                    transform=ax.transAxes)
+                ax.text(0.02, 0.95, f"Error: {error:.2f}", transform=ax.transAxes, fontsize=9)
+                ax.text(0.02, 0.90, f"Actual in CI: {'Yes' if within_ci else 'No'}", 
+                        transform=ax.transAxes, fontsize=9,
+                        color='green' if within_ci else 'red') # Color code for quick visual
             
             # Calculate prediction interval width
-            interval_width = upper - lower
-            ax.text(0.02, 0.85, f"Interval width: {interval_width:.2f}", transform=ax.transAxes)
+            interval_width = upper_val - lower_val
+            ax.text(0.02, 0.85, f"Interval width: {interval_width:.2f}", transform=ax.transAxes, fontsize=9)
             
-            ax.set_title(f"Sample {idx}")
-            ax.set_ylim([max(0, lower - 0.2 * interval_width), upper + 0.2 * interval_width])
-            ax.set_xticks([])
+            ax.set_title(f"Sample Index: {idx}", fontsize=10)
             
-            if i == 0:
-                ax.legend()
+            # Adjust y-limits to better fit the data, ensuring some padding
+            plot_min_y = min(lower_val, y_true_np[idx] if y_true is not None and idx < len(y_true_np) else lower_val)
+            plot_max_y = max(upper_val, y_true_np[idx] if y_true is not None and idx < len(y_true_np) else upper_val)
+            padding = 0.2 * (plot_max_y - plot_min_y) if (plot_max_y - plot_min_y) > 1e-6 else 1.0 # Add padding, handle near-zero range
+            
+            ax.set_ylim([max(0, plot_min_y - padding), plot_max_y + padding]) # Ensure y_min is not negative if data is non-negative
+            ax.set_xticks([]) # Remove x-ticks as they are not meaningful here
+            ax.set_ylabel("Value", fontsize=9) # Add y-axis label
+            
+            if i == 0: # Add legend only to the first subplot
+                ax.legend(fontsize=8, loc='best')
         
-        plt.tight_layout()
+        plt.suptitle(f'Predictions with {int((1-alpha)*100)}% Confidence Intervals', fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap with suptitle
         return fig
+
