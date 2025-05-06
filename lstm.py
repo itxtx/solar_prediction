@@ -95,11 +95,13 @@ class WeatherLSTM(nn.Module):
         # Fully connected layers for better feature extraction
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
         self.relu = nn.ReLU()
+        #self.relu = nn.LeakyReLU(negative_slope=0.2)
         self.dropout2 = nn.Dropout(dropout_prob)  # Additional dropout between FC layers
         
         # Add a second hidden layer for more capacity
         self.fc2 = nn.Linear(hidden_dim // 4, hidden_dim // 2)
         self.relu2 = nn.ReLU()
+        #self.relu2 = nn.LeakyReLU(negative_slope=0.02)
         self.dropout3 = nn.Dropout(dropout_prob)
         
         # Output layer
@@ -135,14 +137,13 @@ class WeatherLSTM(nn.Module):
         
         # First dense layer with batch normalization
         out = self.fc1(out)
-        #out = self.relu(out)
-        out = nn.LeakyReLU(negative_slope=0.02)(out)
+        out = self.relu(out)
+        
         out = self.dropout2(out)
         
         # Second hidden layer with batch normalization
         out = self.fc2(out)
-        #out = self.relu2(out)
-        out = nn.LeakyReLU(negative_slope=0.01)(out)
+        out = self.relu2(out)
         out = self.dropout3(out)
         
         # Output layer
