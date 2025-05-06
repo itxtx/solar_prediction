@@ -286,7 +286,7 @@ def prepare_weather_data(df, target_col, window_size=12, test_size=0.2, val_size
         log_transform_info = {
             'applied': True, 
             'type': 'log',  # Add the 'type' key to match inverse_transform expectations
-            'epsilon': epsilon, 
+            'offset': epsilon, 
             'original_col': target_col
         }
         print(f"Log-transformed {target_col} -> {target_col_actual}")

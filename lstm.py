@@ -367,80 +367,109 @@ class WeatherLSTM(nn.Module):
         print("Training complete. Best model saved.")
         
         return self
-    
+        
     def _inverse_transform_target(self, y, target_scaler, transform_info):
-        """
-        Apply inverse transformations to recover original target values
-        
-        Args:
-            y: Transformed target values
-            target_scaler: Scaler used for the target
-            transform_info: Combined transform info dictionary
-            
-        Returns:
-            Original scale target values
-        """
-        # Make a copy to avoid modifying the original
-        y_transformed = y.copy()
-        
-        # First apply inverse scaling if scaler is provided
-        if target_scaler is not None:
-            # Create dummy array with the right shape for inverse_transform
-            if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
-                y_transformed = y_transformed.squeeze(axis=1)
-                
-            # Check if we need a dummy array (if y is just the target column)
-            if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
-                # Create dummy array with zeros except for target column
-                dummy = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
-                
-                # Find target column index from transform_info
-                target_col = transform_info.get('target_col_original', -1)
-                if isinstance(target_col, str) and hasattr(target_scaler, 'feature_names_in_'):
-                    # If we have column names, find the index
-                    try:
-                        target_idx = np.where(target_scaler.feature_names_in_ == target_col)[0][0]
-                    except:
-                        # Default to last column if name not found
-                        target_idx = -1
-                else:
-                    # Default to the provided index or last column
-                    target_idx = -1 if isinstance(target_col, str) else target_col
-                
-                # Place values in the correct column
-                dummy[:, target_idx] = y_transformed
-                
-                # Apply inverse transform
-                transformed_dummy = target_scaler.inverse_transform(dummy)
-                
-                # Extract target column
-                y_transformed = transformed_dummy[:, target_idx]
-            else:
-                # If scaler was fitted only on target, just inverse transform directly
-                y_transformed = target_scaler.inverse_transform(
-                    y_transformed.reshape(-1, 1)).squeeze()
-        
-        # Then apply any additional inverse transformations
-        if transform_info is not None:
-            transforms = transform_info.get('transforms', [])[::-1]
-            
-            for transform in transforms:
-                transform_type = transform.get('type')
-                
-                if transform_type == 'log' and transform.get('applied', False):
-                    # Undo log transform with numerical stability
-                    epsilon = transform.get('epsilon', 1e-6)
-                    if transform.get('offset', 0) > 0:
-                        # If log1p was used: exp(y) - offset
-                        y_transformed = np.exp(np.clip(y_transformed, -100, 100)) - transform.get('offset')
-                    else:
-                        # If simple log was used
-                        y_transformed = np.exp(np.clip(y_transformed, -100, 100))
+            """
+            Apply inverse transformations to recover original target values.
+            Handles both MinMaxScaler and StandardScaler for the target, and log transform.
+
+            Args:
+                y: Transformed target values (numpy array).
+                target_scaler: Scaler object (e.g., MinMaxScaler, StandardScaler) used for the target.
+                            Should be fitted only on the target column.
+                transform_info: Dictionary containing information about transformations applied,
+                                including log transformation details.
+                                Example:
+                                {
+                                    'transforms': [
+                                        {'applied': True, 'type': 'log', 'offset': 1e-06, 'original_col': 'Radiation'}
+                                    ],
+                                    'target_col_original': 'Radiation',
+                                    'target_col_transformed': 'Radiation_log'
+                                }
+
+            Returns:
+                Original scale target values (numpy array).
+            """
+            # Make a copy to avoid modifying the original array
+            y_transformed = y.copy()
+
+            # --- 1. Apply Inverse Scaling ---
+            if target_scaler is not None:
+                # Ensure y_transformed is 1D if it's a column vector, for consistency
+                # before reshaping for the scaler.
+                if len(y_transformed.shape) > 1 and y_transformed.shape[1] == 1:
+                    y_transformed = y_transformed.squeeze(axis=1)
+
+                # The following 'if' block is for a complex case where the target_scaler
+                # was fitted on multiple features including the target.
+                # Given prepare_weather_data fits scalers individually, target_scaler.n_features_in_
+                # for 'Radiation_log' should be 1, so the 'else' block should be taken.
+                if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
+                    # This part handles scalers fitted on multi-feature arrays.
+                    # It reconstructs a dummy array to perform inverse_transform.
+                    print("Warning: target_scaler seems to be fitted on multiple features. Ensure 'target_col_original' and feature names are correctly set in transform_info and scaler.")
+                    dummy_array = np.zeros((y_transformed.shape[0], target_scaler.n_features_in_))
                     
-                    # Clip to reasonable range to prevent overflow
-                    y_transformed = np.clip(y_transformed, 0, 2000)  # Assuming max radiation is 2000
-        
-        return y_transformed
+                    target_col_name_original = transform_info.get('target_col_original', -1) # Fallback to -1 if not found
+                    target_idx = -1 # Default to last column
+
+                    if isinstance(target_col_name_original, str) and hasattr(target_scaler, 'feature_names_in_') and target_scaler.feature_names_in_ is not None:
+                        try:
+                            # Convert feature_names_in_ to a list for robust searching
+                            feature_names = list(target_scaler.feature_names_in_)
+                            target_idx = feature_names.index(target_col_name_original)
+                        except ValueError:
+                            print(f"Warning: Target column '{target_col_name_original}' not found in scaler's feature_names_in_: {target_scaler.feature_names_in_}. Defaulting to last column.")
+                            target_idx = -1 # Default to last column
+                    elif isinstance(target_col_name_original, int):
+                        target_idx = target_col_name_original
+                    else:
+                        print(f"Warning: 'target_col_original' ('{target_col_name_original}') is not a valid string or int index. Defaulting to last column for multi-feature scaler.")
+                        target_idx = -1
+
+                    dummy_array[:, target_idx] = y_transformed
+                    transformed_dummy = target_scaler.inverse_transform(dummy_array)
+                    y_transformed = transformed_dummy[:, target_idx]
+                else:
+                    # This path is taken if the scaler was fitted only on the target variable (e.g., 'Radiation_log').
+                    # This is typical for both MinMaxScaler and StandardScaler when processed individually.
+                    # Scaler's inverse_transform expects a 2D array [n_samples, n_features].
+                    # If y_transformed is 1D, reshape it to [n_samples, 1].
+                    if len(y_transformed.shape) == 1:
+                        y_to_unscale = y_transformed.reshape(-1, 1)
+                    else: # Should already be 2D if not squeezed from a column vector earlier
+                        y_to_unscale = y_transformed
+                    
+                    y_unscaled = target_scaler.inverse_transform(y_to_unscale)
+                    y_transformed = y_unscaled.squeeze() # Squeeze back to 1D if it became [n_samples, 1]
+
+            # --- 2. Apply Additional Inverse Transformations (e.g., Log) ---
+            if transform_info is not None and 'transforms' in transform_info:
+                # Apply transforms in reverse order (though only 'log' is typical here from transform_info['transforms'])
+                for transform_details in transform_info.get('transforms', [])[::-1]:
+                    transform_type = transform_details.get('type')
+                    
+                    if transform_type == 'log' and transform_details.get('applied', False):
+                        # Get the offset value (e.g., epsilon used in log(X + offset))
+                        # Your transform_info now correctly provides 'offset'
+                        offset_val = transform_details.get('offset', 0)
+
+                        # Apply inverse log transformation (np.exp)
+                        # Clip input to np.exp to prevent overflow/underflow with very large/small numbers
+                        y_exp = np.exp(np.clip(y_transformed, -100, 100)) # Clipping for numerical stability
+
+                        # Subtract the offset if one was used (e.g., for log(X + epsilon))
+                        if offset_val != 0: # Check if an offset was specified and is non-zero
+                            y_transformed = y_exp - offset_val
+                        else:
+                            y_transformed = y_exp # No offset to subtract
+                        
+                        # Final clip to a sensible range for the original data (e.g., radiation >= 0)
+                        # This range (0 to 2000) should be based on your domain knowledge for 'Radiation'.
+                        y_transformed = np.clip(y_transformed, 0, 2000) 
+            
+            return y_transformed
 
     def evaluate(self, X_test, y_test, device="cpu", target_scaler=None, transform_info=None):
         """
@@ -453,7 +482,7 @@ class WeatherLSTM(nn.Module):
         
         predictions = []
         actuals = []
-        
+
         with torch.no_grad():
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -464,7 +493,7 @@ class WeatherLSTM(nn.Module):
         
         predictions = np.array(predictions)
         actuals = np.array(actuals)
-        
+
         # Calculate metrics on scaled data
         # Use epsilon for MAPE calculation to avoid division by zero
         epsilon = 1e-8
@@ -487,8 +516,19 @@ class WeatherLSTM(nn.Module):
         print(f"Test R²: {r2_scaled:.6f}")
         print(f"Test MAPE (capped at 100%): {mape_scaled:.2f}%")
         
-        # If we have a scaler, calculate metrics on the original scale
+
         if target_scaler is not None:
+            #print('target_scaler', target_scaler)
+            #print("--- CURRENT PROBLEMATIC Target Scaler (MinMaxScaler) ---")
+            #print(f"Learned Min (data_min_): {target_scaler.data_min_[0]:.4f}") # This is 'learned_min_log'
+            #print(f"Learned Max (data_max_): {target_scaler.data_max_[0]:.4f}") # This is 'learned_max_log'
+            #print(f"Learned Range (data_range_): {target_scaler.data_range_[0]:.4f}")
+            # Also, these are available:
+            #print(f"Scaler min_ attribute: {target_scaler.min_[0]:.4f}") # Min of scaled output, usually 0
+            #print(f"Scaler scale_ attribute: {target_scaler.scale_[0]:.4f}") # Scale factor for data_range_
+            # If we have a scaler, calculate metrics on the original scale            
+                
+            
             # Use transform_info from instance if not provided
             if transform_info is None and hasattr(self, 'transform_info'):
                 transform_info = self.transform_info
@@ -498,7 +538,7 @@ class WeatherLSTM(nn.Module):
                 if log_transform_info and log_transform_info.get('applied', False):
                     transform_info = {
                         'transforms': [
-                            {'type': 'log', 'applied': True, 'offset': log_transform_info.get('epsilon', 0)},
+                            {'type': 'log', 'applied': True, 'offset': log_transform_info.get('offset', 0)},
                             {'type': 'scale', 'applied': True}
                         ],
                         'target_col_original': -1
@@ -510,7 +550,13 @@ class WeatherLSTM(nn.Module):
                         ],
                         'target_col_original': -1
                     }
-            
+            #print(f"DEBUG: Shape of 'predictions' (transformed): {predictions.shape}")
+            #print(f"DEBUG: Max 'predictions' (transformed): {np.max(predictions):.4f}, Min: {np.min(predictions):.4f}, Mean: {np.mean(predictions):.4f}")
+            #print(f"DEBUG: Max 'actuals' (transformed): {np.max(actuals):.4f}, Min: {np.min(actuals):.4f}, Mean: {np.mean(actuals):.4f}")
+
+            # If you can, find an index where the problem is severe:
+            # For example, if you know actuals_orig[i] is ~1000 and predictions_orig[i] is ~100
+            # print(f"DEBUG: Problem sample - Transformed Prediction: {predictions[i]}, Transformed Actual: {actuals[i]}")
             # Use the new inverse transform method
             predictions_orig = self._inverse_transform_target(predictions, target_scaler, transform_info)
             actuals_orig = self._inverse_transform_target(actuals, target_scaler, transform_info)
