@@ -157,7 +157,7 @@ def prepare_weather_data(df_input, target_col, window_size=12, test_size=0.2, va
     # ====================================================================
     # 2. PROCESS TIME FEATURES
     # ====================================================================
-    df = _process_time_features(df, df_input, use_solar_elevation)
+    df = _process_time_features(df, df_input, use_solar_elevation, column_map)
     
     # ====================================================================
     # 3. APPLY TARGET TRANSFORMATIONS
@@ -214,7 +214,7 @@ def prepare_weather_data(df_input, target_col, window_size=12, test_size=0.2, va
     _add_low_threshold_indicator(df, target_col)
     
     # Select features based on mode
-    feature_cols = _select_features(df, df_input, feature_selection_mode, target_col, use_solar_elevation)
+    feature_cols = _select_features(df, df_input, feature_selection_mode, target_col, use_solar_elevation, column_map)
     
     # Ensure target isn't in feature list
     if target_col_actual in feature_cols:
@@ -829,7 +829,7 @@ def _create_sequences(scaled_data_df, feature_cols, target_col_actual, window_si
     y_seq = np.array(y_seq).reshape(-1, 1)
     
     # Split data into train, validation, and test sets
-    return _split_train_val_test(X, y_seq, test_size, val_size)
+    return _split_train_val_test(X, y_seq, test_size, val_size, feature_cols)
 
 
 def _split_train_val_test(X, y_seq, test_size, val_size, feature_cols):
