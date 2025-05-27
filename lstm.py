@@ -535,21 +535,35 @@ class WeatherLSTM(nn.Module):
     
     @classmethod
     def load(cls, path: str, device: str = "cpu") -> 'WeatherLSTM':
-        # ... (load logic as in previous version, handling model_params) ...
         try:
-            checkpoint = torch.load(path, map_location=device)
+            # MODIFIED LINE: Added weights_only=False
+            checkpoint = torch.load(path, map_location=device, weights_only=False) 
+            
             model_params = checkpoint['model_params']
             if not isinstance(model_params, ModelHyperparameters):
-                 model_params = ModelHyperparameters(**model_params) # Recreate if saved as dict
+                 # If it was saved as dict from an older version, recreate dataclass
+                 model_params = ModelHyperparameters(**model_params) 
+            
             model = cls(model_params=model_params)
             model.load_state_dict(checkpoint['model_state_dict'])
-            model.history = checkpoint.get('history', {key: [] for key in model.history})
+            # Ensure history keys exist if loading older models; provide default empty lists
+            default_history = {key: [] for key in model.history_template_keys} # Assuming you add a class attr like history_template_keys = ['epochs', 'train_loss', ...]
+            model.history = checkpoint.get('history', default_history) 
             model.transform_info = checkpoint.get('transform_info')
             model.to(device)
-            logging.info(f"LSTM Model loaded from {path}")
+            logging.info(f"LSTM Model loaded from {path} with weights_only=False.")
             return model
         except Exception as e:
-            logging.error(f"Failed to load LSTM model from {path}: {e}")
+            logging.error(f"Failed to load LSTM model from {path}: {e}", exc_info=True)
+            # Add the specific error message for unsupported globals if that's the case
+            if "Unsupported global" in str(e):
+                logging.error(
+                    "This might be due to custom classes (like ModelHyperparameters) in the checkpoint. "
+                    "Ensure these classes are defined in the scope where load is called. "
+                    "If using PyTorch 1.13+ and weights_only=True is implicitly active, "
+                    "consider using weights_only=False (if you trust the source) "
+                    "or torch.serialization.add_safe_globals."
+                )
             raise
     
     def enable_mc_dropout(self):
@@ -604,7 +618,6 @@ class WeatherLSTM(nn.Module):
             self.disable_mc_dropout() # Ensure dropout is disabled and model is back in eval mode
 
     def plot_prediction_with_uncertainty(self, X: np.ndarray, y_true: Optional[np.ndarray] = None, 
-                                         # ... (parameters as before) ...
                                          mc_samples: int = 30, 
                                          target_scaler: Optional[Any] = None, 
                                          transform_info: Optional[Dict] = None, 
