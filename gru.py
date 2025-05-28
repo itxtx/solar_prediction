@@ -39,7 +39,7 @@ class GRUModelHyperparameters: # Specific to GRU
             raise ValueError("dropout_prob must be between 0 and 1")
 
 @dataclass
-class TrainingConfig: # Can be shared with LSTM or made specific
+class TrainingConfig: 
     epochs: int = 100
     batch_size: int = 32
     learning_rate: float = 0.001
@@ -51,11 +51,6 @@ class TrainingConfig: # Can be shared with LSTM or made specific
     scheduler_type: str = "plateau"
     T_max_cosine: Optional[int] = None
     loss_type: str = "mse" # For GRU, simpler: "mse", "mae"
-    # GRU doesn't use CombinedLoss by default in this script, so mse_weight etc. are omitted here
-    # If CombinedLoss were to be used, these would be needed.
-    # value_multiplier: float = 0.01 # Only if CombinedLoss with value_aware is used
-
-
 class WeatherGRU(nn.Module):
     def __init__(self, model_params: GRUModelHyperparameters):
         super(WeatherGRU, self).__init__()
@@ -99,9 +94,7 @@ class WeatherGRU(nn.Module):
             return nn.MSELoss()
         elif config.loss_type.lower() == "mae":
             return nn.L1Loss() # MAE Loss
-        # If CombinedLoss or other complex losses were to be used with GRU, add here:
-        # elif config.loss_type.lower() == "combined":
-        #     return CombinedLoss(...) # Assuming CombinedLoss class is accessible
+
         else:
             logging.warning(f"Unknown loss type '{config.loss_type}' for GRU. Defaulting to MSE.")
             return nn.MSELoss()
@@ -336,10 +329,10 @@ class WeatherGRU(nn.Module):
                 if key in self.history and self.history[key]:
                     lbl = key.replace('_', ' ').title()
                     ax.plot(self.history['epochs'], self.history[key], l_colors[k_idx], label=lbl)
-                    if 'val' in key and self.history[key]:
-                        best_idx = np.argmin(self.history[key]) if any(s in key for s in ['loss','rmse','mape','mae']) else np.argmax(self.history[key])
-                        if best_idx < len(self.history['epochs']):
-                             ax.scatter(self.history['epochs'][best_idx], self.history[key][best_idx], s=100, c='gold', marker='*', zorder=5, label=f'Best {lbl.split(" ")[0]}')
+                    #if 'val' in key and self.history[key]:
+                        #best_idx = np.argmin(self.history[key]) if any(s in key for s in ['loss','rmse','mape','mae']) else np.argmax(self.history[key])
+                        #if best_idx < len(self.history['epochs']):
+                        #     ax.scatter(self.history['epochs'][best_idx], self.history[key][best_idx], s=100, c='gold', marker='*', zorder=5, label=f'Best {lbl.split(" ")[0]}')
             ax.set_title(title); ax.set_xlabel('Epoch'); ax.set_ylabel(keys[0].split('_')[-1].upper() if '_' in keys[0] else keys[0].upper()); ax.legend(); ax.grid(True)
             if ylog: ax.set_yscale('log')
         ax_r = axes[6]

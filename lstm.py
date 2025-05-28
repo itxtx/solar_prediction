@@ -103,6 +103,17 @@ class CombinedLoss(nn.Module):
 
 
 class WeatherLSTM(nn.Module):
+    history_template_keys: List[str] = [
+        'epochs', 
+        'train_loss', 
+        'val_loss', 
+        'val_rmse', 
+        'val_r2', 
+        'val_mape', 
+        'val_mae', 
+        'lr'
+        # Add any other keys you use in your history dictionary
+    ]
     def __init__(self, model_params: ModelHyperparameters):
         super(WeatherLSTM, self).__init__()
         self.params = model_params
@@ -123,10 +134,7 @@ class WeatherLSTM(nn.Module):
         self.dropout3 = nn.Dropout(model_params.dropout_prob)
         self.fc3 = nn.Linear(model_params.hidden_dim // 2, model_params.output_dim)
         
-        self.history: Dict[str, List] = {
-            'epochs': [], 'train_loss': [], 'val_loss': [],
-            'val_rmse': [], 'val_r2': [], 'val_mape': [], 'val_mae': [], 'lr': []
-        }
+        self.history = {key: [] for key in self.history_template_keys}
         self.transform_info: Optional[Dict] = None 
         self._mc_dropout_enabled: bool = False # For managing MC Dropout state
         
@@ -476,8 +484,10 @@ class WeatherLSTM(nn.Module):
     
     # plot_training_history remains largely the same, ensure it uses self.history correctly.
     def plot_training_history(self, figsize: Tuple[int, int] = (20, 18), log_scale_loss: bool = True):
+        # Import is_color_like here or at the top of the file
+        from matplotlib.colors import is_color_like
 
-        if not self.history['epochs']: 
+        if not self.history.get('epochs'): # Use .get for safer dictionary access
             logging.info("No LSTM training history to plot.")
             return None
         
@@ -488,34 +498,112 @@ class WeatherLSTM(nn.Module):
             ('Loss', ['train_loss', 'val_loss'], log_scale_loss, ['b-', 'r-']),
             ('RMSE (Scaled)', ['val_rmse'], False, ['g-']),
             ('R² (Scaled)', ['val_r2'], False, ['m-']),
-            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['darkorange-']),
-            ('MAE (Scaled)', ['val_mae'], False, ['darkcyan-']),
+            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['darkorange-']), # Problematic
+            ('MAE (Scaled)', ['val_mae'], False, ['darkcyan-']),       # Problematic
             ('Learning Rate', ['lr'], True, ['c-'])
         ]
-        for i, (title, keys, ylog, line_colors) in enumerate(metrics_plot_config):
+
+        for i, (title, keys, ylog, style_specs_list) in enumerate(metrics_plot_config): # Renamed line_colors to style_specs_list for clarity
             ax = axes[i]
             for k_idx, key in enumerate(keys):
                 if key in self.history and self.history[key]: 
                     label = key.replace('_', ' ').title()
-                    ax.plot(self.history['epochs'], self.history[key], line_colors[k_idx], label=label)
-                    if 'val' in key and self.history[key]:
-                        best_idx = np.argmin(self.history[key]) if any(s in key for s in ['loss', 'rmse', 'mape', 'mae']) else np.argmax(self.history[key])
-                        if best_idx < len(self.history['epochs']):
-                             ax.scatter(self.history['epochs'][best_idx], self.history[key][best_idx], s=100, c='gold', marker='*', zorder=5, label=f'Best {label.split(" ")[0]}')
-            ax.set_title(title); ax.set_xlabel('Epoch'); ax.set_ylabel(keys[0].split('_')[-1].upper() if '_' in keys[0] else keys[0].upper()); ax.legend(); ax.grid(True)
-            if ylog: ax.set_yscale('log')
+                    
+                    style_spec = style_specs_list[k_idx]
+                    plot_args = [self.history['epochs'], self.history[key]]
+                    plot_kwargs = {'label': label}
+
+                    parsed_color = None
+                    parsed_linestyle = None
+                    parsed_marker = None
+                    is_complex_spec = False
+
+                    # Define common linestyles and markers
+                    # Sorted by length (desc) to match '--' before '-' if applicable, though simple iteration works for distinct endings
+                    possible_styles_markers = ['--', '-.', '-', ':', '.', ',', 'o', 'v', '^', '<', '>', 's', 'p', '*', 'h', 'H', '+', 'x', 'D', 'd']
+
+                    if style_spec: # Ensure style_spec is not empty
+                        for sm_suffix in sorted(possible_styles_markers, key=len, reverse=True):
+                            if style_spec.endswith(sm_suffix):
+                                color_candidate = style_spec[:-len(sm_suffix)]
+                                if color_candidate and is_color_like(color_candidate):
+                                    # If the color_candidate is a single char color (e.g., 'r' in 'r-'),
+                                    # it's a standard fmt string. We only parse if it's a named color.
+                                    if len(color_candidate) > 1 or color_candidate.lower() not in 'bgrcmykw':
+                                        parsed_color = color_candidate
+                                        if sm_suffix in ['-', '--', '-.', ':']:
+                                            parsed_linestyle = sm_suffix
+                                        else:
+                                            parsed_marker = sm_suffix
+                                        is_complex_spec = True
+                                        break 
+                        if not is_complex_spec and is_color_like(style_spec) and (len(style_spec) > 1 or style_spec.lower() not in 'bgrcmykw.'):
+
+                            pass # Let it be handled by the else block for direct fmt string.
+
+                    if is_complex_spec:
+                        if parsed_color: plot_kwargs['color'] = parsed_color
+                        if parsed_linestyle: plot_kwargs['linestyle'] = parsed_linestyle
+                        if parsed_marker: plot_kwargs['marker'] = parsed_marker
+                        ax.plot(*plot_args, **plot_kwargs)
+                    else:
+                        # Pass style_spec as is (e.g., 'b-', 'g-', 'red', 'o').
+                        # Matplotlib handles valid format strings or color names here.
+                        ax.plot(*plot_args, style_spec, **plot_kwargs)
+
+                    if 'val' in key and self.history[key]: # Ensure list is not empty
+                        current_metric_values = np.array(self.history[key])
+                        if len(current_metric_values) > 0: # Ensure there are values to find min/max
+                            if any(s in key for s in ['loss', 'rmse', 'mape', 'mae']):
+                                best_idx = np.nanargmin(current_metric_values) # Use nanargmin
+                            else:
+                                best_idx = np.nanargmax(current_metric_values) # Use nanargmax
+                            
+                            if best_idx < len(self.history['epochs']): # Check bounds
+                                ax.scatter(self.history['epochs'][best_idx], current_metric_values[best_idx], 
+                                           s=100, c='gold', marker='*', zorder=5, 
+                                           label=f'Best {label.split(" ")[0]}') # Added space in label
+
+            ax.set_title(title)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(keys[0].split('_')[-1].upper() if '_' in keys[0] else keys[0].upper())
+            ax.legend()
+            ax.grid(True)
+            if ylog:
+                ax.set_yscale('log')
         
+        # Plot for 'Overfitting Indicator'
         ax_ratio = axes[6] 
-        if all(k in self.history and self.history[k] for k in ['train_loss', 'val_loss']) and len(self.history['train_loss']) == len(self.history['val_loss']) > 0:
-            train_loss_s = np.maximum(np.array(self.history['train_loss']), 1e-9)
-            ratio = np.array(self.history['val_loss']) / train_loss_s
-            ax_ratio.plot(self.history['epochs'], ratio, 'slateblue', label='Val/Train Loss Ratio')
-            ax_ratio.axhline(1.0, color='grey', ls='--'); 
-            if len(ratio) > 0 and np.nanmax(ratio) > 1.5 : ax_ratio.text(0.5, 0.9, "Ratio > 1.5: Overfitting?", transform=ax_ratio.transAxes, ha='center', bbox=dict(boxstyle='round', fc='wheat', alpha=0.7))
-        else: ax_ratio.text(0.5, 0.5, "Loss data missing", transform=ax_ratio.transAxes, ha='center')
-        ax_ratio.set_title('Overfitting Indicator'); ax_ratio.set_xlabel('Epoch'); ax_ratio.set_ylabel('Ratio'); ax_ratio.legend(); ax_ratio.grid(True)
-        if len(axes) > 7 and fig.axes[-1] == axes[7]: fig.delaxes(axes[7])
-        plt.suptitle('LSTM Model Training Metrics', fontsize=16, fontweight='bold'); plt.tight_layout(rect=[0,0,1,0.96]); return fig
+        if all(k in self.history and self.history[k] for k in ['train_loss', 'val_loss']) and \
+           len(self.history['train_loss']) == len(self.history['val_loss']) and \
+           len(self.history['train_loss']) > 0: # Ensure lists are not empty
+            train_loss_s = np.maximum(np.array(self.history['train_loss']), 1e-9) # Ensure train_loss_s has values
+            val_loss_s = np.array(self.history['val_loss'])
+            if len(train_loss_s) == len(val_loss_s): # Ensure equal length after potential np.array conversion
+                 ratio = val_loss_s / train_loss_s
+                 ax_ratio.plot(self.history['epochs'][:len(ratio)], ratio, color='slateblue', label='Val/Train Loss Ratio') # Explicit color, ensure epochs match ratio length
+                 ax_ratio.axhline(1.0, color='grey', linestyle='--') # Use linestyle
+                 if len(ratio) > 0 and np.nanmax(ratio) > 1.5:
+                     ax_ratio.text(0.5, 0.9, "Ratio > 1.5: Overfitting?", 
+                                   transform=ax_ratio.transAxes, ha='center', 
+                                   bbox=dict(boxstyle='round', fc='wheat', alpha=0.7))
+            else:
+                 ax_ratio.text(0.5, 0.5, "Loss data length mismatch", transform=ax_ratio.transAxes, ha='center')
+        else:
+            ax_ratio.text(0.5, 0.5, "Loss data missing or incomplete", transform=ax_ratio.transAxes, ha='center') # More informative message
+        ax_ratio.set_title('Overfitting Indicator')
+        ax_ratio.set_xlabel('Epoch')
+        ax_ratio.set_ylabel('Ratio')
+        ax_ratio.legend()
+        ax_ratio.grid(True)
+
+        # Remove unused subplot if it exists
+        if len(axes) > 7 and fig.axes[-1] == axes[7]: # Check if axes[7] is indeed the last axes
+             fig.delaxes(axes[7])
+
+        plt.suptitle('LSTM Model Training Metrics', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0,0,1,0.96]) # Ensure suptitle does not overlap
+        return fig
 
 
     def save(self, path: str):
@@ -653,7 +741,9 @@ class WeatherLSTM(nn.Module):
                 ).flatten()
             else: y_true_original_np = y_true_arr.flatten()
 
-        if not plot_indices: 
+
+
+        if plot_indices.size == 0:  # Corrected line 736
             logging.info("No valid samples to plot for LSTM uncertainty.")
             return plt.figure(figsize=figsize) 
 
