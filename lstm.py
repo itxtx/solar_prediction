@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 class DataProcessingConfig:
     MAX_EXP_INPUT: float = 700.0  # Max input to np.exp to avoid overflow
     MIN_RADIATION_CLIP: float = 0.0
-    MAX_RADIATION_CLIP: float = 2000.0 # Example, should be domain-specific
+    MAX_RADIATION_CLIP: float = 2000.0 
 
 @dataclass
 class ModelHyperparameters:
@@ -349,90 +349,248 @@ class WeatherLSTM(nn.Module):
         y_final_1d = self._apply_domain_clipping(y_untransformed_1d, transform_info)
             
         return y_final_1d # Should be 1D array
-        
+            
     def evaluate(self, X_test_data: np.ndarray, y_test_data: np.ndarray, device: str = "cpu", 
-                 target_scaler_object: Optional[Any] = None, 
-                 transform_info_dict: Optional[Dict] = None, 
-                 scalers_dict: Optional[Dict] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
-        self.eval(); self.to(device)
-        actuals_scaled_np = np.asarray(y_test_data).flatten()
-        inputs_tensor = torch.FloatTensor(X_test_data).to(device)
-        model_predictions_scaled_np: Optional[np.ndarray] = None
+                target_scaler_object: Optional[Any] = None, 
+                transform_info_dict: Optional[Dict] = None, 
+                scalers_dict: Optional[Dict] = None,
+                batch_size: int = 256,  # Added batch_size parameter
+                return_predictions: bool = True,  # Control whether to return full predictions
+                plot_results: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
+        """
+        Evaluate model with improved memory efficiency.
+        
+        Args:
+            X_test_data: Test data features
+            y_test_data: Test data targets
+            device: Device to run on
+            target_scaler_object: Scaler object for target variable
+            transform_info_dict: Dictionary containing transformation information
+            scalers_dict: Dictionary containing scaler objects
+            batch_size: Process data in batches to reduce memory usage
+            return_predictions: If False, only return metrics (saves memory)
+            plot_results: If True, generate residual and prediction plots
+        """
+        self.eval()
+        self.to(device)
+        
+        # Create data loader for batch processing
+        test_dataset = TensorDataset(torch.FloatTensor(X_test_data), torch.FloatTensor(y_test_data))
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        
+        # Initialize accumulators for metrics computation
+        n_samples = 0
+        sum_squared_error = 0.0
+        sum_absolute_error = 0.0
+        sum_actuals = 0.0
+        sum_actuals_squared = 0.0
+        sum_predictions = 0.0
+        sum_pred_actual = 0.0
+        
+        # For MAPE calculation
+        sum_percentage_error = 0.0
+        epsilon_mape = 1e-8
+        
+        # Optional: collect predictions if needed
+        if return_predictions:
+            all_predictions_scaled = []
+            all_actuals_scaled = []
+        
+        # Process in batches
         with torch.no_grad():
-            model_predictions_scaled_np = self(inputs_tensor).cpu().numpy().flatten()
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                predictions = self(inputs)
+                
+                # Move to CPU and convert to numpy
+                pred_batch = predictions.cpu().numpy()
+                actual_batch = targets.cpu().numpy()
+                
+                # Update running statistics for scaled metrics
+                batch_size_actual = pred_batch.shape[0]
+                n_samples += batch_size_actual
+                
+                # For MSE and MAE
+                sum_squared_error += np.sum((actual_batch - pred_batch) ** 2)
+                sum_absolute_error += np.sum(np.abs(actual_batch - pred_batch))
+                
+                # For R²
+                sum_actuals += np.sum(actual_batch)
+                sum_actuals_squared += np.sum(actual_batch ** 2)
+                sum_predictions += np.sum(pred_batch)
+                sum_pred_actual += np.sum(pred_batch * actual_batch)
+                
+                # For MAPE
+                abs_percentage_error = np.abs((actual_batch - pred_batch) / (np.abs(actual_batch) + epsilon_mape))
+                sum_percentage_error += np.sum(np.clip(abs_percentage_error, 0, 1.0))
+                
+                # Collect predictions if requested
+                if return_predictions:
+                    all_predictions_scaled.append(pred_batch)
+                    all_actuals_scaled.append(actual_batch)
+        
+        # Calculate scaled metrics from accumulated statistics
+        mse_scaled = sum_squared_error / n_samples
+        rmse_scaled = np.sqrt(mse_scaled)
+        mae_scaled = sum_absolute_error / n_samples
+        mape_scaled_capped = (sum_percentage_error / n_samples) * 100
+        
+        # Calculate R² using accumulated statistics
+        mean_actual = sum_actuals / n_samples
+        ss_tot = sum_actuals_squared - n_samples * mean_actual ** 2
+        ss_res = sum_squared_error
+        r2_scaled = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
         
         logging.info("\n--- LSTM Scaled Metrics ---")
-        # ... (scaled metrics calculation as before)
-        mse_scaled = mean_squared_error(actuals_scaled_np, model_predictions_scaled_np)
-        rmse_scaled = np.sqrt(mse_scaled); r2_scaled = r2_score(actuals_scaled_np, model_predictions_scaled_np)
-        mae_scaled = mean_absolute_error(actuals_scaled_np, model_predictions_scaled_np)
-        epsilon_mape = 1e-8
-        mape_scaled_capped = np.mean(np.clip(np.abs((actuals_scaled_np - model_predictions_scaled_np) / (np.abs(actuals_scaled_np) + epsilon_mape)), 0, 1.0)) * 100
-        logging.info(f"RMSE (scaled): {rmse_scaled:.4f}, R² (scaled): {r2_scaled:.4f}, MAE (scaled): {mae_scaled:.4f}, Capped MAPE (scaled): {mape_scaled_capped:.2f}%")
-
+        logging.info(f"RMSE (scaled): {rmse_scaled:.4f}, R² (scaled): {r2_scaled:.4f}, "
+                    f"MAE (scaled): {mae_scaled:.4f}, Capped MAPE (scaled): {mape_scaled_capped:.2f}%")
+        
+        # Process original scale metrics if scaler provided
         predictions_original_scale, actuals_original_scale = None, None
         original_metrics: Dict[str, float] = {'rmse': np.nan, 'r2': np.nan, 'mae': np.nan, 'mape_capped': np.nan}
-        if target_scaler_object and transform_info_dict:
+        
+        if target_scaler_object and transform_info_dict and return_predictions:
             logging.info("\n--- LSTM Original Scale Metrics ---")
             try:
-                # Ensure inputs to _inverse_transform_target are 2D column vectors if they are single series
-                preds_scaled_2d = model_predictions_scaled_np.reshape(-1, 1)
-                actuals_scaled_2d = actuals_scaled_np.reshape(-1, 1)
-
-                predictions_original_scale = self._inverse_transform_target(preds_scaled_2d, target_scaler_object, transform_info_dict, scalers_dict).flatten()
-                actuals_original_scale = self._inverse_transform_target(actuals_scaled_2d, target_scaler_object, transform_info_dict, scalers_dict).flatten()
+                # Concatenate all predictions and actuals
+                model_predictions_scaled_np = np.vstack(all_predictions_scaled)
+                actuals_scaled_np = np.vstack(all_actuals_scaled)
                 
-                # ... (original metrics calculation as before)
+                # Process in batches for inverse transform to save memory
+                predictions_original_list = []
+                actuals_original_list = []
+                
+                inverse_batch_size = min(1000, n_samples)  # Process inverse transform in smaller batches
+                
+                for i in range(0, n_samples, inverse_batch_size):
+                    end_idx = min(i + inverse_batch_size, n_samples)
+                    
+                    # Inverse transform predictions batch
+                    pred_batch = model_predictions_scaled_np[i:end_idx]
+                    pred_original_batch = self._inverse_transform_target(
+                        pred_batch, target_scaler_object, transform_info_dict, scalers_dict
+                    ).flatten()
+                    predictions_original_list.append(pred_original_batch)
+                    
+                    # Inverse transform actuals batch
+                    actual_batch = actuals_scaled_np[i:end_idx]
+                    actual_original_batch = self._inverse_transform_target(
+                        actual_batch, target_scaler_object, transform_info_dict, scalers_dict
+                    ).flatten()
+                    actuals_original_list.append(actual_original_batch)
+                
+                predictions_original_scale = np.concatenate(predictions_original_list)
+                actuals_original_scale = np.concatenate(actuals_original_list)
+                
+                # Calculate original scale metrics
                 if not (np.isnan(predictions_original_scale).any() or np.isnan(actuals_original_scale).any()):
-                    if len(predictions_original_scale) > 0 and len(actuals_original_scale) > 0 and len(predictions_original_scale) == len(actuals_original_scale):
-                        rmse_orig = np.sqrt(mean_squared_error(actuals_original_scale, predictions_original_scale))
-                        r2_orig = r2_score(actuals_original_scale, predictions_original_scale)
-                        mae_orig = mean_absolute_error(actuals_original_scale, predictions_original_scale)
-                        mape_orig_capped = np.mean(np.clip(np.abs((actuals_original_scale - predictions_original_scale) / (np.abs(actuals_original_scale) + epsilon_mape)), 0, 1.0)) * 100
-                        logging.info(f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%")
-                        original_metrics = {'rmse': rmse_orig, 'r2': r2_orig, 'mae': mae_orig, 'mape_capped': mape_orig_capped}
-            except Exception as e: logging.error(f"Error in original scale metrics calculation: {e}")
+                    rmse_orig = np.sqrt(mean_squared_error(actuals_original_scale, predictions_original_scale))
+                    r2_orig = r2_score(actuals_original_scale, predictions_original_scale)
+                    mae_orig = mean_absolute_error(actuals_original_scale, predictions_original_scale)
+                    mape_orig_capped = np.mean(np.clip(
+                        np.abs((actuals_original_scale - predictions_original_scale) / 
+                            (np.abs(actuals_original_scale) + epsilon_mape)), 0, 1.0)) * 100
+                    
+                    logging.info(f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, "
+                                f"MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%")
+                    
+                    original_metrics = {
+                        'rmse': rmse_orig, 
+                        'r2': r2_orig, 
+                        'mae': mae_orig, 
+                        'mape_capped': mape_orig_capped
+                    }
+                    
+                    # Generate plots if requested
+                    if plot_results:
+                        self._generate_evaluation_plots(predictions_original_scale, actuals_original_scale)
+                        
+            except Exception as e:
+                logging.error(f"Error in original scale metrics calculation: {e}")
         
-        all_metrics = {'scaled_rmse': rmse_scaled, 'scaled_r2': r2_scaled, 'scaled_mae': mae_scaled, 'scaled_mape_capped': mape_scaled_capped, **original_metrics}
-        return (model_predictions_scaled_np, actuals_scaled_np, predictions_original_scale, actuals_original_scale, all_metrics)
+        # Prepare return values
+        all_metrics = {
+            'scaled_rmse': rmse_scaled,
+            'scaled_r2': r2_scaled,
+            'scaled_mae': mae_scaled,
+            'scaled_mape_capped': mape_scaled_capped,
+            **original_metrics
+        }
+        
+        if return_predictions:
+            model_predictions_scaled_np = np.vstack(all_predictions_scaled).flatten()
+            actuals_scaled_np = np.vstack(all_actuals_scaled).flatten()
+        else:
+            model_predictions_scaled_np = None
+            actuals_scaled_np = None
+        
+        return (model_predictions_scaled_np, actuals_scaled_np, 
+                predictions_original_scale, actuals_original_scale, all_metrics)
 
-    def evaluate_memory_efficient(self, val_loader: DataLoader, criterion: nn.Module, 
-                                  train_config: TrainingConfig, device: str = "cpu",
-                                  target_scaler_object: Optional[Any] = None, 
-                                  transform_info_dict: Optional[Dict] = None, 
-                                  scalers_dict: Optional[Dict] = None) -> Dict[str, float]:
-        self.eval(); self.to(device)
-        total_loss = 0.0; all_scaled_preds_list, all_scaled_actuals_list = [], []
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = self(inputs)
-                if isinstance(criterion, CombinedLoss) and criterion.loss_mode == "value_aware":
-                     loss = criterion(outputs, targets, value_multiplier=train_config.value_multiplier)
-                else: loss = criterion(outputs, targets)
-                total_loss += loss.item() * inputs.size(0)
-                all_scaled_preds_list.append(outputs.cpu().numpy()); all_scaled_actuals_list.append(targets.cpu().numpy())
-        avg_loss = total_loss / len(val_loader.dataset)
-        preds_s = np.concatenate(all_scaled_preds_list); actuals_s = np.concatenate(all_scaled_actuals_list)
-        # ... (scaled metrics calculation as before) ...
-        rmse_s = np.sqrt(mean_squared_error(actuals_s, preds_s)); mae_s = mean_absolute_error(actuals_s, preds_s)
-        epsilon_mape = 1e-8
-        mape_s_capped = np.mean(np.clip(np.abs((actuals_s - preds_s) / (np.abs(actuals_s) + epsilon_mape)), 0, 1.0)) * 100
-        metrics = {'avg_val_loss_scaled': avg_loss, 'rmse_scaled': rmse_s, 'mae_scaled': mae_s, 'mape_scaled_capped': mape_s_capped}
-        logging.info(f"Memory-Efficient Eval (Scaled): Loss={avg_loss:.4f}, RMSE={rmse_s:.4f}, MAE={mae_s:.4f}, CappedMAPE={mape_s_capped:.2f}%")
-        if target_scaler_object and transform_info_dict:
-            try:
-                # Ensure inputs are 2D for _inverse_transform_target
-                preds_orig = self._inverse_transform_target(preds_s.reshape(-1,1), target_scaler_object, transform_info_dict, scalers_dict)
-                actuals_orig = self._inverse_transform_target(actuals_s.reshape(-1,1), target_scaler_object, transform_info_dict, scalers_dict)
-                if not (np.isnan(preds_orig).any() or np.isnan(actuals_orig).any()):
-                    if len(preds_orig) > 0 and len(actuals_orig) > 0 and len(preds_orig) == len(actuals_orig):
-                        metrics['rmse_original'] = np.sqrt(mean_squared_error(actuals_orig, preds_orig))
-                        metrics['mae_original'] = mean_absolute_error(actuals_orig, preds_orig)
-                        metrics['mape_original_capped'] = np.mean(np.clip(np.abs((actuals_orig - preds_orig) / (np.abs(actuals_orig) + epsilon_mape)), 0, 1.0)) * 100
-                        logging.info(f"Memory-Efficient Eval (Original): RMSE={metrics['rmse_original']:.4f}, MAE={metrics['mae_original']:.4f}, CappedMAPE={metrics['mape_original_capped']:.2f}%")
-            except Exception as e: logging.error(f"Error in original scale metrics during memory-efficient eval: {e}")
-        return metrics
+
+    def _generate_evaluation_plots(self, original_preds: np.ndarray, original_actuals: np.ndarray):
+        """Generate residual and prediction vs actual plots."""
+        logging.info("Generating residual and prediction vs. actual plots for original scale data...")
+        
+        # Calculate residuals in the original scale
+        residuals_original = original_actuals.flatten() - original_preds.flatten()
+        mean_residuals_original = np.mean(residuals_original)
+        std_residuals_original = np.std(residuals_original)
+        
+        # --- 1. Frequency of Residuals (Histogram) in Original Scale ---
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals_original, bins=50, alpha=0.7, color='skyblue', 
+                edgecolor='black', density=True)
+        plt.axvline(mean_residuals_original, color='red', linestyle='dashed', 
+                    linewidth=2, label=f'Mean Residual: {mean_residuals_original:.2f}')
+        plt.title('Frequency of Residuals (Original Scale)', fontsize=16)
+        plt.xlabel(f'Residual (Actual Value - Predicted Value) in original units', fontsize=12)
+        plt.ylabel('Density', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(axis='y', alpha=0.75)
+        plt.text(0.95, 0.90, f'Std Dev of Residuals: {std_residuals_original:.2f}', 
+                horizontalalignment='right', verticalalignment='top', 
+                transform=plt.gca().transAxes, fontsize=10)
+        plt.tight_layout()
+        plt.show()
+        
+        # --- 2. Predictions vs. Actuals in Original Scale ---
+        plt.figure(figsize=(10, 8))
+        
+        # Sample points if dataset is too large to plot efficiently
+        if len(original_actuals) > 10000:
+            sample_indices = np.random.choice(len(original_actuals), 10000, replace=False)
+            plot_actuals = original_actuals[sample_indices]
+            plot_preds = original_preds[sample_indices]
+            logging.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
+        else:
+            plot_actuals = original_actuals
+            plot_preds = original_preds
+        
+        plt.scatter(plot_actuals, plot_preds, alpha=0.5, color='cornflowerblue', 
+                    label='Predicted vs. Actual', s=10)
+        
+        # Determine plot limits for y=x line and observed trend
+        min_val = min(np.min(plot_actuals), np.min(plot_preds))
+        max_val = max(np.max(plot_actuals), np.max(plot_preds))
+        
+        # Ideal line (y=x)
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal (y=x)')
+        
+        # Observed trend line
+        plt.plot([min_val, max_val], 
+                [min_val - mean_residuals_original, max_val - mean_residuals_original], 
+                'g:', lw=2, 
+                label=f'Observed Trend (y = x - {mean_residuals_original:.2f})')
+        
+        plt.title('Predictions vs. Actuals (Original Scale)', fontsize=16)
+        plt.xlabel('Actual Values (Original Units)', fontsize=12)
+        plt.ylabel('Predicted Values (Original Units)', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.5)
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.show()
 
     def _ensure_batched_input(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         """Ensure input is a PyTorch tensor and properly batched for prediction."""

@@ -51,6 +51,8 @@ class TrainingConfig:
     scheduler_type: str = "plateau"
     T_max_cosine: Optional[int] = None
     loss_type: str = "mse" # For GRU, simpler: "mse", "mae"
+    
+    
 class WeatherGRU(nn.Module):
     def __init__(self, model_params: GRUModelHyperparameters):
         super(WeatherGRU, self).__init__()
