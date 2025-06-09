@@ -3,24 +3,6 @@
 
 This project demonstrates a complete workflow for time-series forecasting using a Long Short-Term Memory (LSTM) neural network. The model is built with PyTorch and predicts solar Global Horizontal Irradiance (GHI) based on historical weather data. The process includes comprehensive data preparation, hyperparameter tuning with Optuna, final model training, and in-depth evaluation, including uncertainty estimation.
 
-## Table of Contents
-
-  - [Project Overview]
-  - [Methodology]
-      - [1. Data Preparation]
-      - [2. Hyperparameter Optimization]
-      - [3. Model Architecture]
-      - [4. Training]
-      - [5. Evaluation & Uncertainty]
-  - [Performance]
-      - [Test Set Metrics]
-      - [Visualizations]
-  - [How to Use]
-      - [Prerequisites]
-      - [File Structure]
-      - [Running the Project]
-  - [Dependencies]
-
 ## Project Overview
 
 The primary goal is to forecast the 'GHI' (a measure of solar radiation) using a sequence of past weather conditions. This is a time-series regression task. The project leverages an LSTM network to capture temporal dependencies in the data.
