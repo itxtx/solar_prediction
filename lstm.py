@@ -4,1254 +4,935 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, PowerTransformer
-from sklearn.model_selection import train_test_split
+import torch.nn.functional as F # For memory-efficient evaluation
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, PowerTransformer 
+from sklearn.model_selection import train_test_split, TimeSeriesSplit 
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error 
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error, r2_score
 import warnings
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any, Union
+
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Custom loss function combining MSE and MAPE
+# Configuration for data processing and model constraints
+class DataProcessingConfig:
+    MAX_EXP_INPUT: float = 700.0  # Max input to np.exp to avoid overflow
+    MIN_RADIATION_CLIP: float = 0.0
+    MAX_RADIATION_CLIP: float = 2000.0 
+
+@dataclass
+class ModelHyperparameters:
+    input_dim: int
+    hidden_dim: int = 64
+    num_layers: int = 2
+    output_dim: int = 1 # Typically 1 for regression
+    dropout_prob: float = 0.3
+
+    def __post_init__(self):
+        if not (0 <= self.dropout_prob <= 1):
+            raise ValueError("dropout_prob must be between 0 and 1")
+
+@dataclass
+class TrainingConfig:
+    epochs: int = 100
+    batch_size: int = 32
+    learning_rate: float = 0.001
+    patience: int = 10 # For early stopping
+    factor: float = 0.5 # For LR scheduler
+    min_lr: float = 1e-6
+    weight_decay: float = 1e-5
+    clip_grad_norm: Optional[float] = 1.0 # Max norm for gradient clipping, None to disable
+    scheduler_type: str = "plateau" # "plateau" or "cosine"
+    T_max_cosine: Optional[int] = None # For CosineAnnealingLR, defaults to epochs if None
+    loss_type: str = "mse" # "mse", "combined", "value_aware"
+    mse_weight: float = 0.7 # For combined losses
+    mape_weight: float = 0.3 # For combined losses
+    value_multiplier: float = 0.01 # For value_aware_combined_loss
+
+
 class CombinedLoss(nn.Module):
     """
-    Custom loss function that combines MSE and MAPE with improved handling of small values
+    Custom loss function that combines MSE and MAPE with improved handling of small values.
+    MAPE component is effectively a "capped MAPE" as errors are clamped.
+    Can operate in 'standard' or 'value_aware' mode.
     """
-    def __init__(self, mse_weight=0.7, mape_weight=0.3, epsilon=1e-8, clip_mape=100.0):
+    def __init__(self, mse_weight: float = 0.7, mape_weight: float = 0.3, 
+                 epsilon: float = 1e-8, clip_mape_percentage: float = 100.0,
+                 loss_mode: str = "standard"): # Added loss_mode
         super(CombinedLoss, self).__init__()
         self.mse_weight = mse_weight
         self.mape_weight = mape_weight
-        self.epsilon = epsilon  # To avoid division by zero
-        self.clip_mape = clip_mape  # Maximum value for MAPE to avoid extreme values
+        self.epsilon = epsilon
+        self.clip_mape_fraction = clip_mape_percentage / 100.0
         self.mse_loss = nn.MSELoss()
+        self.loss_mode = loss_mode
+        if self.loss_mode not in ["standard", "value_aware"]:
+            raise ValueError(f"loss_mode must be 'standard' or 'value_aware', got {self.loss_mode}")
         
-    def forward(self, y_pred, y_true):
-        # MSE component
+    def _standard_combined_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         mse = self.mse_loss(y_pred, y_true)
-        
-        # MAPE component - with safeguards against zero values and extreme percentages
         abs_percentage_error = torch.abs((y_true - y_pred) / (torch.abs(y_true) + self.epsilon))
-        
-        # Clip extremely high percentage errors to avoid instability
-        abs_percentage_error = torch.clamp(abs_percentage_error, max=self.clip_mape)
-        
-        # Calculate MAPE
+        abs_percentage_error = torch.clamp(abs_percentage_error, max=self.clip_mape_fraction) 
         mape = torch.mean(abs_percentage_error) * 100.0
-        
-        # Combined loss
-        return self.mse_weight * mse + self.mape_weight * mape / 100.0
-    
-    def value_aware_combined_loss(self, y_pred, y_true, value_multiplier=0.01):
-        """
-        A value-aware loss that gives higher weight to larger true values.
-        
-        Args:
-            y_pred: The predicted values
-            y_true: The true values
-            value_multiplier: Controls how much to scale the weighting by true values
-        
-        Returns:
-            Weighted loss that focuses more on higher radiation values
-        """
-        # Basic MSE component
+        return self.mse_weight * mse + self.mape_weight * (mape / 100.0)
+
+    def _value_aware_combined_loss_calc(self, y_pred: torch.Tensor, y_true: torch.Tensor, value_multiplier: float) -> torch.Tensor:
         squared_errors = (y_true - y_pred)**2
-        
-        # Create weights that increase with radiation value
-        # This focuses more attention on higher values without sacrificing low values
-        value_weights = 1.0 + y_true * value_multiplier
-        
-        # Weighted MSE
+        value_weights = 1.0 + torch.abs(y_true) * value_multiplier
         weighted_mse = torch.mean(value_weights * squared_errors)
         
-        # Standard MAPE with epsilon protection
-        mape = torch.mean(torch.abs((y_true - y_pred) / (torch.abs(y_true) + self.epsilon))) * 100
+        abs_percentage_error = torch.abs((y_true - y_pred) / (torch.abs(y_true) + self.epsilon))
+        abs_percentage_error = torch.clamp(abs_percentage_error, max=self.clip_mape_fraction)
+        mape = torch.mean(abs_percentage_error) * 100.0
         
-        # Combined loss with original weights
-        return self.mse_weight * weighted_mse + self.mape_weight * mape / 100.0
+        return self.mse_weight * weighted_mse + self.mape_weight * (mape / 100.0)
 
-# Define the improved LSTM model
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor, value_multiplier: Optional[float] = 0.01) -> torch.Tensor:
+        if self.loss_mode == "value_aware":
+            if value_multiplier is None: # Should be passed by training loop
+                logging.warning("value_multiplier not provided for value_aware loss, using default 0.01.")
+                value_multiplier = 0.01 
+            return self._value_aware_combined_loss_calc(y_pred, y_true, value_multiplier)
+        else: # Standard combined loss
+            return self._standard_combined_loss(y_pred, y_true)
+
+
 class WeatherLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, dropout_prob=0.3):
+    history_template_keys: List[str] = [
+        'epochs', 
+        'train_loss', 
+        'val_loss', 
+        'val_rmse', 
+        'val_r2', 
+        'val_mape', 
+        'val_mae', 
+        'lr'
+        # Add any other keys you use in your history dictionary
+    ]
+    def __init__(self, model_params: ModelHyperparameters):
         super(WeatherLSTM, self).__init__()
+        self.params = model_params
         
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.output_dim = output_dim
-        self.dropout_prob = dropout_prob
-        
-        # LSTM layers with dropout between layers
         self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout_prob if num_layers > 1 else 0
+            input_size=model_params.input_dim, 
+            hidden_size=model_params.hidden_dim, 
+            num_layers=model_params.num_layers,
+            batch_first=True, 
+            dropout=model_params.dropout_prob if model_params.num_layers > 1 else 0
         )
-        
-        # Additional dropout layer after LSTM for better regularization
-        self.dropout1 = nn.Dropout(dropout_prob)
-        
-        # Fully connected layers for better feature extraction
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
+        self.dropout1 = nn.Dropout(model_params.dropout_prob)
+        self.fc1 = nn.Linear(model_params.hidden_dim, model_params.hidden_dim // 4)
         self.relu = nn.ReLU()
-        #self.relu = nn.LeakyReLU(negative_slope=0.2)
-        self.dropout2 = nn.Dropout(dropout_prob)  # Additional dropout between FC layers
-        
-        # Add a second hidden layer for more capacity
-        self.fc2 = nn.Linear(hidden_dim // 4, hidden_dim // 2)
+        self.dropout2 = nn.Dropout(model_params.dropout_prob)
+        self.fc2 = nn.Linear(model_params.hidden_dim // 4, model_params.hidden_dim // 2)
         self.relu2 = nn.ReLU()
-        #self.relu2 = nn.LeakyReLU(negative_slope=0.02)
-        self.dropout3 = nn.Dropout(dropout_prob)
+        self.dropout3 = nn.Dropout(model_params.dropout_prob)
+        self.fc3 = nn.Linear(model_params.hidden_dim // 2, model_params.output_dim)
         
-        # Output layer
-        self.fc3 = nn.Linear(hidden_dim // 2, output_dim)
+        self.history = {key: [] for key in self.history_template_keys}
+        self.transform_info: Optional[Dict] = None 
+        self._mc_dropout_enabled: bool = False # For managing MC Dropout state
         
-        # Training history
-        self.history = {
-            'epochs': [],
-            'train_loss': [],
-            'val_loss': [],
-            'val_rmse': [],
-            'val_r2': [],
-            'val_mape': [],
-            'lr': []
-        }
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Let LSTM handle hidden state initialization automatically if (h0, c0) are not provided.
+        # PyTorch will create zero hidden states by default.
+        out, _ = self.lstm(x) 
         
-        # Store log transform info
-        self.transform_info = None
-        
-    def forward(self, x):
-        # Use Xavier/Glorot initialization for hidden states (optional)
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        
-        # LSTM forward pass
-        out, _ = self.lstm(x, (h0, c0))
-        
-        # Get the output from the last time step
-        out = out[:, -1, :]
-        
-        # Apply dropout after LSTM (reduced dropout rate)
+        out = out[:, -1, :] 
         out = self.dropout1(out)
-        
-        # First dense layer with batch normalization
-        out = self.fc1(out)
-        out = self.relu(out)
-        
-        out = self.dropout2(out)
-        
-        # Second hidden layer with batch normalization
-        out = self.fc2(out)
-        out = self.relu2(out)
-        out = self.dropout3(out)
-        
-        # Output layer
+        out = self.fc1(out); out = self.relu(out); out = self.dropout2(out)
+        out = self.fc2(out); out = self.relu2(out); out = self.dropout3(out)
         out = self.fc3(out)
-        
         return out
 
-    def fit(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32, 
-            learning_rate=0.001, patience=10, factor=0.5, min_lr=1e-6, device="cpu",
-            scheduler_type="plateau", T_max=None, weight_decay=1e-5, clip_grad_norm=1.0,
-            loss_type="mse", mse_weight=0.7, mape_weight=0.3, value_multiplier=0.01):
-        """
-        Complete training method with validation, early stopping, and learning rate scheduling
-        Now with training history tracking and regularization techniques
+    def _get_criterion(self, config: TrainingConfig) -> nn.Module:
+        if config.loss_type.lower() == "mse":
+            return nn.MSELoss()
+        elif config.loss_type.lower() == "combined":
+            return CombinedLoss(
+                mse_weight=config.mse_weight,
+                mape_weight=config.mape_weight,
+                loss_mode="standard" # Explicitly set mode
+            )
+        elif config.loss_type.lower() == "value_aware":
+            return CombinedLoss(
+                mse_weight=config.mse_weight,
+                mape_weight=config.mape_weight,
+                loss_mode="value_aware" # Explicitly set mode
+            )
+        else:
+            raise ValueError(f"Unknown loss type: {config.loss_type}")
+
+    def _validate_fit_inputs(self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray):
+        if X_train.shape[0] != y_train.shape[0]:
+            raise ValueError("X_train and y_train must have the same number of samples.")
+        if X_val.shape[0] != y_val.shape[0]:
+            raise ValueError("X_val and y_val must have the same number of samples.")
+        if X_train.ndim != 3 or X_val.ndim != 3:
+            raise ValueError("Input features (X_train, X_val) must be 3-dimensional (samples, sequence_length, num_features).")
+        if y_train.ndim != 2 or y_val.ndim != 2 or y_train.shape[-1] != self.params.output_dim or y_val.shape[-1] != self.params.output_dim:
+             raise ValueError(f"Target variables (y_train, y_val) must be 2-dimensional (samples, output_dim) and match model output_dim={self.params.output_dim}.")
+
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray, 
+            train_config: TrainingConfig, device: str = "cpu"):
+        try:
+            self._validate_fit_inputs(X_train, y_train, X_val, y_val)
+        except ValueError as e:
+            logging.error(f"Input validation failed for fit method: {e}")
+            raise
+
+        logging.info(f"LSTM Training started. Device: {device}, Training Config: {train_config}")
+        self.history = {key: [] for key in self.history}
         
-        Args:
-            X_train, y_train: Training data
-            X_val, y_val: Validation data
-            epochs: Maximum number of epochs
-            batch_size: Batch size for training
-            learning_rate: Initial learning rate
-            patience: Number of epochs with no improvement before early stopping
-            factor: Factor by which to reduce learning rate on plateau
-            min_lr: Minimum learning rate
-            device: Device to train on ('cpu' or 'cuda')
-            scheduler_type: Type of learning rate scheduler ('plateau' or 'cosine')
-            T_max: Maximum number of iterations for CosineAnnealingLR (defaults to epochs if None)
-            weight_decay: L2 regularization strength (default: 1e-5)
-            clip_grad_norm: Maximum norm for gradient clipping (default: 1.0)
-            loss_type: Type of loss function to use ('mse', 'combined', or 'value_aware')
-            mse_weight: Weight for MSE in combined losses
-            mape_weight: Weight for MAPE in combined losses
-            value_multiplier: Multiplier for value-aware weighting (default: 0.01)
-            
-        Returns:
-            self: The trained model
-        """
-        # Debug the shapes
-        print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-        print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
-        
-        # Make sure the shapes match on the first dimension
-        assert X_train.shape[0] == y_train.shape[0], f"Training data mismatch: X_train has {X_train.shape[0]} samples but y_train has {y_train.shape[0]}"
-        assert X_val.shape[0] == y_val.shape[0], f"Validation data mismatch: X_val has {X_val.shape[0]} samples but y_val has {y_val.shape[0]}"
-        
-        # Reset training history
-        self.history = {
-            'epochs': [],
-            'train_loss': [],
-            'val_loss': [],
-            'val_rmse': [],
-            'val_r2': [],
-            'val_mape': [],
-            'lr': []
-        }
-        
-        # Prepare data loaders
         train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
         val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+        train_loader = DataLoader(train_dataset, batch_size=train_config.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=train_config.batch_size, shuffle=False)
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+        optimizer = optim.Adam(self.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
+        criterion = self._get_criterion(train_config)
         
-        # Initialize optimizer with L2 regularization (weight decay)
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        if train_config.scheduler_type.lower() == "plateau":
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=train_config.factor, patience=train_config.patience//2, min_lr=train_config.min_lr, verbose=True)
+        elif train_config.scheduler_type.lower() == "cosine":
+            T_max = train_config.T_max_cosine if train_config.T_max_cosine is not None else train_config.epochs
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=train_config.min_lr)
+        else: raise ValueError(f"Unknown scheduler type: {train_config.scheduler_type}")
         
-        # Initialize loss function based on user choice
-        combined_loss_instance = None
-        
-        if loss_type.lower() == "mse":
-            criterion = nn.MSELoss()
-            print("Using MSE Loss")
-        elif loss_type.lower() == "combined":
-            combined_loss_instance = CombinedLoss(mse_weight=mse_weight, mape_weight=mape_weight)
-            criterion = combined_loss_instance
-            print(f"Using Combined Loss (MSE weight: {mse_weight}, MAPE weight: {mape_weight})")
-        elif loss_type.lower() == "value_aware":
-            combined_loss_instance = CombinedLoss(mse_weight=mse_weight, mape_weight=mape_weight)
-            print(f"Using Value-Aware Combined Loss (MSE weight: {mse_weight}, MAPE weight: {mape_weight}, value multiplier: {value_multiplier})")
-            # We'll handle this case specially in the training loop
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}. Choose from 'mse', 'combined', or 'value_aware'")
-        
-        # Print regularization settings
-        print(f"Regularization settings:")
-        print(f"- Dropout probability: {self.dropout_prob}")
-        print(f"- L2 regularization (weight decay): {weight_decay}")
-        print(f"- Gradient clipping norm: {clip_grad_norm}")
-        
-        # Learning rate scheduler
-        if scheduler_type.lower() == "plateau":
-            print(f"Using ReduceLROnPlateau scheduler")
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=factor, patience=patience//2, 
-                min_lr=min_lr, verbose=True
-            )
-        elif scheduler_type.lower() == "cosine":
-            # If T_max is not provided, use the number of epochs
-            if T_max is None:
-                T_max = epochs
-            print(f"Using CosineAnnealingLR scheduler with T_max={T_max}")
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=T_max, eta_min=min_lr
-            )
-        else:
-            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
-        
-        # Early stopping setup
         best_val_loss = float('inf')
         best_model_state = None
         early_stopping_counter = 0
-        
-        # Move model to device
         self.to(device)
         
-        # Training loop
-        for epoch in range(epochs):
-            # Training phase
+        for epoch in range(train_config.epochs):
             self.train()
-            train_loss = 0.0
-            
+            train_loss_epoch = 0.0
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-                
-                # Zero gradients
                 optimizer.zero_grad()
-                
-                # Forward pass
                 outputs = self(inputs)
-                
-                # Calculate loss based on loss_type
-                if loss_type.lower() == "value_aware":
-                    loss = combined_loss_instance.value_aware_combined_loss(outputs, targets, value_multiplier)
+                # Pass value_multiplier if criterion is CombinedLoss and mode is value_aware
+                if isinstance(criterion, CombinedLoss) and criterion.loss_mode == "value_aware":
+                    loss = criterion(outputs, targets, value_multiplier=train_config.value_multiplier)
                 else:
                     loss = criterion(outputs, targets)
-                
-                # Backward pass
                 loss.backward()
-                
-                # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(self.parameters(), clip_grad_norm)
-                
-                # Optimize
+                if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
+                     torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
                 optimizer.step()
-                
-                train_loss += loss.item() * inputs.size(0)
-            
-            train_loss /= len(train_loader.dataset)
+                train_loss_epoch += loss.item() * inputs.size(0)
+            train_loss_epoch /= len(train_loader.dataset)
             
             # Validation phase
             self.eval()
-            val_loss = 0.0
-            val_outputs_all = []
-            val_targets_all = []
-            
+            val_loss_epoch = 0.0
+            val_outputs_all, val_targets_all = [], []
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = self(inputs)
-                    
-                    # Calculate validation loss (use same loss type as training)
-                    if loss_type.lower() == "value_aware":
-                        loss = combined_loss_instance.value_aware_combined_loss(outputs, targets, value_multiplier)
+                    if isinstance(criterion, CombinedLoss) and criterion.loss_mode == "value_aware":
+                        loss_val = criterion(outputs, targets, value_multiplier=train_config.value_multiplier)
                     else:
-                        loss = criterion(outputs, targets)
-                        
-                    val_loss += loss.item() * inputs.size(0)
-                    
-                    # Collect predictions and targets for metrics
+                        loss_val = criterion(outputs, targets)
+                    val_loss_epoch += loss_val.item() * inputs.size(0)
                     val_outputs_all.append(outputs.cpu().numpy())
                     val_targets_all.append(targets.cpu().numpy())
+            val_loss_epoch /= len(val_loader.dataset)
             
-            val_loss /= len(val_loader.dataset)
-            
-            # Combine predictions and targets for metrics calculation
             val_predictions = np.vstack(val_outputs_all)
             val_actuals = np.vstack(val_targets_all)
             
-            # Calculate metrics
             val_rmse = np.sqrt(mean_squared_error(val_actuals, val_predictions))
             val_r2 = r2_score(val_actuals, val_predictions)
+            val_mae = mean_absolute_error(val_actuals, val_predictions)
+            epsilon_mape = 1e-8 
+            val_mape_capped = np.mean(np.clip(np.abs((val_actuals - val_predictions) / (np.abs(val_actuals) + epsilon_mape)), 0, 1.0)) * 100 
+
+            self.history['epochs'].append(epoch + 1); self.history['train_loss'].append(train_loss_epoch)
+            self.history['val_loss'].append(val_loss_epoch); self.history['val_rmse'].append(val_rmse)
+            self.history['val_r2'].append(val_r2); self.history['val_mape'].append(val_mape_capped)
+            self.history['val_mae'].append(val_mae); self.history['lr'].append(optimizer.param_groups[0]['lr'])
             
-            # Calculate MAPE with protection against zero values
-            epsilon = 1.0 
-            val_mape = np.mean(np.abs((val_actuals - val_predictions) / (np.abs(val_actuals) + epsilon))) * 100
+            logging.info(f'LSTM Epoch {epoch+1}/{train_config.epochs} - TrainLoss: {train_loss_epoch:.4f} - ValLoss: {val_loss_epoch:.4f} | Scaled Metrics: ValRMSE: {val_rmse:.4f}, ValR²: {val_r2:.4f}, ValCappedMAPE: {val_mape_capped:.2f}%, ValMAE: {val_mae:.4f}')
             
-            # Store metrics in history
-            self.history['epochs'].append(epoch + 1)
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
-            self.history['val_rmse'].append(val_rmse)
-            self.history['val_r2'].append(val_r2)
-            self.history['val_mape'].append(val_mape)
-            self.history['lr'].append(optimizer.param_groups[0]['lr'])
+            if train_config.scheduler_type.lower() == "plateau": scheduler.step(val_loss_epoch)
+            else: scheduler.step()
             
-            # Print progress
-            print(f'Epoch {epoch+1}/{epochs} - Train loss: {train_loss:.6f} - Val loss: {val_loss:.6f} - Val RMSE: {val_rmse:.6f} - Val R²: {val_r2:.6f} - Val MAPE: {val_mape:.2f}%')
-            
-            # Adjust learning rate
-            if scheduler_type.lower() == "plateau":
-                scheduler.step(val_loss)
-            elif scheduler_type.lower() == "cosine":
-                scheduler.step()
-            
-            # Check if this is the best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = self.state_dict().copy()
-                early_stopping_counter = 0
-            else:
-                early_stopping_counter += 1
-                
-            # Check early stopping condition
-            if early_stopping_counter >= patience:
-                print(f"Early stopping triggered after {epoch+1} epochs")
-                break
+            if val_loss_epoch < best_val_loss:
+                best_val_loss = val_loss_epoch; best_model_state = self.state_dict().copy(); early_stopping_counter = 0
+            else: early_stopping_counter += 1
+            if early_stopping_counter >= train_config.patience:
+                logging.info(f"LSTM Early stopping at epoch {epoch+1}"); break
         
-        # Load best model
-        if best_model_state is not None:
-            self.load_state_dict(best_model_state)
-            
-        # Save the best model
-        torch.save(self.state_dict(), 'best_model.pt')
-        print("Training complete. Best model saved.")
-        
+        if best_model_state: self.load_state_dict(best_model_state)
+        logging.info("LSTM Training complete. Best model state loaded.")
         return self
-        
-    def _inverse_transform_target(self, y, target_scaler, transform_info):
-        """
-        Apply inverse transformations to recover original target values.
-        Handles scaler (MinMaxScaler/StandardScaler) and structural transforms (Log, Yeo-Johnson).
 
-        The expected order of forward transformations on the target variable is:
-        1. Optional structural transformations (e.g., Log, Yeo-Johnson).
-        2. Scaling (e.g., MinMaxScaler, StandardScaler), handled by `target_scaler`.
+    def _ensure_2d(self, arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr)
+        if arr.ndim == 0: return arr.reshape(1, -1)
+        elif arr.ndim == 1: return arr.reshape(-1, 1)
+        return arr
 
-        The inverse transformations are applied in the reverse order:
-        1. Inverse Scaling.
-        2. Inverse Structural Transformations.
-
-        Args:
-            y: Transformed target values from the model (numpy array).
-            target_scaler: Scaler object (e.g., MinMaxScaler, StandardScaler) used for the target.
-                           Should have been fitted on the target column *after* any structural transformations.
-                           If no scaling was applied after structural transforms, this can be None.
-            transform_info: Dictionary containing information about transformations applied.
-                            Example structure:
-                            {
-                                'transforms': [
-                                    # Applied in order: first Log, then Yeo-Johnson (example)
-                                    {'applied': True, 'type': 'log', 'offset': 1e-06, 'original_col': 'Radiation'},
-                                    {'applied': True, 'type': 'yeo-johnson', 'lambda': 0.5, 'original_col': 'Radiation'}
-                                ],
-                                'target_col_original': 'Radiation',
-                                # 'target_col_transformed': 'Radiation_yj_scaled' # Name of column fed to model (optional info)
-                            }
-                            If only scaling was done, 'transforms' might be empty or absent.
-                            If only Yeo-Johnson and then StandardScaler:
-                            {
-                                'transforms': [
-                                     {'applied': True, 'type': 'yeo-johnson', 'lambda': 0.5, 'original_col': 'Radiation'}
-                                ],
-                                'target_col_original': 'Radiation'
-                            }
-                            (target_scaler would be the StandardScaler instance)
-
-        Returns:
-            Original scale target values (numpy array).
-        """
-        # Make a copy to avoid modifying the original array
-        y_processed = y.copy()
-
-        # --- 1. Apply Inverse Scaling (MinMaxScaler or StandardScaler) ---
-        # This step reverses the last scaling transformation applied to the target.
+    def _apply_inverse_scaling(self, y: np.ndarray, target_scaler: Any, transform_info: Dict) -> np.ndarray:
+        """Handles inverse scaling part of the transformation."""
+        y_processed = y # Assumes y is already 2D via _ensure_2d
         if target_scaler is not None:
-            # Ensure y_processed is 1D if it's a column vector, for consistency before reshaping for the scaler.
-            if len(y_processed.shape) > 1 and y_processed.shape[1] == 1:
-                y_processed = y_processed.squeeze(axis=1)
-
-            # Check if the scaler was fitted on multiple features (complex case)
-            # or a single feature (typical for target variable scaling).
             if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ > 1:
-                print("Warning: target_scaler appears to be fitted on multiple features. "
-                      "Ensure 'target_col_original' (or the name of the target column as seen by the scaler) "
-                      "and feature names are correctly set in transform_info and scaler for accurate inverse transform.")
-                dummy_array = np.zeros((y_processed.shape[0], target_scaler.n_features_in_))
+                target_col_name = transform_info.get('target_col_transformed_final', transform_info.get('target_col_original'))
+                target_idx = -1
+                if hasattr(target_scaler, 'feature_names_in_') and target_scaler.feature_names_in_ is not None:
+                    try: target_idx = list(target_scaler.feature_names_in_).index(target_col_name)
+                    except ValueError: logging.warning(f"Target '{target_col_name}' not in scaler features. Defaulting to last.")
+                else: logging.warning("Scaler has no feature_names_in_. Assuming target is last for multi-feature scaler.")
                 
-                # Determine the column name that the target corresponds to *within the scaler*.
-                # This could be target_col_original or target_col_transformed (if it holds the name after structural change but before scaling).
-                # The original function used 'target_col_original'. Let's assume this is the intended key.
-                target_col_name_in_scaler = transform_info.get('target_col_original', -1)
-                target_idx = -1 # Default to last column
+                dummy = np.zeros((y_processed.shape[0], target_scaler.n_features_in_))
+                dummy[:, target_idx] = y_processed.squeeze()
+                y_processed = target_scaler.inverse_transform(dummy)[:, target_idx]
+            else: # Scaler was for single feature (target)
+                y_processed = target_scaler.inverse_transform(y_processed).squeeze()
+        return self._ensure_2d(y_processed).squeeze() # Ensure 1D for next steps
 
-                if isinstance(target_col_name_in_scaler, str) and \
-                   hasattr(target_scaler, 'feature_names_in_') and \
-                   target_scaler.feature_names_in_ is not None:
-                    try:
-                        feature_names = list(target_scaler.feature_names_in_)
-                        target_idx = feature_names.index(target_col_name_in_scaler)
-                    except ValueError:
-                        print(f"Warning: Target column '{target_col_name_in_scaler}' not found in scaler's "
-                              f"feature_names_in_: {list(target_scaler.feature_names_in_)}. Defaulting to last column index.")
-                        target_idx = -1 # Default to last column if name not found
-                elif isinstance(target_col_name_in_scaler, int):
-                    target_idx = target_col_name_in_scaler # Assume it's a valid index
-                else:
-                    print(f"Warning: 'target_col_original' ('{target_col_name_in_scaler}') for multi-feature scaler "
-                          f"is not a valid string name or integer index. Defaulting to last column index.")
-                    target_idx = -1
-
-                dummy_array[:, target_idx] = y_processed
-                unscaled_dummy = target_scaler.inverse_transform(dummy_array)
-                y_processed = unscaled_dummy[:, target_idx]
-            else:
-                # This path is taken if the scaler was fitted only on the target variable (e.g., 'Radiation_log' or 'Radiation_yj').
-                # Scaler's inverse_transform expects a 2D array [n_samples, n_features].
-                if len(y_processed.shape) == 1:
-                    y_to_unscale = y_processed.reshape(-1, 1)
-                else: # Should already be 2D if not squeezed from a column vector earlier
-                    y_to_unscale = y_processed
-                
-                y_unscaled = target_scaler.inverse_transform(y_to_unscale)
-                y_processed = y_unscaled.squeeze() # Squeeze back to 1D if it became [n_samples, 1]
-        else:
-            # If target_scaler is None, we assume y_processed is already unscaled
-            # but might still need inverse structural transformations (e.g., inverse log, inverse Yeo-Johnson).
-            # If y_processed is a column vector, squeeze it to 1D for consistency.
-            if len(y_processed.shape) > 1 and y_processed.shape[1] == 1:
-                 y_processed = y_processed.squeeze(axis=1)
-            elif len(y_processed.shape) == 0: # if it's a scalar
-                 y_processed = np.array([y_processed]) # ensure it's at least 1D for subsequent steps
-
-
-        # --- 2. Apply Inverse Structural Transformations (e.g., Log, Yeo-Johnson) ---
-        # These are applied in the reverse order of their original application.
-        if transform_info is not None and 'transforms' in transform_info:
-            target_column_name = transform_info.get('target_col_original')
-            
-            for transform_details in transform_info.get('transforms', [])[::-1]: # Iterate in reverse
-                # Ensure this transformation detail is for the target column
-                if transform_details.get('original_col') != target_column_name:
+    def _apply_inverse_structural_transforms(self, y: np.ndarray, transform_info: Dict, scalers_dict: Optional[Dict] = None) -> np.ndarray:
+        """Handles inverse structural transformations (log, Yeo-Johnson)."""
+        y_processed = y # Assumes y is 1D from _apply_inverse_scaling
+        if transform_info and 'transforms' in transform_info:
+            target_col_orig_name = transform_info.get('target_col_original')
+            for t_details in reversed(transform_info.get('transforms', [])):
+                if t_details.get('original_col') != target_col_orig_name or not t_details.get('applied', False):
                     continue
-                
-                if not transform_details.get('applied', False):
-                    continue # Skip if this transform was not actually applied to the target
-
-                transform_type = transform_details.get('type')
-                
-                if transform_type == 'log':
-                    offset_val = transform_details.get('offset', 0)
-                    # Clip input to np.exp to prevent overflow/underflow with very large/small numbers
-                    # float64 max exponent is around 709. Values below -700 become ~0.
-                    y_exp_input = np.clip(y_processed, -700, 700) # Clipping for numerical stability
-                    y_exp = np.exp(y_exp_input)
-
-                    if offset_val != 0:
-                        y_processed = y_exp - offset_val
-                    else:
-                        y_processed = y_exp
-                
-                elif transform_type == 'yeo-johnson':
-                    learned_lambda = transform_details.get('lambda')
-                    if learned_lambda is not None:
-                        print(f"Applying inverse Yeo-Johnson transform (lambda={learned_lambda:.4f}) for column '{target_column_name}'")
-                        
-                        # Recreate the transformer. standardize=False because any scaling
-                        # should have been handled by the separate target_scaler.
-                        power_transformer_inverse = PowerTransformer(method='yeo-johnson', standardize=False)
-                        power_transformer_inverse.lambdas_ = np.array([learned_lambda]) # Must be an array-like
-                        
-                        # Ensure y_processed is 2D for inverse_transform
-                        if len(y_processed.shape) == 1:
-                            y_to_unpower = y_processed.reshape(-1, 1)
-                        elif len(y_processed.shape) == 0: # scalar case
-                            y_to_unpower = np.array([[y_processed]])
-                        else: # Already 2D (or more, though not expected here)
-                            y_to_unpower = y_processed
-                            
-                        y_processed = power_transformer_inverse.inverse_transform(y_to_unpower).flatten()
-                    else:
-                        print(f"Warning: Yeo-Johnson transform applied for '{target_column_name}', "
-                              f"but lambda not found in transform_info. Skipping inverse Yeo-Johnson.")
-                
-                # Add elif blocks here for other inverse structural transformations if needed (e.g., Box-Cox)
-
-        # --- 3. Final Clipping (Domain-Specific) ---
-        # This is an example for 'Radiation' data, adjust as needed for your specific target.
-        if transform_info and transform_info.get('target_col_original') == 'Radiation':
-            # Example: Clip to a sensible range based on domain knowledge.
-            # Radiation typically >= 0. Upper bound might also be relevant.
-            y_processed = np.clip(y_processed, 0, 2000) # As per original function's example
-            # Or more generally, just ensure non-negativity if that's the only strict constraint:
-            # y_processed = np.maximum(y_processed, 0) 
-            
+                t_type = t_details.get('type')
+                logging.info(f"Applying inverse structural transform: {t_type} for {target_col_orig_name}")
+                if t_type == 'log':
+                    offset = t_details.get('offset', 0)
+                    exp_input = np.clip(y_processed, -DataProcessingConfig.MAX_EXP_INPUT, DataProcessingConfig.MAX_EXP_INPUT)
+                    y_processed = np.exp(exp_input)
+                    if offset > 0: y_processed -= offset
+                elif t_type == 'yeo-johnson':
+                    lambda_val = t_details.get('lambda')
+                    pt_obj = scalers_dict.get('power_transformer_object_for_target') if scalers_dict else None
+                    if pt_obj and lambda_val is not None:
+                        y_processed = pt_obj.inverse_transform(self._ensure_2d(y_processed)).flatten()
+                    elif lambda_val is not None:
+                        logging.warning("Recreating PowerTransformer for inverse Yeo-Johnson.")
+                        pt_inv = PowerTransformer(method='yeo-johnson', standardize=False)
+                        pt_inv.lambdas_ = np.array([lambda_val])
+                        y_processed = pt_inv.inverse_transform(self._ensure_2d(y_processed)).flatten()
+                    else: logging.warning(f"Yeo-Johnson lambda/object not found. Skipping.")
         return y_processed
+
+    def _apply_domain_clipping(self, y: np.ndarray, transform_info: Dict) -> np.ndarray:
+        """Applies domain-specific clipping, e.g., for GHI."""
+        y_processed = y
+        if transform_info and transform_info.get('target_col_original') == 'Radiation':
+            y_processed = np.clip(y, DataProcessingConfig.MIN_RADIATION_CLIP, DataProcessingConfig.MAX_RADIATION_CLIP)
+        return y_processed
+
+    def _inverse_transform_target(self, y: np.ndarray, target_scaler: Any, 
+                                  transform_info: Dict, scalers_dict: Optional[Dict] = None) -> np.ndarray:
+        """Main orchestrator for inverse transformation."""
+        y_processed_2d = self._ensure_2d(y.copy())
         
-    def evaluate(self, X_test_data, y_test_data, device="cpu", 
-                    target_scaler_object=None, transform_info_dict=None):
-            """
-            Evaluates the model and includes diagnostic analysis in the transformed space.
-            Args:
-                X_test_data (np.array or torch.Tensor): Test features.
-                y_test_data (np.array or torch.Tensor): True target values in standardized log space.
-                device (str): Computation device ('cpu' or 'cuda').
-                target_scaler_object (sklearn.preprocessing.Scaler): Fitted scaler for the target variable (e.g., StandardScaler for 'Radiation_log').
-                transform_info_dict (dict): Dictionary with transformation details.
-            """
-            self.eval()  # Set the model to evaluation mode
-            self.to(device)
-
-            # --- 1. Prepare Actuals in Standardized Log Space ---
-            # y_test_data are the true target values, already in the standardized log space.
-            # Ensure it's a flattened NumPy array.
-            if torch.is_tensor(y_test_data): # Convert to numpy if it's a tensor
-                actuals_std_log_np = y_test_data.cpu().numpy().flatten()
-            else:
-                actuals_std_log_np = np.array(y_test_data).flatten()
-
-
-            # --- 2. Get Model Predictions in Standardized Log Space ---
-            # Convert X_test_data to a PyTorch tensor and move to the specified device.
-            if isinstance(X_test_data, np.ndarray):
-                inputs_tensor = torch.FloatTensor(X_test_data).to(device)
-            elif torch.is_tensor(X_test_data):
-                inputs_tensor = X_test_data.to(device)
-            else:
-                raise ValueError("X_test_data must be a NumPy array or a PyTorch tensor.")
-
-            model_predictions_std_log_np = None
-            with torch.no_grad():  # Ensure no gradients are computed during evaluation
-                outputs_tensor = self(inputs_tensor)  # Get raw model outputs
-                # Move predictions to CPU and convert to a flattened NumPy array.
-                model_predictions_std_log_np = outputs_tensor.cpu().numpy().flatten()
-            
-            print(f"DEBUG [EVALUATE]: Shape of actuals_std_log_np: {actuals_std_log_np.shape}")
-            print(f"DEBUG [EVALUATE]: Shape of model_predictions_std_log_np: {model_predictions_std_log_np.shape}")
-            if actuals_std_log_np.shape != model_predictions_std_log_np.shape:
-                print(f"WARNING [EVALUATE]: Shape mismatch between actuals ({actuals_std_log_np.shape}) and predictions ({model_predictions_std_log_np.shape}). This might cause issues.")
-
-
-            # --- 3. Extract Standard Deviation from the Scaler ---
-            # This is std_dev_log, used for estimating the original multiplicative factor C.
-            std_dev_of_log_data = None
-            if target_scaler_object is not None:
-                if isinstance(target_scaler_object, StandardScaler) and hasattr(target_scaler_object, 'scale_'):
-                    # For StandardScaler, .scale_ attribute holds the standard deviations.
-                    # Assuming it was fitted on a single feature (e.g., 'Radiation_log'), 
-                    # it will be the first (and only) element.
-                    std_dev_of_log_data = target_scaler_object.scale_[0]
-                    print(f"DEBUG [EVALUATE]: Extracted std_dev_log for analysis: {std_dev_of_log_data:.4f}")
-                # Check for MinMaxScaler, though it doesn't directly give std_dev, it might be passed mistakenly
-                elif isinstance(target_scaler_object, MinMaxScaler):
-                    print(f"DEBUG [EVALUATE]: target_scaler_object is a MinMaxScaler. "
-                        "Standard deviation for multiplicative factor estimation is typically derived from StandardScaler on log-transformed data.")
-                else:
-                    print(f"DEBUG [EVALUATE]: target_scaler_object is of type {type(target_scaler_object)}, "
-                        "not a fitted StandardScaler with a 'scale_' attribute. "
-                        "Cannot extract std_dev_log for C estimation.")
-            else:
-                print("DEBUG [EVALUATE]: target_scaler_object is None. Cannot extract std_dev_log for C estimation.")
-
-            # --- 4. Call the Diagnostic Analysis Function (Method of this class) ---
-            self.analyze_transformed_space_predictions( # Call the method using self
-                actuals_std_transformed=actuals_std_log_np,          # Input 1: True values in standardized log space
-                predictions_std_transformed=model_predictions_std_log_np, # Input 2: Model predictions in standardized log space
-                transform_type=transform_info_dict.get('transforms', [])[0].get('type', 'log'), # Input 3: Transformation type
-                transform_params=transform_info_dict.get('transforms', [])[0].get('params', {}), # Input 4: Transformation parameters
-                underlying_transformed_data_std_dev=std_dev_of_log_data # Input 5: Standard deviation from the scaler (optional)
-            )
-
-            # --- 5. Proceed with Scaled Metrics Calculation (using the same arrays) ---
-            print("\n--- Scaled Metrics (Calculated in Evaluate Method) ---")
-            # Ensure actuals and predictions are 1D for metric calculations if they expect that
-            mse_scaled = np.mean((actuals_std_log_np - model_predictions_std_log_np) ** 2)
-            rmse_scaled = np.sqrt(mse_scaled)
-            # r2_scaled = r2_score(actuals_std_log_np, model_predictions_std_log_np) # Requires sklearn.metrics
-            
-            # Calculate MAPE on scaled data (optional, but good for comparison if loss uses it)
-            epsilon_mape = 1e-8 # To avoid division by zero
-            mape_scaled = np.mean(np.abs((actuals_std_log_np - model_predictions_std_log_np) / (np.abs(actuals_std_log_np) + epsilon_mape))) * 100
-            # Cap MAPE for stability if needed, similar to CombinedLoss
-            mape_scaled_capped = np.mean(np.clip(np.abs((actuals_std_log_np - model_predictions_std_log_np) / (np.abs(actuals_std_log_np) + epsilon_mape)), 0, 100.0/100.0)) * 100 # Clip at 100%
-
-            print(f"Test RMSE (scaled): {rmse_scaled:.6f}")
-            # print(f"Test R² (scaled): {r2_scaled:.6f}") # Uncomment if r2_score is used
-            print(f"Test MAPE (scaled): {mape_scaled:.2f}%")
-            print(f"Test MAPE (scaled, capped at 100% error per point): {mape_scaled_capped:.2f}%")
-
-
-            # --- 6. Proceed with Inverse Transformation and Original Scale Metrics ---
-            predictions_original_scale = None
-            actuals_original_scale = None
-            original_scale_metrics_results = {'rmse': np.nan, 'mape': np.nan} # Initialize with NaN
-
-            if target_scaler_object is not None and transform_info_dict is not None:
-                print("\n--- Calculating Original Scale Metrics ---")
-                # Note: _inverse_transform_target expects NumPy arrays
-                predictions_original_scale = self._inverse_transform_target(
-                    model_predictions_std_log_np.reshape(-1, 1), # Reshape to column vector
-                    target_scaler_object, 
-                    transform_info_dict
-                ).flatten() # Ensure it's flat for metrics
-                actuals_original_scale = self._inverse_transform_target(
-                    actuals_std_log_np.reshape(-1, 1), # Reshape to column vector
-                    target_scaler_object, 
-                    transform_info_dict
-                ).flatten() # Ensure it's flat for metrics
-                
-                mse_original = np.mean((actuals_original_scale - predictions_original_scale) ** 2)
-                rmse_original = np.sqrt(mse_original)
-                # r2_original = r2_score(actuals_original_scale, predictions_original_scale) # Uncomment if used
-                
-                # MAPE for original scale
-                mape_original = np.mean(np.abs((actuals_original_scale - predictions_original_scale) / (np.abs(actuals_original_scale) + epsilon_mape))) * 100
-                mape_original_capped = np.mean(np.clip(np.abs((actuals_original_scale - predictions_original_scale) / (np.abs(actuals_original_scale) + epsilon_mape)), 0, 1.0)) * 100
-
-
-                print(f"Test RMSE (original scale): {rmse_original:.6f}")
-                # print(f"Test R² (original scale): {r2_original:.6f}") # Uncomment if used
-                print(f"Test MAPE (original scale): {mape_original:.2f}%")
-                print(f"Test MAPE (original scale, capped at 100% error per point): {mape_original_capped:.2f}%")
-                #print(f"Target scaler mean: {target_scaler_object.mean_[0]:.4f}")
-                #print(f"Target scaler scale: {target_scaler_object.scale_[0]:.4f}")
-                original_scale_metrics_results = {
-                    'rmse': rmse_original, 
-                    # 'r2': r2_original, # Uncomment if used
-                    'mape': mape_original_capped
-                }
-            else:
-                print("Skipping original scale metrics: target_scaler_object or transform_info_dict is None.")
-
-            # Return values as appropriate for your application
-            return (model_predictions_std_log_np, actuals_std_log_np, 
-                    predictions_original_scale, actuals_original_scale,
-                    {'scaled_rmse': rmse_scaled, 'scaled_mape': mape_scaled_capped, **original_scale_metrics_results})
-
+        # Step 1: Inverse scaling
+        y_unscaled_1d = self._apply_inverse_scaling(y_processed_2d, target_scaler, transform_info)
         
-    def analyze_transformed_space_predictions(self,
-                                            actuals_std_transformed,
-                                            predictions_std_transformed,
-                                            transform_type, # 'log' or 'yeo-johnson' or 'box-cox' etc.
-                                            transform_params=None, # Dict for params like {'lambda': 0.5} or {'offset': 0.01}
-                                            underlying_transformed_data_std_dev=None): # Std dev of (log(data) or yj(data)) BEFORE standardization
+        # Step 2: Inverse structural transforms
+        y_untransformed_1d = self._apply_inverse_structural_transforms(y_unscaled_1d, transform_info, scalers_dict)
+        
+        # Step 3: Domain-specific clipping
+        y_final_1d = self._apply_domain_clipping(y_untransformed_1d, transform_info)
+            
+        return y_final_1d # Should be 1D array
+            
+    def evaluate(self, X_test_data: np.ndarray, y_test_data: np.ndarray, device: str = "cpu", 
+                target_scaler_object: Optional[Any] = None, 
+                transform_info_dict: Optional[Dict] = None, 
+                scalers_dict: Optional[Dict] = None,
+                batch_size: int = 256,  # Added batch_size parameter
+                return_predictions: bool = True,  # Control whether to return full predictions
+                plot_results: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
         """
-        Analyzes model predictions in the standardized transformed space.
-        This space results from applying a transformation (e.g., log, Yeo-Johnson)
-        and then standardizing the result.
-
+        Evaluate model with improved memory efficiency.
+        
         Args:
-            actuals_std_transformed (np.array): True target values in the standardized transformed space.
-            predictions_std_transformed (np.array): Model's predictions in the standardized transformed space.
-            transform_type (str): Type of the primary transformation used before standardization
-                                  (e.g., 'log', 'yeo-johnson').
-            transform_params (dict, optional): Parameters of the transformation, if any.
-                                               For 'log', could be {'offset': value}.
-                                               For 'yeo-johnson', could be {'lambda': value}.
-            underlying_transformed_data_std_dev (float, optional):
-                                  The standard deviation of the data *after* the primary transformation
-                                  (e.g., log(data) or yj(data)) but *before* it was standardized.
-                                  Required for specific interpretations like the multiplicative factor C for log transforms.
-        """
-        space_name = f"Standardized {transform_type.capitalize()} Space"
-        print(f"\n--- Analysis in {space_name} ---")
-
-        # Ensure inputs are flat numpy arrays for consistent calculations
-        actuals_std_transformed = np.array(actuals_std_transformed).flatten()
-        predictions_std_transformed = np.array(predictions_std_transformed).flatten()
-
-        # 1. Calculate Residuals
-        residuals_std_transformed = actuals_std_transformed - predictions_std_transformed
-        print(f"Number of samples: {len(actuals_std_transformed)}")
-
-        # 2. Analyze Residuals
-        mean_residuals_std_transformed = np.mean(residuals_std_transformed)
-        std_residuals_std_transformed = np.std(residuals_std_transformed)
-        
-        print(f"Mean of Residuals (Actuals - Predictions) in {space_name} (K_prime): {mean_residuals_std_transformed:.4f}")
-        print(f"Std Dev of Residuals in {space_name}: {std_residuals_std_transformed:.4f}")
-
-        if transform_type == 'log':
-            if underlying_transformed_data_std_dev is not None and underlying_transformed_data_std_dev != 0:
-                # Derivation:
-                # K_prime (mean_residuals_std_transformed) is the mean of:
-                # ( (log(Actual_orig) - mean_log) / std_dev_log ) - ( (log(Predicted_orig) - mean_log) / std_dev_log )
-                # = ( log(Actual_orig) - log(Predicted_orig) ) / std_dev_log
-                # = log(Actual_orig / Predicted_orig) / std_dev_log
-                # If we hypothesize Predicted_Original approx C * Actual_Original, then Actual_orig / Predicted_orig = 1/C.
-                # So, K_prime = log(1/C) / std_dev_log = -log(C) / std_dev_log
-                # Therefore, log(C) = -K_prime * std_dev_log
-                # C = exp(-K_prime * std_dev_log)
-                # Here, K_prime is mean_residuals_std_transformed, and std_dev_log is underlying_transformed_data_std_dev
-                
-                estimated_multiplicative_factor_C = np.exp(-mean_residuals_std_transformed * underlying_transformed_data_std_dev)
-                print(f"Estimated Multiplicative Factor (C) in Original Scale (from mean residual for log transform): {estimated_multiplicative_factor_C:.4f}")
-                print(f"  (This C implies Predicted_Original approx C * Actual_Original for log-transformed data)")
-                if transform_params and 'offset' in transform_params:
-                    print(f"  Log transform offset used: {transform_params['offset']}")
-            else:
-                print("  Cannot estimate Multiplicative Factor (C) for log transform without 'underlying_transformed_data_std_dev'.")
-        elif transform_type == 'yeo-johnson':
-            print("  Interpretation of a simple multiplicative factor (C) is specific to log transforms and not directly applicable for Yeo-Johnson.")
-            if transform_params and 'lambda' in transform_params:
-                print(f"  Yeo-Johnson Lambda (λ): {transform_params['lambda']:.4f}")
-        # Add other transform types here if needed
-
-        # 3. Plot Histogram of Residuals
-        plt.figure(figsize=(10, 6))
-        plt.hist(residuals_std_transformed, bins=50, alpha=0.7, color='blue', edgecolor='black')
-        plt.axvline(mean_residuals_std_transformed, color='red', linestyle='dashed', linewidth=2, label=f'Mean Residual: {mean_residuals_std_transformed:.4f}')
-        plt.title(f'Histogram of Residuals in {space_name}')
-        plt.xlabel(f'Residual (Actual_Std_{transform_type.capitalize()} - Predicted_Std_{transform_type.capitalize()})')
-        plt.ylabel('Frequency')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-
-        # 4. Plot Predictions vs. Actuals in Standardized Transformed Space
-        plt.figure(figsize=(10, 8))
-        plt.scatter(actuals_std_transformed, predictions_std_transformed, alpha=0.5, label='Predicted vs. Actual')
-        
-        # Add y=x line (perfect prediction)
-        min_val = min(np.min(actuals_std_transformed), np.min(predictions_std_transformed))
-        max_val = max(np.max(actuals_std_transformed), np.max(predictions_std_transformed))
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal (y=x)')
-        
-        # Add y = x - K_prime line (representing the mean bias in this space)
-        # K_prime is mean_residuals_std_transformed
-        # So, predictions_std_transformed approx actuals_std_transformed - mean_residuals_std_transformed
-        plt.plot([min_val, max_val], 
-                 [min_val - mean_residuals_std_transformed, max_val - mean_residuals_std_transformed], 
-                 'g:', lw=2, label=f'Observed Trend (y = x - K\') (K\'={mean_residuals_std_transformed:.4f})')
-        
-        plt.title(f'Predictions vs. Actuals in {space_name}')
-        plt.xlabel(f'Actual Standardized {transform_type.capitalize()} Values')
-        plt.ylabel(f'Predicted Standardized {transform_type.capitalize()} Values')
-        plt.legend()
-        plt.grid(True)
-        plt.axis('equal') # Ensures a 1:1 aspect ratio for easier visual assessment
-        plt.show()
-
-    def predict(self, X, batch_size=64, device="cpu", target_scaler=None, log_transform_info=None):
-        """
-        Make predictions on new data
+            X_test_data: Test data features
+            y_test_data: Test data targets
+            device: Device to run on
+            target_scaler_object: Scaler object for target variable
+            transform_info_dict: Dictionary containing transformation information
+            scalers_dict: Dictionary containing scaler objects
+            batch_size: Process data in batches to reduce memory usage
+            return_predictions: If False, only return metrics (saves memory)
+            plot_results: If True, generate residual and prediction plots
         """
         self.eval()
         self.to(device)
         
-        # Convert data to tensor
-        tensor_x = torch.FloatTensor(X)
-        dataset = TensorDataset(tensor_x)
-        loader = DataLoader(dataset, batch_size=batch_size)
+        # Create data loader for batch processing
+        test_dataset = TensorDataset(torch.FloatTensor(X_test_data), torch.FloatTensor(y_test_data))
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         
-        predictions = []
+        # Initialize accumulators for metrics computation
+        n_samples = 0
+        sum_squared_error = 0.0
+        sum_absolute_error = 0.0
+        sum_actuals = 0.0
+        sum_actuals_squared = 0.0
+        sum_predictions = 0.0
+        sum_pred_actual = 0.0
         
+        # For MAPE calculation
+        sum_percentage_error = 0.0
+        epsilon_mape = 1e-8
+        
+        # Optional: collect predictions if needed
+        if return_predictions:
+            all_predictions_scaled = []
+            all_actuals_scaled = []
+        
+        # Process in batches
         with torch.no_grad():
-            for (inputs,) in loader: # Note: DataLoader returns a tuple, so (inputs,) unpacks it
-                inputs = inputs.to(device)
-                outputs = self(inputs)
-                predictions.extend(outputs.cpu().numpy())
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                predictions = self(inputs)
+                
+                # Move to CPU and convert to numpy
+                pred_batch = predictions.cpu().numpy()
+                actual_batch = targets.cpu().numpy()
+                
+                # Update running statistics for scaled metrics
+                batch_size_actual = pred_batch.shape[0]
+                n_samples += batch_size_actual
+                
+                # For MSE and MAE
+                sum_squared_error += np.sum((actual_batch - pred_batch) ** 2)
+                sum_absolute_error += np.sum(np.abs(actual_batch - pred_batch))
+                
+                # For R²
+                sum_actuals += np.sum(actual_batch)
+                sum_actuals_squared += np.sum(actual_batch ** 2)
+                sum_predictions += np.sum(pred_batch)
+                sum_pred_actual += np.sum(pred_batch * actual_batch)
+                
+                # For MAPE
+                abs_percentage_error = np.abs((actual_batch - pred_batch) / (np.abs(actual_batch) + epsilon_mape))
+                sum_percentage_error += np.sum(np.clip(abs_percentage_error, 0, 1.0))
+                
+                # Collect predictions if requested
+                if return_predictions:
+                    all_predictions_scaled.append(pred_batch)
+                    all_actuals_scaled.append(actual_batch)
         
-        predictions = np.array(predictions)
+        # Calculate scaled metrics from accumulated statistics
+        mse_scaled = sum_squared_error / n_samples
+        rmse_scaled = np.sqrt(mse_scaled)
+        mae_scaled = sum_absolute_error / n_samples
+        mape_scaled_capped = (sum_percentage_error / n_samples) * 100
         
-        # If we have a scaler, transform predictions back to original scale
-        if target_scaler is not None:
-            # Handle backward compatibility with log_transform_info
-            if log_transform_info is not None: # This is the old parameter name
-                # Construct the new transform_info structure
-                current_transform_info = {
-                    'transforms': [
-                        {'type': 'log', 'applied': log_transform_info.get('applied', False), 
-                         'offset': log_transform_info.get('epsilon', log_transform_info.get('offset', 0))}, # check for epsilon or offset
-                        {'type': 'scale', 'applied': True} # Assume scaling was always applied if target_scaler is present
-                    ],
-                    'target_col_original': -1 # Default or get from log_transform_info if available
-                }
-            elif hasattr(self, 'transform_info') and self.transform_info is not None: # Use the class attribute
-                 current_transform_info = self.transform_info
-            else: # Default if no info is provided
-                current_transform_info = {
-                    'transforms': [
-                        {'type': 'scale', 'applied': True}
-                    ],
-                    'target_col_original': -1
-                }
-            
-            # Use the new inverse transform method
-            predictions = self._inverse_transform_target(predictions, target_scaler, current_transform_info)
+        # Calculate R² using accumulated statistics
+        mean_actual = sum_actuals / n_samples
+        ss_tot = sum_actuals_squared - n_samples * mean_actual ** 2
+        ss_res = sum_squared_error
+        r2_scaled = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
         
-        return predictions
-    
-    def plot_training_history(self, figsize=(20, 15), log_scale=True):
-        """
-        Plot the training history metrics
+        logging.info("\n--- LSTM Scaled Metrics ---")
+        logging.info(f"RMSE (scaled): {rmse_scaled:.4f}, R² (scaled): {r2_scaled:.4f}, "
+                    f"MAE (scaled): {mae_scaled:.4f}, Capped MAPE (scaled): {mape_scaled_capped:.2f}%")
         
-        Args:
-            figsize: Figure size as (width, height)
-            log_scale: Whether to use log scale for loss plots
+        # Process original scale metrics if scaler provided
+        predictions_original_scale, actuals_original_scale = None, None
+        original_metrics: Dict[str, float] = {'rmse': np.nan, 'r2': np.nan, 'mae': np.nan, 'mape_capped': np.nan}
         
-        Returns:
-            matplotlib.figure.Figure: The figure containing the plots
-        """
-        if not self.history['epochs']:
-            print("No training history available. Please train the model first.")
-            return None
+        if target_scaler_object and transform_info_dict and return_predictions:
+            logging.info("\n--- LSTM Original Scale Metrics ---")
+            try:
+                # Concatenate all predictions and actuals
+                model_predictions_scaled_np = np.vstack(all_predictions_scaled)
+                actuals_scaled_np = np.vstack(all_actuals_scaled)
+                
+                # Process in batches for inverse transform to save memory
+                predictions_original_list = []
+                actuals_original_list = []
+                
+                inverse_batch_size = min(1000, n_samples)  # Process inverse transform in smaller batches
+                
+                for i in range(0, n_samples, inverse_batch_size):
+                    end_idx = min(i + inverse_batch_size, n_samples)
+                    
+                    # Inverse transform predictions batch
+                    pred_batch = model_predictions_scaled_np[i:end_idx]
+                    pred_original_batch = self._inverse_transform_target(
+                        pred_batch, target_scaler_object, transform_info_dict, scalers_dict
+                    ).flatten()
+                    predictions_original_list.append(pred_original_batch)
+                    
+                    # Inverse transform actuals batch
+                    actual_batch = actuals_scaled_np[i:end_idx]
+                    actual_original_batch = self._inverse_transform_target(
+                        actual_batch, target_scaler_object, transform_info_dict, scalers_dict
+                    ).flatten()
+                    actuals_original_list.append(actual_original_batch)
+                
+                predictions_original_scale = np.concatenate(predictions_original_list)
+                actuals_original_scale = np.concatenate(actuals_original_list)
+                
+                # Calculate original scale metrics
+                if not (np.isnan(predictions_original_scale).any() or np.isnan(actuals_original_scale).any()):
+                    rmse_orig = np.sqrt(mean_squared_error(actuals_original_scale, predictions_original_scale))
+                    r2_orig = r2_score(actuals_original_scale, predictions_original_scale)
+                    mae_orig = mean_absolute_error(actuals_original_scale, predictions_original_scale)
+                    mape_orig_capped = np.mean(np.clip(
+                        np.abs((actuals_original_scale - predictions_original_scale) / 
+                            (np.abs(actuals_original_scale) + epsilon_mape)), 0, 1.0)) * 100
+                    
+                    logging.info(f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, "
+                                f"MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%")
+                    
+                    original_metrics = {
+                        'rmse': rmse_orig, 
+                        'r2': r2_orig, 
+                        'mae': mae_orig, 
+                        'mape_capped': mape_orig_capped
+                    }
+                    
+                    # Generate plots if requested
+                    if plot_results:
+                        self._generate_evaluation_plots(predictions_original_scale, actuals_original_scale)
+                        
+            except Exception as e:
+                logging.error(f"Error in original scale metrics calculation: {e}")
         
-        # Create a figure with 3x2 subplots
-        fig, axes = plt.subplots(3, 2, figsize=figsize)
-        axes = axes.flatten()
-        
-        # 1. Plot training and validation loss
-        ax = axes[0]
-        ax.plot(self.history['epochs'], self.history['train_loss'], 'b-', label='Training Loss', 
-                linewidth=2, marker='o', markersize=4)
-        ax.plot(self.history['epochs'], self.history['val_loss'], 'r-', label='Validation Loss', 
-                linewidth=2, marker='x', markersize=6)
-        
-        # Find best validation loss point
-        best_val_loss_idx = np.argmin(self.history['val_loss'])
-        best_val_loss_epoch = self.history['epochs'][best_val_loss_idx]
-        best_val_loss = self.history['val_loss'][best_val_loss_idx]
-        
-        # Highlight best model
-        ax.scatter(best_val_loss_epoch, best_val_loss, s=150, c='green', marker='*', 
-                   label=f'Best Model (Epoch {best_val_loss_epoch}, Loss {best_val_loss:.6f})', zorder=10)
-        
-        # Add gray vertical line at best model
-        ax.axvline(x=best_val_loss_epoch, color='gray', linestyle='--', alpha=0.5)
-        
-        # Add formatting
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('Loss', fontsize=12)
-        ax.set_title('Training and Validation Loss Over Time', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper right')
-        
-        # Use log scale if requested
-        if log_scale:
-            ax.set_yscale('log')
-        
-        # 2. Plot RMSE
-        ax = axes[1]
-        ax.plot(self.history['epochs'], self.history['val_rmse'], 'g-', label='Validation RMSE', 
-                linewidth=2, marker='s', markersize=6)
-        
-        # Find best RMSE point
-        best_rmse_idx = np.argmin(self.history['val_rmse'])
-        best_rmse_epoch = self.history['epochs'][best_rmse_idx]
-        best_rmse = self.history['val_rmse'][best_rmse_idx]
-        
-        # Highlight best RMSE
-        ax.scatter(best_rmse_epoch, best_rmse, s=150, c='purple', marker='*', 
-                   label=f'Best RMSE (Epoch {best_rmse_epoch}, RMSE {best_rmse:.6f})', zorder=10)
-        
-        # Add gray vertical line at best RMSE
-        ax.axvline(x=best_rmse_epoch, color='gray', linestyle='--', alpha=0.5)
-        
-        # Add formatting
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('RMSE', fontsize=12)
-        ax.set_title('Validation RMSE Over Time', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper right')
-        
-        # 3. Plot R²
-        ax = axes[2]
-        ax.plot(self.history['epochs'], self.history['val_r2'], 'm-', label='Validation R²', 
-                linewidth=2, marker='d', markersize=6)
-        
-        # Find best R² point
-        best_r2_idx = np.argmax(self.history['val_r2'])
-        best_r2_epoch = self.history['epochs'][best_r2_idx]
-        best_r2 = self.history['val_r2'][best_r2_idx]
-        
-        # Highlight best R²
-        ax.scatter(best_r2_epoch, best_r2, s=150, c='orange', marker='*', 
-                   label=f'Best R² (Epoch {best_r2_epoch}, R² {best_r2:.6f})', zorder=10)
-        
-        # Add formatting
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('R²', fontsize=12)
-        ax.set_title('Validation R² Over Time', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='lower right')
-        
-        # 4. Plot MAPE
-        ax = axes[3]
-        ax.plot(self.history['epochs'], self.history['val_mape'], 'r-', label='Validation MAPE (%)', 
-                linewidth=2, marker='o', markersize=6)
-        
-        # Find best MAPE point
-        best_mape_idx = np.argmin(self.history['val_mape'])
-        best_mape_epoch = self.history['epochs'][best_mape_idx]
-        best_mape = self.history['val_mape'][best_mape_idx]
-        
-        # Highlight best MAPE
-        ax.scatter(best_mape_epoch, best_mape, s=150, c='brown', marker='*', 
-                   label=f'Best MAPE (Epoch {best_mape_epoch}, MAPE {best_mape:.2f}%)', zorder=10)
-        
-        # Add formatting
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('MAPE (%)', fontsize=12)
-        ax.set_title('Validation MAPE Over Time', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper right')
-        
-        # 5. Plot Learning Rate
-        ax = axes[4]
-        ax.plot(self.history['epochs'], self.history['lr'], 'c-', 
-                linewidth=2, marker='d', markersize=6)
-        
-        # Add formatting
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('Learning Rate', fontsize=12)
-        ax.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        
-        # Use log scale for learning rate
-        ax.set_yscale('log')
-        
-        # 6. Plot Train vs Val Loss Ratio (to detect overfitting)
-        ax = axes[5]
-        # Ensure train_loss is not zero to avoid division by zero error
-        train_loss_safe = [max(t, 1e-9) for t in self.history['train_loss']] # Add small epsilon
-        loss_ratio = [v/t for t, v in zip(train_loss_safe, self.history['val_loss'])]
-        ax.plot(self.history['epochs'], loss_ratio, 'm-', 
-                linewidth=2, marker='^', markersize=6)
-        
-        # Add horizontal line at ratio=1
-        ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7)
-        
-        # Add formatting
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('Val Loss / Train Loss Ratio', fontsize=12)
-        ax.set_title('Overfitting Indicator', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        
-        # Add annotation for interpretation
-        if max(loss_ratio) > 1.5: # Check if max ratio is available and greater than 1.5
-            ax.text(0.5, 0.9, "Ratio > 1: Potential overfitting", 
-                   transform=ax.transAxes, ha='center', 
-                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-        
-        # Add a title for the entire figure
-        plt.suptitle('LSTM Model Training Metrics', fontsize=16, fontweight='bold', y=0.98)
-        
-        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust for the suptitle
-        
-        return fig
-
-    def save(self, path):
-        """
-        Save model to file
-        """
-        torch.save({
-            'model_state_dict': self.state_dict(),
-            'model_config': {
-                'input_dim': self.input_dim,
-                'hidden_dim': self.hidden_dim,
-                'output_dim': self.output_dim,
-                'num_layers': self.num_layers,
-                'dropout_prob': self.dropout_prob # Save dropout_prob as well
-            },
-            'history': self.history,
-            'transform_info': self.transform_info # Save transform_info
-        }, path)
-        print(f"Model saved to {path}")
-    
-    @classmethod # Use classmethod for loading
-    def load(cls, path, device="cpu"): # Add cls as first argument
-        """
-        Load model from file
-        """
-        checkpoint = torch.load(path, map_location=device)
-        config = checkpoint['model_config']
-        
-        model = cls( # Use cls to instantiate the class
-            input_dim=config['input_dim'],
-            hidden_dim=config['hidden_dim'],
-            num_layers=config['num_layers'],
-            output_dim=config['output_dim'],
-            dropout_prob=config.get('dropout_prob', 0.3) # Load dropout_prob, default if not found
-        )
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load history if available
-        if 'history' in checkpoint:
-            model.history = checkpoint['history']
-
-        # Load transform_info if available
-        if 'transform_info' in checkpoint:
-            model.transform_info = checkpoint['transform_info']
-        else: # For backward compatibility if old model was saved without transform_info
-            model.transform_info = None 
-            
-        model.to(device)
-        return model
-    
-    def predict_with_uncertainty(self, X, mc_samples=30, device="cpu", 
-                                 target_scaler=None, transform_info=None,
-                                 return_samples=False, alpha=0.05):
-        """
-        Generate predictions with uncertainty estimates using MC Dropout
-        
-        Args:
-            X: Input data of shape (batch_size, seq_length, input_dim)
-            mc_samples: Number of Monte Carlo forward passes
-            device: Device for computation
-            target_scaler: Scaler for inverse transformation
-            transform_info: Info about transformations applied to the target. 
-                            If None, uses self.transform_info.
-            return_samples: Whether to return all MC samples
-            alpha: Significance level for confidence intervals (default 0.05 for 95% CI)
-            
-        Returns:
-            Dictionary containing:
-                - mean: Mean prediction
-                - std: Standard deviation of predictions
-                - lower_ci: Lower confidence interval bound
-                - upper_ci: Upper confidence interval bound
-                - samples: All MC samples (if return_samples=True)
-        """
-        # Convert to tensor if not already
-        if not torch.is_tensor(X):
-            X = torch.tensor(X, dtype=torch.float32)
-        
-        # Move to device
-        X = X.to(device)
-        
-        # Set model to evaluation mode but keep dropout active
-        self.eval() 
-        
-        # Enable dropout during inference
-        def enable_dropout(model_to_set): # Renamed to avoid conflict
-            for m in model_to_set.modules():
-                if isinstance(m, nn.Dropout):
-                    m.train() # Activates dropout
-        
-        enable_dropout(self) # Apply to the current model instance
-        
-        # Store predictions from multiple forward passes
-        all_predictions = []
-        
-        # Run multiple forward passes
-        with torch.no_grad():
-            for _ in range(mc_samples):
-                # Forward pass with dropout active
-                outputs = self(X)
-                all_predictions.append(outputs.cpu().numpy())
-        
-        # Stack predictions along new axis
-        # Shape: (mc_samples, batch_size, output_dim)
-        all_predictions = np.stack(all_predictions, axis=0)
-        
-        # Use self.transform_info if transform_info argument is None
-        current_transform_info = transform_info if transform_info is not None else self.transform_info
-
-        # If we have a target scaler, apply inverse transformation to each sample
-        if target_scaler is not None:
-            # For each MC sample
-            for i in range(mc_samples):
-                # Use the inverse transform method
-                # Assuming output_dim is 1, so we access all_predictions[i, :, 0]
-                all_predictions[i, :, 0] = self._inverse_transform_target(
-                    all_predictions[i, :, 0], target_scaler, current_transform_info
-                )
-        
-        # Calculate statistics across MC samples
-        # Mean prediction for each input example
-        mean_prediction = np.mean(all_predictions, axis=0)
-        
-        # Standard deviation for each input example
-        std_prediction = np.std(all_predictions, axis=0)
-        
-        # Confidence intervals (using percentiles for non-parametric intervals)
-        lower_percentile = alpha/2 * 100
-        upper_percentile = (1 - alpha/2) * 100
-        
-        lower_ci = np.percentile(all_predictions, lower_percentile, axis=0)
-        upper_ci = np.percentile(all_predictions, upper_percentile, axis=0)
-        
-        # Prepare return dictionary
-        uncertainty_dict = {
-            'mean': mean_prediction,
-            'std': std_prediction,
-            'lower_ci': lower_ci, 
-            'upper_ci': upper_ci,
+        # Prepare return values
+        all_metrics = {
+            'scaled_rmse': rmse_scaled,
+            'scaled_r2': r2_scaled,
+            'scaled_mae': mae_scaled,
+            'scaled_mape_capped': mape_scaled_capped,
+            **original_metrics
         }
         
-        # Add all samples if requested
-        if return_samples:
-            uncertainty_dict['samples'] = all_predictions
-        
-        return uncertainty_dict
-
-    def plot_prediction_with_uncertainty(self, X, y_true=None, mc_samples=30, 
-                                         target_scaler=None, transform_info=None,
-                                         figsize=(12, 8), device="cpu", alpha=0.05,
-                                         indices=None, max_samples_to_plot=5): # Renamed max_samples to avoid conflict
-        """
-        Plot predictions with uncertainty bounds
-        
-        Args:
-            X: Input data
-            y_true: Ground truth values (optional)
-            mc_samples: Number of Monte Carlo samples
-            target_scaler: Scaler for inverse transformation
-            transform_info: Info about transformations applied to the target.
-                            If None, uses self.transform_info.
-            figsize: Figure size
-            device: Computation device
-            alpha: Significance level for confidence intervals
-            indices: Specific indices to plot (default: first max_samples_to_plot)
-            max_samples_to_plot: Maximum number of samples to plot
-            
-        Returns:
-            Matplotlib figure
-        """
-        # Use self.transform_info if transform_info argument is None
-        current_transform_info = transform_info if transform_info is not None else self.transform_info
-
-        # Get predictions with uncertainty
-        uncertainty = self.predict_with_uncertainty(
-            X, mc_samples=mc_samples, device=device,
-            target_scaler=target_scaler, transform_info=current_transform_info,
-            return_samples=True, alpha=alpha
-        )
-        
-        # If indices not specified, use first max_samples_to_plot
-        if indices is None:
-            n_plot_samples = min(max_samples_to_plot, len(X)) # n_samples was conflicting
-            indices_to_plot = np.arange(n_plot_samples) # Renamed indices
+        if return_predictions:
+            model_predictions_scaled_np = np.vstack(all_predictions_scaled).flatten()
+            actuals_scaled_np = np.vstack(all_actuals_scaled).flatten()
         else:
-            indices_to_plot = np.array(indices)
-            n_plot_samples = len(indices_to_plot)
+            model_predictions_scaled_np = None
+            actuals_scaled_np = None
         
-        # Prepare ground truth if available
-        if y_true is not None:
-            y_true_np = y_true.copy() # Work with a copy
-            if not isinstance(y_true_np, np.ndarray): # Ensure it's a numpy array
-                 y_true_np = np.array(y_true_np)
-            
-            if target_scaler is not None:
-                # Use the inverse transform method for ground truth
-                y_true_np = self._inverse_transform_target(
-                    y_true_np.squeeze(), target_scaler, current_transform_info # Squeeze if it's a column vector
-                )
+        return (model_predictions_scaled_np, actuals_scaled_np, 
+                predictions_original_scale, actuals_original_scale, all_metrics)
+
+
+    def _generate_evaluation_plots(self, original_preds: np.ndarray, original_actuals: np.ndarray):
+        """Generate residual and prediction vs actual plots."""
+        logging.info("Generating residual and prediction vs. actual plots for original scale data...")
         
-        # Create figure
-        fig, axs = plt.subplots(n_plot_samples, 1, figsize=figsize, squeeze=False)
+        # Calculate residuals in the original scale
+        residuals_original = original_actuals.flatten() - original_preds.flatten()
+        mean_residuals_original = np.mean(residuals_original)
+        std_residuals_original = np.std(residuals_original)
         
-        # For each sample to plot
-        for i, idx in enumerate(indices_to_plot):
-            ax = axs[i, 0]
-            
-            # Extract predictions and bounds for this sample
-            mean_val = uncertainty['mean'][idx, 0] # Renamed mean to mean_val
-            lower_val = uncertainty['lower_ci'][idx, 0] # Renamed lower to lower_val
-            upper_val = uncertainty['upper_ci'][idx, 0] # Renamed upper to upper_val
-            
-            # Get all MC samples for this input
-            all_mc_samples = uncertainty['samples'][:, idx, 0] # Renamed all_samples
-            
-            # Plot MC samples as semi-transparent lines/points
-            # Plotting many individual lines can be slow, so plot as points or a few representative lines
-            # Here, we plot individual points for a subset of MC samples
-            num_mc_to_plot = min(10, mc_samples) # Plot up to 10 individual MC samples
-            for j in range(num_mc_to_plot): 
-                ax.plot([0], [all_mc_samples[j]], 'o', alpha=0.2, color='gray', markersize=3) # Smaller markersize
-            
-            # Plot prediction and confidence interval
-            ax.errorbar([0], [mean_val], yerr=[[mean_val-lower_val], [upper_val-mean_val]], 
-                        fmt='o', color='blue', ecolor='lightblue', 
-                        capsize=5, label=f'{int((1-alpha)*100)}% CI Prediction') # More descriptive label
-            
-            # Plot ground truth if available
-            if y_true is not None and idx < len(y_true_np):
-                ax.plot([0], [y_true_np[idx]], 'ro', label='Actual')
-                
-                # Calculate error
-                error = abs(mean_val - y_true_np[idx])
-                within_ci = lower_val <= y_true_np[idx] <= upper_val
-                
-                # Add error information
-                ax.text(0.02, 0.95, f"Error: {error:.2f}", transform=ax.transAxes, fontsize=9)
-                ax.text(0.02, 0.90, f"Actual in CI: {'Yes' if within_ci else 'No'}", 
-                        transform=ax.transAxes, fontsize=9,
-                        color='green' if within_ci else 'red') # Color code for quick visual
-            
-            # Calculate prediction interval width
-            interval_width = upper_val - lower_val
-            ax.text(0.02, 0.85, f"Interval width: {interval_width:.2f}", transform=ax.transAxes, fontsize=9)
-            
-            ax.set_title(f"Sample Index: {idx}", fontsize=10)
-            
-            # Adjust y-limits to better fit the data, ensuring some padding
-            plot_min_y = min(lower_val, y_true_np[idx] if y_true is not None and idx < len(y_true_np) else lower_val)
-            plot_max_y = max(upper_val, y_true_np[idx] if y_true is not None and idx < len(y_true_np) else upper_val)
-            padding = 0.2 * (plot_max_y - plot_min_y) if (plot_max_y - plot_min_y) > 1e-6 else 1.0 # Add padding, handle near-zero range
-            
-            ax.set_ylim([max(0, plot_min_y - padding), plot_max_y + padding]) # Ensure y_min is not negative if data is non-negative
-            ax.set_xticks([]) # Remove x-ticks as they are not meaningful here
-            ax.set_ylabel("Value", fontsize=9) # Add y-axis label
-            
-            if i == 0: # Add legend only to the first subplot
-                ax.legend(fontsize=8, loc='best')
+        # --- 1. Frequency of Residuals (Histogram) in Original Scale ---
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals_original, bins=50, alpha=0.7, color='skyblue', 
+                edgecolor='black', density=True)
+        plt.axvline(mean_residuals_original, color='red', linestyle='dashed', 
+                    linewidth=2, label=f'Mean Residual: {mean_residuals_original:.2f}')
+        plt.title('Frequency of Residuals (Original Scale)', fontsize=16)
+        plt.xlabel(f'Residual (Actual Value - Predicted Value) in original units', fontsize=12)
+        plt.ylabel('Density', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(axis='y', alpha=0.75)
+        plt.text(0.95, 0.90, f'Std Dev of Residuals: {std_residuals_original:.2f}', 
+                horizontalalignment='right', verticalalignment='top', 
+                transform=plt.gca().transAxes, fontsize=10)
+        plt.tight_layout()
+        plt.show()
         
-        plt.suptitle(f'Predictions with {int((1-alpha)*100)}% Confidence Intervals', fontsize=14, fontweight='bold')
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap with suptitle
+        # --- 2. Predictions vs. Actuals in Original Scale ---
+        plt.figure(figsize=(10, 8))
+        
+        # Sample points if dataset is too large to plot efficiently
+        if len(original_actuals) > 10000:
+            sample_indices = np.random.choice(len(original_actuals), 10000, replace=False)
+            plot_actuals = original_actuals[sample_indices]
+            plot_preds = original_preds[sample_indices]
+            logging.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
+        else:
+            plot_actuals = original_actuals
+            plot_preds = original_preds
+        
+        plt.scatter(plot_actuals, plot_preds, alpha=0.5, color='cornflowerblue', 
+                    label='Predicted vs. Actual', s=10)
+        
+        # Determine plot limits for y=x line and observed trend
+        min_val = min(np.min(plot_actuals), np.min(plot_preds))
+        max_val = max(np.max(plot_actuals), np.max(plot_preds))
+        
+        # Ideal line (y=x)
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal (y=x)')
+        
+        # Observed trend line
+        plt.plot([min_val, max_val], 
+                [min_val - mean_residuals_original, max_val - mean_residuals_original], 
+                'g:', lw=2, 
+                label=f'Observed Trend (y = x - {mean_residuals_original:.2f})')
+        
+        plt.title('Predictions vs. Actuals (Original Scale)', fontsize=16)
+        plt.xlabel('Actual Values (Original Units)', fontsize=12)
+        plt.ylabel('Predicted Values (Original Units)', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.5)
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.show()
+
+    def _ensure_batched_input(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        """Ensure input is a PyTorch tensor and properly batched for prediction."""
+        if isinstance(X, np.ndarray):
+            X_tensor = torch.FloatTensor(X)
+        elif isinstance(X, torch.Tensor):
+            X_tensor = X.float() # Ensure float
+        else:
+            raise TypeError(f"Input X must be np.ndarray or torch.Tensor, got {type(X)}")
+
+        if X_tensor.ndim == 1:  # Single feature vector for one timestep (features,)
+            # This case is ambiguous for LSTMs expecting (seq_len, features).
+            # Assuming it's a sequence of length 1.
+            logging.warning("1D input to _ensure_batched_input, assuming seq_len=1.")
+            return X_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, features)
+        elif X_tensor.ndim == 2:  # Single sequence (seq_len, features)
+            return X_tensor.unsqueeze(0)  # (1, seq_len, features)
+        elif X_tensor.ndim == 3:  # Already batched (batch_size, seq_len, features)
+            return X_tensor
+        else:
+            raise ValueError(f"Input X must be 1D, 2D, or 3D, got {X_tensor.ndim}D")
+
+    def predict(self, X: np.ndarray, batch_size: int = 32, device: str = "cpu", 
+                target_scaler: Optional[Any] = None, 
+                transform_info: Optional[Dict] = None, 
+                scalers_dict: Optional[Dict] = None) -> np.ndarray:
+        self.eval(); self.to(device)
+        
+        X_batched_tensor = self._ensure_batched_input(X).to(device)
+        
+        dataset = TensorDataset(X_batched_tensor) # DataLoader needs a dataset
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        
+        predictions_scaled_list = []
+        with torch.no_grad():
+            for (inputs_batch,) in loader: # inputs_batch is already on device from _ensure_batched_input
+                outputs = self(inputs_batch)
+                predictions_scaled_list.append(outputs.cpu().numpy())
+        
+        predictions_scaled_np = np.concatenate(predictions_scaled_list, axis=0)
+        
+        if target_scaler is not None and transform_info is not None:
+            # Output from model is (N, output_dim). Ensure it's (N,1) for inverse transform if output_dim is 1.
+            if predictions_scaled_np.ndim == 1: predictions_scaled_np = predictions_scaled_np.reshape(-1,1)
+            return self._inverse_transform_target(predictions_scaled_np, target_scaler, transform_info, scalers_dict)
+        else:
+            logging.warning("target_scaler or transform_info not provided to predict method. Returning scaled predictions.")
+            return predictions_scaled_np.squeeze()
+    
+    # plot_training_history remains largely the same, ensure it uses self.history correctly.
+    def plot_training_history(self, figsize: Tuple[int, int] = (20, 18), log_scale_loss: bool = True):
+        # Import is_color_like here or at the top of the file
+        from matplotlib.colors import is_color_like
+
+        if not self.history.get('epochs'): # Use .get for safer dictionary access
+            logging.info("No LSTM training history to plot.")
+            return None
+        
+        fig, axes = plt.subplots(4, 2, figsize=figsize)
+        axes = axes.flatten() 
+
+        metrics_plot_config = [
+            ('Loss', ['train_loss', 'val_loss'], log_scale_loss, ['b-', 'r-']),
+            ('RMSE (Scaled)', ['val_rmse'], False, ['g-']),
+            ('R² (Scaled)', ['val_r2'], False, ['m-']),
+            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['darkorange-']), # Problematic
+            ('MAE (Scaled)', ['val_mae'], False, ['darkcyan-']),       # Problematic
+            ('Learning Rate', ['lr'], True, ['c-'])
+        ]
+
+        for i, (title, keys, ylog, style_specs_list) in enumerate(metrics_plot_config): # Renamed line_colors to style_specs_list for clarity
+            ax = axes[i]
+            for k_idx, key in enumerate(keys):
+                if key in self.history and self.history[key]: 
+                    label = key.replace('_', ' ').title()
+                    
+                    style_spec = style_specs_list[k_idx]
+                    plot_args = [self.history['epochs'], self.history[key]]
+                    plot_kwargs = {'label': label}
+
+                    parsed_color = None
+                    parsed_linestyle = None
+                    parsed_marker = None
+                    is_complex_spec = False
+
+                    # Define common linestyles and markers
+                    # Sorted by length (desc) to match '--' before '-' if applicable, though simple iteration works for distinct endings
+                    possible_styles_markers = ['--', '-.', '-', ':', '.', ',', 'o', 'v', '^', '<', '>', 's', 'p', '*', 'h', 'H', '+', 'x', 'D', 'd']
+
+                    if style_spec: # Ensure style_spec is not empty
+                        for sm_suffix in sorted(possible_styles_markers, key=len, reverse=True):
+                            if style_spec.endswith(sm_suffix):
+                                color_candidate = style_spec[:-len(sm_suffix)]
+                                if color_candidate and is_color_like(color_candidate):
+                                    # If the color_candidate is a single char color (e.g., 'r' in 'r-'),
+                                    # it's a standard fmt string. We only parse if it's a named color.
+                                    if len(color_candidate) > 1 or color_candidate.lower() not in 'bgrcmykw':
+                                        parsed_color = color_candidate
+                                        if sm_suffix in ['-', '--', '-.', ':']:
+                                            parsed_linestyle = sm_suffix
+                                        else:
+                                            parsed_marker = sm_suffix
+                                        is_complex_spec = True
+                                        break 
+                        if not is_complex_spec and is_color_like(style_spec) and (len(style_spec) > 1 or style_spec.lower() not in 'bgrcmykw.'):
+
+                            pass # Let it be handled by the else block for direct fmt string.
+
+                    if is_complex_spec:
+                        if parsed_color: plot_kwargs['color'] = parsed_color
+                        if parsed_linestyle: plot_kwargs['linestyle'] = parsed_linestyle
+                        if parsed_marker: plot_kwargs['marker'] = parsed_marker
+                        ax.plot(*plot_args, **plot_kwargs)
+                    else:
+                        # Pass style_spec as is (e.g., 'b-', 'g-', 'red', 'o').
+                        # Matplotlib handles valid format strings or color names here.
+                        ax.plot(*plot_args, style_spec, **plot_kwargs)
+
+                    if 'val' in key and self.history[key]: # Ensure list is not empty
+                        current_metric_values = np.array(self.history[key])
+                        if len(current_metric_values) > 0: # Ensure there are values to find min/max
+                            if any(s in key for s in ['loss', 'rmse', 'mape', 'mae']):
+                                best_idx = np.nanargmin(current_metric_values) # Use nanargmin
+                            else:
+                                best_idx = np.nanargmax(current_metric_values) # Use nanargmax
+                            
+                            if best_idx < len(self.history['epochs']): # Check bounds
+                                ax.scatter(self.history['epochs'][best_idx], current_metric_values[best_idx], 
+                                           s=100, c='gold', marker='*', zorder=5, 
+                                           label=f'Best {label.split(" ")[0]}') # Added space in label
+
+            ax.set_title(title)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(keys[0].split('_')[-1].upper() if '_' in keys[0] else keys[0].upper())
+            ax.legend()
+            ax.grid(True)
+            if ylog:
+                ax.set_yscale('log')
+        
+        # Plot for 'Overfitting Indicator'
+        ax_ratio = axes[6] 
+        if all(k in self.history and self.history[k] for k in ['train_loss', 'val_loss']) and \
+           len(self.history['train_loss']) == len(self.history['val_loss']) and \
+           len(self.history['train_loss']) > 0: # Ensure lists are not empty
+            train_loss_s = np.maximum(np.array(self.history['train_loss']), 1e-9) # Ensure train_loss_s has values
+            val_loss_s = np.array(self.history['val_loss'])
+            if len(train_loss_s) == len(val_loss_s): # Ensure equal length after potential np.array conversion
+                 ratio = val_loss_s / train_loss_s
+                 ax_ratio.plot(self.history['epochs'][:len(ratio)], ratio, color='slateblue', label='Val/Train Loss Ratio') # Explicit color, ensure epochs match ratio length
+                 ax_ratio.axhline(1.0, color='grey', linestyle='--') # Use linestyle
+                 if len(ratio) > 0 and np.nanmax(ratio) > 1.5:
+                     ax_ratio.text(0.5, 0.9, "Ratio > 1.5: Overfitting?", 
+                                   transform=ax_ratio.transAxes, ha='center', 
+                                   bbox=dict(boxstyle='round', fc='wheat', alpha=0.7))
+            else:
+                 ax_ratio.text(0.5, 0.5, "Loss data length mismatch", transform=ax_ratio.transAxes, ha='center')
+        else:
+            ax_ratio.text(0.5, 0.5, "Loss data missing or incomplete", transform=ax_ratio.transAxes, ha='center') # More informative message
+        ax_ratio.set_title('Overfitting Indicator')
+        ax_ratio.set_xlabel('Epoch')
+        ax_ratio.set_ylabel('Ratio')
+        ax_ratio.legend()
+        ax_ratio.grid(True)
+
+        # Remove unused subplot if it exists
+        if len(axes) > 7 and fig.axes[-1] == axes[7]: # Check if axes[7] is indeed the last axes
+             fig.delaxes(axes[7])
+
+        plt.suptitle('LSTM Model Training Metrics', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0,0,1,0.96]) # Ensure suptitle does not overlap
         return fig
 
+
+    def save(self, path: str):
+        # ... (save logic as in previous version, using self.params) ...
+        try:
+            save_content = {
+                'model_state_dict': self.state_dict(),
+                'model_params': self.params, 
+                'history': self.history, 
+                'transform_info': self.transform_info
+            }
+            torch.save(save_content, path)
+            logging.info(f"LSTM Model saved to {path}")
+        except Exception as e:
+            logging.error(f"Failed to save LSTM model to {path}: {e}")
+            raise
+    
+    @classmethod
+    def load(cls, path: str, device: str = "cpu") -> 'WeatherLSTM':
+        try:
+            # MODIFIED LINE: Added weights_only=False
+            checkpoint = torch.load(path, map_location=device, weights_only=False) 
+            
+            model_params = checkpoint['model_params']
+            if not isinstance(model_params, ModelHyperparameters):
+                 # If it was saved as dict from an older version, recreate dataclass
+                 model_params = ModelHyperparameters(**model_params) 
+            
+            model = cls(model_params=model_params)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            # Ensure history keys exist if loading older models; provide default empty lists
+            default_history = {key: [] for key in model.history_template_keys} # Assuming you add a class attr like history_template_keys = ['epochs', 'train_loss', ...]
+            model.history = checkpoint.get('history', default_history) 
+            model.transform_info = checkpoint.get('transform_info')
+            model.to(device)
+            logging.info(f"LSTM Model loaded from {path} with weights_only=False.")
+            return model
+        except Exception as e:
+            logging.error(f"Failed to load LSTM model from {path}: {e}", exc_info=True)
+            # Add the specific error message for unsupported globals if that's the case
+            if "Unsupported global" in str(e):
+                logging.error(
+                    "This might be due to custom classes (like ModelHyperparameters) in the checkpoint. "
+                    "Ensure these classes are defined in the scope where load is called. "
+                    "If using PyTorch 1.13+ and weights_only=True is implicitly active, "
+                    "consider using weights_only=False (if you trust the source) "
+                    "or torch.serialization.add_safe_globals."
+                )
+            raise
+    
+    def enable_mc_dropout(self):
+        """Enables dropout layers for Monte Carlo Dropout."""
+        self._mc_dropout_enabled = True
+        for m in self.modules():
+            if isinstance(m, nn.Dropout):
+                m.train() # Set dropout to train mode to activate it
+
+    def disable_mc_dropout(self):
+        """Disables dropout layers and sets model to eval mode."""
+        self._mc_dropout_enabled = False
+        self.eval() # Sets all modules, including dropout, to eval mode
+
+    def predict_with_uncertainty(self, X: np.ndarray, mc_samples: int = 30, device: str = "cpu", 
+                                 target_scaler: Optional[Any] = None, 
+                                 transform_info: Optional[Dict] = None, 
+                                 scalers_dict: Optional[Dict] = None,
+                                 return_samples: bool = False, alpha: float = 0.05) -> Dict[str, np.ndarray]:
+        self.enable_mc_dropout() # Enable dropout for MC sampling
+        try:
+            X_batched_tensor = self._ensure_batched_input(X).to(device)
+            predictions_scaled_mc_list = []
+            with torch.no_grad(): # Still no grad for inference part
+                for _ in range(mc_samples):
+                    predictions_scaled_mc_list.append(self(X_batched_tensor).cpu().numpy())
+            
+            predictions_scaled_mc_np = np.stack(predictions_scaled_mc_list, axis=0)
+            
+            predictions_original_mc = np.zeros_like(predictions_scaled_mc_np)
+            if target_scaler is not None and transform_info is not None:
+                for i in range(mc_samples):
+                    current_batch_scaled = predictions_scaled_mc_np[i, :, :]
+                    # Ensure input to _inverse_transform_target is 2D (samples, features)
+                    # Model output is (batch, output_dim). If output_dim=1, it's (batch, 1)
+                    inverted_sample = self._inverse_transform_target(
+                        current_batch_scaled, target_scaler, transform_info, scalers_dict
+                    ) # _inverse_transform_target now returns 1D if input was effectively (N,1)
+                    # Reshape to (batch, output_dim) for consistency in predictions_original_mc
+                    predictions_original_mc[i, :, :] = inverted_sample.reshape(current_batch_scaled.shape)
+            else:
+                logging.warning("No scalers/transform_info for uncertainty. Returning scaled uncertainty.")
+                predictions_original_mc = predictions_scaled_mc_np
+
+            results = {'mean': np.mean(predictions_original_mc, axis=0), 
+                       'std': np.std(predictions_original_mc, axis=0),
+                       'lower_ci': np.percentile(predictions_original_mc, (alpha/2)*100, axis=0),
+                       'upper_ci': np.percentile(predictions_original_mc, (1-alpha/2)*100, axis=0)}
+            if return_samples: results['samples'] = predictions_original_mc
+            return results
+        finally:
+            self.disable_mc_dropout() # Ensure dropout is disabled and model is back in eval mode
+
+    def plot_prediction_with_uncertainty(self, X: np.ndarray, y_true: Optional[np.ndarray] = None, 
+                                         mc_samples: int = 30, 
+                                         target_scaler: Optional[Any] = None, 
+                                         transform_info: Optional[Dict] = None, 
+                                         scalers_dict: Optional[Dict] = None,
+                                         figsize: Tuple[int, int] = (12, 8), device: str = "cpu", 
+                                         alpha: float = 0.05,
+                                         indices: Optional[List[int]] = None, 
+                                         max_samples_to_plot: int = 5):
+        current_transform_info = transform_info if transform_info is not None else self.transform_info
+        X_for_prediction = self._ensure_batched_input(X) # Uses the new helper
+
+        uncertainty_results = self.predict_with_uncertainty(
+            X_for_prediction.cpu().numpy(), # predict_with_uncertainty expects numpy
+            mc_samples, device, target_scaler, 
+            current_transform_info, scalers_dict, True, alpha
+        )
+        # ... (rest of the plotting logic as in previous version, ensuring indices and shapes are handled correctly) ...
+        num_available_samples_in_batch = X_for_prediction.shape[0]
+        if indices is None:
+            num_to_plot = min(max_samples_to_plot, num_available_samples_in_batch)
+            plot_indices = np.arange(num_to_plot)
+        else:
+            plot_indices = [i for i in np.array(indices) if i < num_available_samples_in_batch]
+
+        y_true_original_np: Optional[np.ndarray] = None
+        if y_true is not None:
+            y_true_arr = np.array(y_true).copy()
+            if target_scaler and current_transform_info:
+                # Ensure y_true_arr is 2D for _inverse_transform_target if it's a single series
+                y_true_reshaped = y_true_arr.reshape(-1, self.params.output_dim)
+                y_true_original_np = self._inverse_transform_target(
+                    y_true_reshaped, target_scaler, current_transform_info, scalers_dict
+                ).flatten()
+            else: y_true_original_np = y_true_arr.flatten()
+
+
+
+        if plot_indices.size == 0:  # Corrected line 736
+            logging.info("No valid samples to plot for LSTM uncertainty.")
+            return plt.figure(figsize=figsize) 
+
+        fig, axs = plt.subplots(len(plot_indices), 1, figsize=figsize, squeeze=False)
+        for i, sample_idx_in_batch in enumerate(plot_indices):
+            ax = axs[i,0]
+            mean_val = uncertainty_results['mean'][sample_idx_in_batch, 0] 
+            lower_val = uncertainty_results['lower_ci'][sample_idx_in_batch, 0]
+            upper_val = uncertainty_results['upper_ci'][sample_idx_in_batch, 0]
+            all_mc_samps = uncertainty_results['samples'][:, sample_idx_in_batch, 0]
+            
+            for j in range(min(10, mc_samples)): ax.plot([0],[all_mc_samps[j]],'o',alpha=0.15,c='gray',ms=3)
+            ax.errorbar([0],[mean_val],yerr=[[mean_val-lower_val],[upper_val-mean_val]],fmt='o',c='blue',ecolor='lightblue',capsize=5,label=f'{int((1-alpha)*100)}% CI')
+            
+            if y_true_original_np is not None and sample_idx_in_batch < len(y_true_original_np):
+                actual_val = y_true_original_np[sample_idx_in_batch]
+                ax.plot([0],[actual_val],'ro',label='Actual')
+                err = abs(mean_val - actual_val); in_ci = lower_val <= actual_val <= upper_val
+                ax.text(0.02,0.95,f"Err: {err:.2f}",transform=ax.transAxes,fontsize=9)
+                ax.text(0.02,0.90,f"In CI: {'Y' if in_ci else 'N'}",transform=ax.transAxes,fontsize=9,color='g' if in_ci else 'r')
+            
+            iw = upper_val-lower_val; ax.text(0.02,0.85,f"IW: {iw:.2f}",transform=ax.transAxes,fontsize=9)
+            ax.set_title(f"Pred for Sample Idx in Batch: {sample_idx_in_batch}",fontsize=10)
+            
+            plot_min_y_vals = [lower_val] + ([y_true_original_np[sample_idx_in_batch]] if y_true_original_np is not None and sample_idx_in_batch < len(y_true_original_np) else [])
+            plot_max_y_vals = [upper_val] + ([y_true_original_np[sample_idx_in_batch]] if y_true_original_np is not None and sample_idx_in_batch < len(y_true_original_np) else [])
+            plot_min_y = min(plot_min_y_vals) if plot_min_y_vals else 0
+            plot_max_y = max(plot_max_y_vals) if plot_max_y_vals else 1 # Default if empty
+            padding = 0.2*(plot_max_y-plot_min_y) if (plot_max_y-plot_min_y)>1e-6 else 1.0
+            ax.set_ylim([max(DataProcessingConfig.MIN_RADIATION_CLIP, plot_min_y - padding), plot_max_y + padding]) 
+            ax.set_xticks([]); ax.set_ylabel("GHI (Original Scale)",fontsize=9)
+            if i==0: ax.legend(fontsize=8,loc='best')
+        
+        plt.suptitle(f'LSTM Preds w {int((1-alpha)*100)}% CI (Original Scale)',fontsize=14,fontweight='bold'); plt.tight_layout(rect=[0,0.03,1,0.95]); return fig

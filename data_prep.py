@@ -2,905 +2,701 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, PowerTransformer
 from sklearn.model_selection import train_test_split
-import torch 
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import mean_squared_error
 import math
+import logging
+from dataclasses import dataclass, field, replace
+from typing import List, Dict, Tuple, Optional, Any
 
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def create_solar_elevation_proxy(time_str, sunrise_str, sunset_str):
-    """Creates a continuous feature representing approximate solar elevation
+# --- Configuration Dataclasses ---
+@dataclass
+class DataInputConfig:
+    """Configuration for input data properties."""
+    target_col_original_name: str # Original name of the target column in the input df
+    # Common column names that might be present in input dataframes
+    common_temp_col: str = 'temp'
+    common_pressure_col: str = 'pressure'
+    common_humidity_col: str = 'humidity'
+    common_wind_speed_col: str = 'wind_speed'
+    common_ghi_col: str = 'GHI'
+    time_col: str = 'Time' # Expected primary timestamp column
+    unix_time_col: str = 'UNIXTime' # Fallback timestamp column
+    sunrise_col: str = 'TimeSunRise'
+    sunset_col: str = 'TimeSunSet'
+    hour_col_raw: str = 'hour' # Raw hour column from input if available
+    month_col_raw: str = 'month' # Raw month column from input if available
+    daylength_col_raw: str = 'dayLength'
+    is_sun_col_raw: str = 'isSun'
+    sunlight_time_daylength_ratio_raw: str = 'SunlightTime/daylength'
+    # Add other potential raw column names here
+
+@dataclass
+class TransformationConfig:
+    """Configuration for data transformations."""
+    use_log_transform: bool = False
+    use_power_transform: bool = False # Yeo-Johnson
+    use_piecewise_transform_target: bool = False # For GHI/Radiation target
     
-    Args:
-        time_str: Current time in 'HH:MM' format
-        sunrise_str: Sunrise time in 'HH:MM' format 
-        sunset_str: Sunset time in 'HH:MM' format
-        
-    Returns:
-        A value between 0-1 representing solar elevation
+    min_target_threshold_initial: Optional[float] = None # Initial floor for original target
+    clip_original_target_before_power_transform: bool = False
+    original_target_clip_lower_percentile: float = 5.0
+    original_target_clip_upper_percentile: float = 95.0
+    
+    # Floor for radiation before power transform (applied if target is radiation-like)
+    min_radiation_floor_before_power_transform: float = 0.0 
+    
+    # For log transform specifically (often for GHI/Radiation)
+    min_radiation_for_log: float = 0.1 # Floor before log(GHI)
+    log_transform_offset: float = 1e-6 # Epsilon for log(x + epsilon)
+    clip_log_transformed_target: bool = False
+    log_clip_lower_percentile: float = 1.0
+    log_clip_upper_percentile: float = 99.0
+
+    # Piecewise transform constants (if use_piecewise_transform_target is True)
+    PIECEWISE_NIGHT_THRESHOLD: float = 10.0
+    PIECEWISE_MODERATE_THRESHOLD: float = 200.0
+    # Coefficients for piecewise, can be tuned or made configurable
+    PIECEWISE_MODERATE_SLOPE: float = 0.05
+    PIECEWISE_HIGH_SLOPE: float = 0.002
+
+
+@dataclass
+class FeatureEngineeringConfig:
+    """Configuration for feature engineering."""
+    use_solar_elevation_proxy: bool = True
+    create_low_target_indicator: bool = True # e.g., GHI_is_low
+    low_target_indicator_quantile: float = 0.1
+    feature_selection_mode: str = 'all'  # 'all', 'basic', 'minimal'
+    # Define explicit feature sets for different modes (using standardized names)
+    minimal_features: List[str] = field(default_factory=lambda: ['Radiation', 'Temperature', 'Humidity', 'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover'])
+    basic_features: List[str] = field(default_factory=lambda: ['Radiation', 'Temperature', 'Pressure', 'Humidity', 'WindSpeed', 'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover', 'Rain'])
+    # 'all' mode will try to use all available standardized + engineered features.
+
+@dataclass
+class ScalingConfig:
+    """Configuration for data scaling."""
+    standardize_features: bool = True # True for StandardScaler, False for MinMaxScaler
+    # Target scaler choice might depend on transformations (e.g., PowerTransform often followed by StandardScaler)
+
+@dataclass
+class SequenceConfig:
+    """Configuration for creating sequences."""
+    window_size: int = 12
+    test_size: float = 0.2
+    val_size_from_train_val: float = 0.25 # Validation size as a fraction of (train+val) data
+
+# --- Standardized Column Names (Internal) ---
+# These are the names the rest of the functions will expect after initial mapping.
+STD_RADIATION_COL = 'Radiation'
+STD_TEMP_COL = 'Temperature'
+STD_PRESSURE_COL = 'Pressure'
+STD_HUMIDITY_COL = 'Humidity'
+STD_WINDSPEED_COL = 'WindSpeed'
+STD_CLOUDCOVER_COL = 'Cloudcover' # Example, map 'clouds_all' to this
+STD_RAIN_COL = 'Rain' # Example, map 'rain_1h'
+STD_SNOW_COL = 'Snow' # Example, map 'snow_1h'
+STD_WEATHER_TYPE_COL = 'WeatherType'
+# Time related standardized names
+STD_TIME_COL = 'Timestamp' # Standardized name for the main time column
+STD_HOUR_OF_DAY = 'HourOfDay'
+STD_MONTH = 'Month'
+STD_DAYLIGHT_MINUTES = 'DaylightMinutes'
+STD_IS_DAYLIGHT = 'IsDaylight'
+STD_DAYLIGHT_POSITION = 'DaylightPosition'
+STD_SOLAR_ELEVATION = 'SolarElevation'
+STD_TIME_MINUTES_SIN = 'TimeMinutesSin'
+STD_TIME_MINUTES_COS = 'TimeMinutesCos'
+STD_TIME_SINCE_SUNRISE = 'TimeSinceSunrise'
+STD_TIME_UNTIL_SUNSET = 'TimeUntilSunset'
+
+
+# --- Main Data Preparation Function ---
+def prepare_weather_data(
+    df_input: pd.DataFrame,
+    input_cfg: DataInputConfig,
+    transform_cfg: TransformationConfig,
+    feature_cfg: FeatureEngineeringConfig,
+    scaling_cfg: ScalingConfig,
+    sequence_cfg: SequenceConfig
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any], List[str], Dict[str, Any]]:
     """
-    # Convert times to minutes
-    time_parts = time_str.split(':')
-    current_minutes = int(time_parts[0]) * 60 + int(time_parts[1])
-    
-    sunrise_parts = sunrise_str.split(':')
-    sunrise_minutes = int(sunrise_parts[0]) * 60 + int(sunrise_parts[1])
-    
-    sunset_parts = sunset_str.split(':')
-    sunset_minutes = int(sunset_parts[0]) * 60 + int(sunset_parts[1])
-    
-    # Handle wrap-around for night hours
-    if current_minutes < sunrise_minutes and current_minutes > 0:
-        # It's early morning before sunrise
-        return 0
-    if current_minutes > sunset_minutes and current_minutes < 24*60:
-        # It's evening after sunset
-        return 0
-    
-    # For daytime, calculate normalized position in daylight hours (0 to 1)
-    daylight_duration = sunset_minutes - sunrise_minutes
-    midday_point = sunrise_minutes + (daylight_duration / 2)
-    
-    if current_minutes <= midday_point:
-        # Morning to noon
-        position = (current_minutes - sunrise_minutes) / (midday_point - sunrise_minutes)
-    else:
-        # Noon to evening
-        position = 1 - ((current_minutes - midday_point) / (sunset_minutes - midday_point))
-    
-    # Return value between 0-1 representing solar elevation
-    return math.sin(position * math.pi/2)  # Creates sine curve peaking at 1.0 during midday
-
-
-def piecewise_radiation_transform(radiation_values):
+    Revised pipeline to prepare weather time series data for recurrent model training.
+    Uses configuration objects and has improved structure and error handling.
     """
-    Applies different scaling to different radiation ranges.
-    
-    Args:
-        radiation_values: NumPy array of radiation values.
-        
-    Returns:
-        Transformed values with preserved nighttime accuracy.
-    """
-    transformed = np.zeros_like(radiation_values, dtype=float)
-    
-    # Night/low radiation (preserve accuracy for values near zero)
-    night_mask = radiation_values < 10
-    transformed[night_mask] = np.log1p(radiation_values[night_mask]) 
-    
-    # Morning/evening radiation (moderate scaling)
-    moderate_mask = (radiation_values >= 10) & (radiation_values < 200)
-    transformed[moderate_mask] = np.log1p(9.999) + 0.05 * (radiation_values[moderate_mask] - 10)
-    
-    # Midday/high radiation (reduced compression)
-    high_mask = radiation_values >= 200
-    moderate_max = np.log1p(9.999) + 0.05 * (199.999 - 10) 
-    transformed[high_mask] = moderate_max + 0.002 * (radiation_values[high_mask] - 200)
+    if df_input.empty:
+        raise ValueError("Input DataFrame is empty.")
+    if input_cfg.target_col_original_name not in df_input.columns:
+        raise ValueError(f"Original target column '{input_cfg.target_col_original_name}' not found in input DataFrame.")
 
-    return transformed
-
-
-def prepare_weather_data(df_input, target_col, window_size=12, test_size=0.2, val_size=0.25,
-                         # --- Transformation Flags ---
-                         use_log_transform=False,
-                         use_power_transform=False,
-                         # --- End Transformation Flags ---
-                         min_radiation_for_log=0.1,
-                         min_radiation_floor=0.0,
-                         # --- Parameters for pre-power-transform clipping of original target ---
-                         clip_original_target_before_transform=False,
-                         original_clip_lower_percentile=5.0,
-                         original_clip_upper_percentile=95.0,
-                         # --- End of new parameters for pre-transform clipping ---
-                         clip_log_target=False,
-                         log_clip_lower_percentile=1.0,
-                         log_clip_upper_percentile=99.0,
-                         use_piecewise_transform=False, 
-                         use_solar_elevation=True,
-                         standardize_features=True,
-                         feature_selection_mode='all',
-                         min_target_threshold=None):
-    """
-    Prepare weather time series data for LSTM training, adapted for the new dataset.
-    Includes optional clipping of the original target, Yeo-Johnson power transformation or
-    log transformation for the target, flooring, and other feature engineering.
-
-    Args:
-        df_input: DataFrame with weather data. Will be copied.
-        target_col: Column to predict (e.g., 'Energy delta[Wh]' or 'GHI').
-        window_size: Size of the sliding window.
-        test_size: Proportion for testing.
-        val_size: Proportion for validation.
-        use_log_transform: Whether to apply log transform (if power transform is not used).
-        use_power_transform: Whether to apply Yeo-Johnson power transform to the target.
-        min_radiation_for_log: Floor for radiation values before log transform (applies if target is GHI).
-        min_radiation_floor: Floor for radiation values AFTER original clipping but BEFORE power transform (applies if target is GHI).
-        clip_original_target_before_transform: Whether to clip the original target (e.g., GHI)
-                                               before other transformations.
-        original_clip_lower_percentile: Lower percentile for original target clipping.
-        original_clip_upper_percentile: Upper percentile for original target clipping.
-        clip_log_target: Whether to clip log-transformed target values.
-        log_clip_lower_percentile: Lower percentile for clipping log-transformed target.
-        log_clip_upper_percentile: Upper percentile for clipping log-transformed target.
-        use_piecewise_transform: Whether to apply piecewise transform for GHI.
-        use_solar_elevation: Whether to add solar elevation proxy.
-        standardize_features: If True, use StandardScaler for features, else MinMaxScaler.
-                              Target scaler depends on transformations applied.
-        feature_selection_mode: 'all', 'basic', or 'minimal'.
-        min_target_threshold: Initial minimum threshold for original target values.
-
-    Returns:
-        X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info
-    """
-    # ====================================================================
-    # 1. INITIALIZE AND PREPARE DATAFRAME
-    # ====================================================================
-    df = df_input.copy()
+    logging.info("Starting weather data preparation pipeline v2.")
     
-    # Initialize transform tracking dictionaries
-    piecewise_transform_details = {'applied': False, 'type': None, 'original_col': None}
-    log_transform_details = {'applied': False, 'type': None, 'offset': 0, 'original_col': None, 'clip_bounds': None}
-    power_transform_details = {
-        'applied': False, 'type': None, 'lambda': None, 'original_col': None, 
-        'scaler_used_after': None, 'power_transformer_obj': None, 'original_clip_bounds': None
+    # 1. Initial DataFrame Setup (Copy, Standardize Names, Sort by Time)
+    df, standardized_target_col_name, column_rename_map = _initial_df_setup(df_input.copy(), input_cfg)
+    
+    # 2. Engineer Time-Based Features
+    df = _engineer_time_features(df, feature_cfg, input_cfg) # Pass input_cfg for raw time col names
+
+    # 3. Apply Target Variable Transformations
+    # target_col_after_transforms is the name of the column that holds the target values
+    # after all structural transformations (log, power, piecewise) but BEFORE scaling.
+    df, target_col_after_transforms, applied_target_transforms_info = _apply_target_transformations(
+        df.copy(), # Pass a copy to avoid SettingWithCopyWarning if df is modified inside
+        standardized_target_col_name, 
+        transform_cfg
+    )
+
+    # 4. Engineer Other Features (e.g., low target indicator)
+    df = _engineer_other_domain_features(df, target_col_after_transforms, feature_cfg, standardized_target_col_name)
+
+    # 5. Select Final Set of Feature Columns (using standardized names)
+    feature_cols_final = _select_final_features(df, feature_cfg, target_col_after_transforms)
+    
+    # 6. Scale Features and the (potentially transformed) Target
+    # scaled_df contains all selected features and the target, scaled.
+    # target_col_scaled is the name of the target column within scaled_df.
+    scaled_df, scalers, target_col_scaled = _scale_data(
+        df, feature_cols_final, target_col_after_transforms, scaling_cfg, applied_target_transforms_info
+    )
+
+    # 7. Create Sequences and Split Data
+    X_train, X_val, X_test, y_train, y_val, y_test = _create_sequences_and_split(
+        scaled_df, feature_cols_final, target_col_scaled, sequence_cfg
+    )
+    
+    # 8. Consolidate Transformation Information for saving/loading/inverting
+    # This should include details about structural transforms and the final scaler for the target.
+    full_transform_details = {
+        'structural_transforms': applied_target_transforms_info,
+        'target_scaler_name': target_col_scaled, # Name of the target column in the scalers dict
+        'target_col_original': input_cfg.target_col_original_name, # The very original name
+        'target_col_standardized': standardized_target_col_name, # Name after initial standardization
+        'target_col_after_structural_transforms': target_col_after_transforms, # Name before scaling
+        'feature_columns_used': feature_cols_final
     }
     
-    # Standardize column names for processing
-    column_map, df = _standardize_column_names(df, df_input, target_col)
-    
-    # Keep track of the original target column name and the processed name
-    original_target_col_name = target_col
-    target_col = _get_processed_target_col_name(target_col, df)
-    
-    # ====================================================================
-    # 2. PROCESS TIME FEATURES
-    # ====================================================================
-    df = _process_time_features(df, df_input, use_solar_elevation, column_map)
-    
-    # ====================================================================
-    # 3. APPLY TARGET TRANSFORMATIONS
-    # ====================================================================
-    # Apply initial threshold to target if specified
-    if min_target_threshold is not None and target_col in df.columns:
-        print(f"Applying initial min_target_threshold of {min_target_threshold} to original '{target_col}'")
-        df[target_col] = df[target_col].clip(lower=min_target_threshold)
-    
-    # Track current target column name as it goes through transformations
-    target_col_processing = target_col
-    
-    # Check if target is radiation (renamed from GHI)
-    is_radiation_target = (target_col_processing == 'Radiation')
-    
-    # Step 1: Optional clipping of the original target variable
-    if clip_original_target_before_transform and is_radiation_target:
-        target_col_processing, power_transform_details = _clip_original_target(
-            df, target_col_processing, original_clip_lower_percentile, 
-            original_clip_upper_percentile, power_transform_details
-        )
-    
-    # Step 2: Apply piecewise transform if needed
-    if is_radiation_target and use_piecewise_transform:
-        target_col_processing, piecewise_transform_details = _apply_piecewise_transform(
-            df, target_col_processing
-        )
-    
-    # Step 3: Apply power transform OR log transform
-    current_target_is_radiation_family = (
-        target_col_processing == 'Radiation' or 
-        target_col_processing == 'Radiation_transformed'
-    )
-    
-    if use_power_transform and current_target_is_radiation_family:
-        target_col_processing, power_transform_details = _apply_power_transform(
-            df, target_col_processing, min_radiation_floor
-        )
-        use_log_transform = False
-    elif use_log_transform:
-        target_col_processing, log_transform_details = _apply_log_transform(
-            df, target_col_processing, current_target_is_radiation_family,
-            min_radiation_for_log, clip_log_target,
-            log_clip_lower_percentile, log_clip_upper_percentile
-        )
-    
-    # Final target column name after all transformations
-    target_col_actual = target_col_processing
-    
-    # ====================================================================
-    # 4. FEATURE ENGINEERING & SELECTION
-    # ====================================================================
-    # Add low threshold indicator feature if applicable
-    _add_low_threshold_indicator(df, target_col)
-    
-    # Select features based on mode
-    feature_cols = _select_features(df, df_input, feature_selection_mode, target_col, use_solar_elevation, column_map)
-    
-    # Ensure target isn't in feature list
-    if target_col_actual in feature_cols:
-        print(f"Warning: Final target column '{target_col_actual}' is also in feature_cols. Removing it from features.")
-        feature_cols = [f_col for f_col in feature_cols if f_col != target_col_actual]
-    
-    # ====================================================================
-    # 5. SCALING
-    # ====================================================================
-    cols_to_scale, df_for_scaling = _prepare_columns_for_scaling(df, feature_cols, target_col_actual)
-    
-    # Scale features and target
-    scaled_data_df, scalers = _scale_features_and_target(
-        df_for_scaling, feature_cols, target_col_actual, 
-        standardize_features, power_transform_details
-    )
-    
-    # ====================================================================
-    # 6. CREATE SEQUENCES
-    # ====================================================================
-    X_train, X_val, X_test, y_train, y_val, y_test = _create_sequences(
-        scaled_data_df, feature_cols, target_col_actual, window_size, test_size, val_size
-    )
-    
-    # ====================================================================
-    # 7. PREPARE RETURN VALUES
-    # ====================================================================
-    combined_transform_info = _prepare_transform_info(
-        original_target_col_name, target_col, target_col_actual,
-        piecewise_transform_details, power_transform_details, log_transform_details, scalers
-    )
-    
-    return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, combined_transform_info
+    logging.info("Weather data preparation pipeline v2 finished successfully.")
+    return X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols_final, full_transform_details
 
 
-# ====================================================================
-# HELPER FUNCTIONS
-# ====================================================================
+# --- Helper Functions for `prepare_weather_data_v2` ---
 
-def _standardize_column_names(df, df_input, target_col):
-    """Standardize column names for consistent processing."""
-    # Map common column names to standardized names
-    column_map = {
-        'temp': 'Temperature',
-        'pressure': 'Pressure',
-        'humidity': 'Humidity',
-        'wind_speed': 'Speed',
-        'GHI': 'Radiation',  # Crucial for radiation-specific transforms
+def _initial_df_setup(df: pd.DataFrame, cfg: DataInputConfig) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
+    """Copies df, standardizes key column names, and sorts by time."""
+    logging.debug("Performing initial DataFrame setup.")
+    
+    # Define the mapping from common input names to standardized internal names
+    # This map should be comprehensive for columns used in feature engineering or as target
+    rename_map = {
+        cfg.common_ghi_col: STD_RADIATION_COL,
+        cfg.common_temp_col: STD_TEMP_COL,
+        cfg.common_pressure_col: STD_PRESSURE_COL,
+        cfg.common_humidity_col: STD_HUMIDITY_COL,
+        cfg.common_wind_speed_col: STD_WINDSPEED_COL,
+        'clouds_all': STD_CLOUDCOVER_COL, # From new dataset
+        'rain_1h': STD_RAIN_COL,         # From new dataset
+        'snow_1h': STD_SNOW_COL,         # From new dataset
+        'weather_type': STD_WEATHER_TYPE_COL, # From new dataset
+        cfg.time_col: STD_TIME_COL,
+        # Raw time features that might be directly used or for deriving others
+        cfg.hour_col_raw: cfg.hour_col_raw, # Keep original if used directly
+        cfg.month_col_raw: cfg.month_col_raw,
+        cfg.daylength_col_raw: cfg.daylength_col_raw,
+        cfg.is_sun_col_raw: cfg.is_sun_col_raw,
+        cfg.sunlight_time_daylength_ratio_raw: cfg.sunlight_time_daylength_ratio_raw,
+        cfg.sunrise_col: cfg.sunrise_col, # Keep original for parsing
+        cfg.sunset_col: cfg.sunset_col,   # Keep original for parsing
     }
+    # Add the original target column to the rename map if it's different from standardized
+    standardized_target_name = STD_RADIATION_COL if cfg.target_col_original_name == cfg.common_ghi_col else \
+                              (STD_TEMP_COL if cfg.target_col_original_name == cfg.common_temp_col else cfg.target_col_original_name)
     
-    df = df.rename(columns=column_map, inplace=False)
-    return column_map, df
-
-
-def _get_processed_target_col_name(target_col, df):
-    """Handle potentially problematic characters in target column name."""
-    if target_col == 'Energy delta[Wh]':
-        processed_name = 'Energy_delta_Wh'
-        df.rename(columns={'Energy delta[Wh]': processed_name}, inplace=True)
-        print(f"Renamed target column '{target_col}' to '{processed_name}'")
-        return processed_name
-    return target_col
-
-
-def _process_time_features(df, df_input, use_solar_elevation, column_map):
-    """Process time-related features in the dataframe."""
-    # Parse the primary 'Time' column
-    if 'Time' in df.columns:
-        df['Time'] = pd.to_datetime(df['Time'])
-        df = df.sort_values('Time').reset_index(drop=True)
-    elif 'UNIXTime' in df.columns:  # Fallback for old format
-        df = df.sort_values('UNIXTime').reset_index(drop=True)
-    else:
-        print("Warning: Neither 'Time' nor 'UNIXTime' column found for sorting.")
+    if cfg.target_col_original_name not in rename_map or rename_map[cfg.target_col_original_name] != standardized_target_name :
+         rename_map[cfg.target_col_original_name] = standardized_target_name
     
-    # Extract time features
-    _add_time_minute_features(df)
-    _add_hour_and_month_features(df, df_input)
-    _add_daylight_features(df, df_input)
+    # Apply renaming for columns present in the DataFrame
+    actual_rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    df.rename(columns=actual_rename_map, inplace=True)
+    logging.info(f"Applied column renames: {actual_rename_map}")
     
-    # Add solar elevation if requested and possible
-    if use_solar_elevation and 'DaylightPosition' in df.columns:
-        _add_solar_elevation(df)
-    
-    return df
+    final_target_col_name = actual_rename_map.get(cfg.target_col_original_name, cfg.target_col_original_name)
+    if final_target_col_name not in df.columns: # Should not happen if logic is correct
+        raise ValueError(f"Target column '{final_target_col_name}' (from '{cfg.target_col_original_name}') not found after renaming.")
 
-
-def _add_time_minute_features(df):
-    """Extract time minute features from datetime column."""
-    if 'Time' in df.columns and isinstance(df['Time'].iloc[0], pd.Timestamp):
-        df['TimeMinutes'] = df['Time'].apply(_time_to_minutes_from_datetime)
-        minutes_in_day = 24 * 60
-        df['TimeMinutesSin'] = np.sin(2 * np.pi * df['TimeMinutes'] / minutes_in_day)
-        df['TimeMinutesCos'] = np.cos(2 * np.pi * df['TimeMinutes'] / minutes_in_day)
-
-
-def _time_to_minutes_from_datetime(dt_obj):
-    """Convert datetime object to minutes in day."""
-    if pd.isna(dt_obj):
-        return np.nan
-    return dt_obj.hour * 60 + dt_obj.minute + dt_obj.second / 60
-
-
-def _add_hour_and_month_features(df, df_input):
-    """Add hour and month features from appropriate source, avoiding redundancy."""
-    # Add hour feature - prefer original input column if available
-    if 'hour' in df_input.columns:
-        df['HourOfDay'] = df_input['hour']
-        print("Using original 'hour' column from input data")
-    elif 'TimeMinutes' in df:
-        df['HourOfDay'] = df['TimeMinutes'] / 60
-        print("Derived 'HourOfDay' from TimeMinutes")
-    elif 'Time' in df.columns:
-        df['HourOfDay'] = df['Time'].dt.hour
-        print("Derived 'HourOfDay' from Time column")
-    
-    # Add month feature - prefer original input column if available
-    if 'month' in df_input.columns:
-        df['Month'] = df_input['month']
-        print("Using original 'month' column from input data")
-    elif 'Time' in df.columns:
-        df['Month'] = df['Time'].dt.month
-        print("Derived 'Month' from Time column")
-
-
-def _add_daylight_features(df, df_input):
-    """Add features related to daylight, avoiding redundancy."""
-    # Add daylight minutes - use input column if available or calculate
-    if 'dayLength' in df_input.columns:
-        df['DaylightMinutes'] = df_input['dayLength']
-        print("Using original 'dayLength' column from input data")
-    elif 'TimeSunRise' in df.columns and 'TimeSunSet' in df.columns:
-        _add_sunrise_sunset_features(df)
-        print("Calculated 'DaylightMinutes' from sunrise/sunset times")
-    
-    # Only proceed if we have daylight minutes
-    if 'DaylightMinutes' in df.columns and 'TimeMinutes' in df.columns:
-        # Add daylight indicator - use input column if available
-        if 'isSun' in df_input.columns:
-            df['IsDaylight'] = df_input['isSun'].astype(float)
-            print("Using original 'isSun' column as 'IsDaylight'")
-        elif 'SunriseMinutes' in df.columns and 'SunsetMinutes' in df.columns:
-            df['IsDaylight'] = (
-                (df['TimeMinutes'] >= df['SunriseMinutes']) & 
-                (df['TimeMinutes'] <= df['SunsetMinutes'])
-            ).astype(float)
-            print("Calculated 'IsDaylight' from sunrise/sunset times")
-        
-        # Add daylight position - use input column if available
-        if 'SunlightTime/daylength' in df_input.columns:
-            df['DaylightPosition'] = df_input['SunlightTime/daylength'].clip(0, 1)
-            print("Using original 'SunlightTime/daylength' column as 'DaylightPosition'")
-        elif 'TimeSinceSunrise' in df.columns and df['DaylightMinutes'].nunique() > 1:
-            # Ensure DaylightMinutes is not zero to avoid division by zero
-            df['DaylightPosition'] = (df['TimeSinceSunrise'] / df['DaylightMinutes'].replace(0, np.nan)).clip(0, 1)
-            print("Calculated 'DaylightPosition' from time since sunrise and daylight minutes")
-        
-        # Add sunrise/sunset timing features
-        _add_sunrise_sunset_timing(df)
-
-
-def _add_sunrise_sunset_features(df):
-    """Calculate sunrise and sunset features."""
-    df['SunriseMinutes'] = df['TimeSunRise'].apply(_time_to_minutes_str_parse)
-    df['SunsetMinutes'] = df['TimeSunSet'].apply(_time_to_minutes_str_parse)
-    df['DaylightMinutes'] = df['SunsetMinutes'] - df['SunriseMinutes']
-    df.loc[df['DaylightMinutes'] < 0, 'DaylightMinutes'] += 1440  # Handles overnight
-
-
-def _time_to_minutes_str_parse(time_val):
-    """Parse various time string formats to minutes."""
-    if pd.isna(time_val):
-        return np.nan
-    if hasattr(time_val, 'hour'):
-        return time_val.hour * 60 + time_val.minute + time_val.second / 60
-    elif isinstance(time_val, str):
-        if ' ' in time_val:
-            time_part = time_val.split(' ')[-1]
-        else:
-            time_part = time_val
-        if ':' in time_part:
-            parts = time_part.split(':')
-            if len(parts) >= 2:
-                hours, minutes = map(int, parts[:2])
+    # Time sorting
+    if STD_TIME_COL in df.columns:
+        try:
+            df[STD_TIME_COL] = pd.to_datetime(df[STD_TIME_COL])
+            df.sort_values(STD_TIME_COL, inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            logging.info(f"Sorted DataFrame by '{STD_TIME_COL}'.")
+        except Exception as e:
+            logging.warning(f"Could not parse or sort by '{STD_TIME_COL}': {e}. Trying UNIXTime.")
+            if cfg.unix_time_col in df.columns:
+                df.sort_values(cfg.unix_time_col, inplace=True) # Assuming UNIXTime is sortable
+                df.reset_index(drop=True, inplace=True)
+                logging.info(f"Sorted DataFrame by '{cfg.unix_time_col}'.")
             else:
-                return np.nan
-            return hours * 60 + minutes
+                logging.warning("No primary or fallback time column found for sorting.")
+    elif cfg.unix_time_col in df.columns:
+        df.sort_values(cfg.unix_time_col, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        logging.info(f"Sorted DataFrame by '{cfg.unix_time_col}'.")
+    else:
+        logging.warning(f"Neither '{STD_TIME_COL}' nor '{cfg.unix_time_col}' found for sorting. Data order is preserved as is.")
+        
+    return df, final_target_col_name, actual_rename_map
+
+def _parse_time_to_minutes(time_val: Any) -> Optional[float]:
+    """Parses various time representations to minutes from midnight."""
+    if pd.isna(time_val): return np.nan
+    if isinstance(time_val, (pd.Timestamp, pd.Timedelta)): # Handle Timedelta if it represents time of day
+        return time_val.hour * 60 + time_val.minute + time_val.second / 60.0
+    if isinstance(time_val, str):
+        try:
+            if ':' in time_val: # HH:MM or HH:MM:SS
+                parts = time_val.split(':')
+                h = int(parts[0])
+                m = int(parts[1])
+                s = float(parts[2]) if len(parts) > 2 else 0.0
+                if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
+                    logging.warning(f"Invalid time string components: {time_val}")
+                    return np.nan
+                return h * 60 + m + s / 60.0
+        except ValueError:
+            logging.warning(f"Could not parse time string: {time_val}")
+            return np.nan
+    logging.debug(f"Unhandled time format for parsing: {time_val} (type: {type(time_val)})")
     return np.nan
 
 
-def _add_sunrise_sunset_timing(df):
-    """Add timing features related to sunrise and sunset."""
-    # Add time since sunrise if possible
-    if 'SunriseMinutes' in df.columns:
-        df['TimeSinceSunrise'] = (df['TimeMinutes'] - df['SunriseMinutes'])
-        df.loc[df['TimeSinceSunrise'] < 0, 'TimeSinceSunrise'] += 1440
-        print("Added 'TimeSinceSunrise' feature")
-    
-    # Add time until sunset if possible
-    if 'SunsetMinutes' in df.columns:
-        df['TimeUntilSunset'] = (df['SunsetMinutes'] - df['TimeMinutes'])
-        df.loc[df['TimeUntilSunset'] < 0, 'TimeUntilSunset'] += 1440
-        print("Added 'TimeUntilSunset' feature")
+def _engineer_time_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, input_cfg: DataInputConfig) -> pd.DataFrame:
+    """Engineers time-based features like cyclical hour/month, daylight, solar elevation."""
+    logging.debug("Engineering time features.")
+    if STD_TIME_COL not in df.columns or not pd.api.types.is_datetime64_any_dtype(df[STD_TIME_COL]):
+        logging.warning(f"'{STD_TIME_COL}' not found or not datetime. Skipping detailed time feature engineering.")
+        return df
 
+    # Hour and Month (Cyclical)
+    df[STD_HOUR_OF_DAY] = df[STD_TIME_COL].dt.hour
+    df[STD_MONTH] = df[STD_TIME_COL].dt.month
+    
+    minutes_in_day = 24 * 60
+    current_time_minutes = df[STD_TIME_COL].dt.hour * 60 + df[STD_TIME_COL].dt.minute + df[STD_TIME_COL].dt.second / 60.0
+    df[STD_TIME_MINUTES_SIN] = np.sin(2 * np.pi * current_time_minutes / minutes_in_day)
+    df[STD_TIME_MINUTES_COS] = np.cos(2 * np.pi * current_time_minutes / minutes_in_day)
 
-def _add_solar_elevation(df):
-    """Add solar elevation proxy feature."""
-    print("Adding solar elevation proxy feature")
-    df['SolarElevation'] = 0.0
-    # Apply only where DaylightPosition is valid (not NaN)
-    valid_idx = df['DaylightPosition'].dropna().index
-    df.loc[valid_idx, 'SolarElevation'] = df.loc[valid_idx, 'DaylightPosition'].apply(
-        lambda x: math.sin(x * math.pi) if (x >= 0 and x <= 1) else 0
-    )
-    print(f"SolarElevation created for {len(valid_idx)} rows, {len(valid_idx)/len(df)*100:.1f}% of data")
+    # Sunrise/Sunset and Daylight Features
+    if input_cfg.sunrise_col in df.columns and input_cfg.sunset_col in df.columns:
+        sunrise_minutes = df[input_cfg.sunrise_col].apply(_parse_time_to_minutes)
+        sunset_minutes = df[input_cfg.sunset_col].apply(_parse_time_to_minutes)
 
-
-def _clip_original_target(df, target_col, lower_percentile, upper_percentile, power_transform_details):
-    """Clip original target values to specified percentiles."""
-    if target_col not in df.columns:
-        print(f"Warning: Column '{target_col}' for original clipping not found. Skipping.")
-        return target_col, power_transform_details
-    
-    original_target_values = df[target_col].values
-    lower_bound_orig = np.percentile(original_target_values, lower_percentile)
-    upper_bound_orig = np.percentile(original_target_values, upper_percentile)
-    
-    power_transform_details['original_clip_bounds'] = (float(lower_bound_orig), float(upper_bound_orig))
-    print(f"Clipping original '{target_col}' to range [{lower_bound_orig:.4f}, {upper_bound_orig:.4f}] BEFORE other transformations.")
-    
-    df[target_col] = np.clip(original_target_values, lower_bound_orig, upper_bound_orig)
-    return target_col, power_transform_details
-
-
-def _apply_piecewise_transform(df, target_col):
-    """Apply piecewise radiation transform to target column."""
-    print(f"Applying piecewise radiation transform to '{target_col}' column.")
-    df['Radiation_transformed'] = piecewise_radiation_transform(df[target_col].values)
-    
-    piecewise_details = {
-        'applied': True, 
-        'type': 'piecewise_radiation', 
-        'original_col': target_col
-    }
-    
-    transformed_col = 'Radiation_transformed'
-    print(f"Using '{transformed_col}' as target for further processing.")
-    
-    return transformed_col, piecewise_details
-
-
-def _apply_power_transform(df, target_col, min_radiation_floor):
-    """Apply Yeo-Johnson power transform to target column."""
-    print(f"Applying Yeo-Johnson Power Transform to '{target_col}'")
-    
-    if min_radiation_floor is not None:
-        print(f"Applying floor of {min_radiation_floor} to '{target_col}' before Power Transform.")
-        df[target_col] = np.maximum(df[target_col].astype(float), min_radiation_floor)
-    
-    power_transformer = PowerTransformer(method='yeo-johnson', standardize=False)
-    values_to_transform = df[target_col].values.reshape(-1, 1)
-    transformed_values = power_transformer.fit_transform(values_to_transform)
-    
-    col_fed_to_power_transform = target_col
-    new_target_col_name = f'{col_fed_to_power_transform}_yeo'
-    df[new_target_col_name] = transformed_values.flatten()
-    
-    power_transform_details = {
-        'applied': True, 
-        'type': 'yeo-johnson',
-        'lambda': power_transformer.lambdas_[0] if power_transformer.lambdas_ is not None else None,
-        'original_col': col_fed_to_power_transform,
-        'scaler_used_after': 'StandardScaler',
-        'power_transformer_obj': power_transformer
-    }
-    
-    print(f"Yeo-Johnson applied (lambda={power_transform_details['lambda']:.4f}). New target: '{new_target_col_name}'")
-    
-    return new_target_col_name, power_transform_details
-
-
-def _apply_log_transform(df, target_col, is_radiation, min_radiation_for_log, 
-                         clip_log_target, log_clip_lower_percentile, log_clip_upper_percentile):
-    """Apply logarithmic transform to target column."""
-    is_other_loggable_target = target_col in ['Temperature', 'Speed', 'Energy_delta_Wh']
-    eligible_for_log = is_radiation or is_other_loggable_target
-    
-    if not eligible_for_log or target_col not in df.columns:
-        print(f"Log transform not applied to '{target_col}' as it's not an eligible type or configuration for log.")
-        return target_col, {'applied': False, 'type': None, 'offset': 0, 'original_col': None, 'clip_bounds': None}
-    
-    epsilon = 1e-6
-    original_values_for_log = df[target_col].copy()
-    log_input_col_name = target_col
-    log_output_col_name = f'{log_input_col_name}_log'
-    
-    if is_radiation:  # Specific handling for radiation
-        print(f"Applying floor of {min_radiation_for_log} to '{log_input_col_name}' before log transform.")
-        floored_values = np.maximum(original_values_for_log, min_radiation_for_log)
-        df[log_output_col_name] = np.log(floored_values + epsilon)
-    else:  # For Temperature, Speed, Energy_delta_Wh, etc.
-        if (original_values_for_log < 0).any():
-            print(f"Warning: Negative values found in '{log_input_col_name}'. Log transform might produce NaNs or errors.")
-            print(f"Applying np.log(np.maximum(original_values_for_log, 0) + epsilon). Review if this is appropriate.")
-            df[log_output_col_name] = np.log(np.maximum(original_values_for_log, 0) + epsilon)
-        else:
-            df[log_output_col_name] = np.log(original_values_for_log + epsilon)
-    
-    log_transform_details = {
-        'applied': True, 
-        'type': 'log', 
-        'offset': epsilon,
-        'original_col': log_input_col_name,
-        'clip_bounds': None
-    }
-    
-    transformed_col = log_output_col_name
-    print(f"Log-transformed '{log_transform_details['original_col']}' -> '{transformed_col}'")
-    
-    if clip_log_target:
-        log_values = df[transformed_col].values
-        lower_bound = np.percentile(log_values, log_clip_lower_percentile)
-        upper_bound = np.percentile(log_values, log_clip_upper_percentile)
-        log_transform_details['clip_bounds'] = (float(lower_bound), float(upper_bound))
-        print(f"Clipping log-transformed '{transformed_col}' to range [{lower_bound:.4f}, {upper_bound:.4f}]")
-        df[transformed_col] = np.clip(log_values, lower_bound, upper_bound)
-    
-    return transformed_col, log_transform_details
-
-
-def _add_low_threshold_indicator(df, target_col):
-    """Add indicator for low target values."""
-    low_threshold_col_ref_options = ['Radiation', 'Temperature', 'Speed', 'Energy_delta_Wh']
-    
-    if target_col in low_threshold_col_ref_options and target_col in df.columns:
-        values_for_threshold = df[target_col]
-        low_threshold = values_for_threshold.quantile(0.1)
-        df[f'{target_col}_is_low'] = (values_for_threshold < low_threshold).astype(float)
-        print(f"Added '{target_col}_is_low' feature (threshold: {low_threshold:.4f})")
-
-
-def _select_features(df, df_input, feature_selection_mode, target_col, use_solar_elevation, column_map):
-    """Select features based on specified mode, removing redundancies."""
-    # Define base feature column sets with potential redundancies removed
-    base_feature_cols_map = {
-        'minimal': ['Radiation', 'Temperature', 'Humidity', 'TimeMinutesSin', 'TimeMinutesCos', 'clouds_all'],
-        'basic': ['Radiation', 'Temperature', 'Pressure', 'Humidity', 'Speed',
-                 'TimeMinutesSin', 'TimeMinutesCos', 'clouds_all', 'rain_1h'],
-        'all': ['Radiation', 'Temperature', 'Pressure', 'Humidity', 'Speed',
-               'rain_1h', 'snow_1h', 'clouds_all', 'weather_type']
-    }
-    
-    # Select appropriate feature columns based on mode
-    if feature_selection_mode == 'all':
-        base_feature_cols = _get_all_relevant_features(df, df_input, base_feature_cols_map, column_map)
-    else:
-        base_feature_cols = [col for col in base_feature_cols_map.get(feature_selection_mode, base_feature_cols_map['all'])
-                            if col in df.columns or col in df_input.columns]
-    
-    # Add low indicator feature if available
-    low_indicator_col = f'{target_col}_is_low'
-    if low_indicator_col in df.columns and low_indicator_col not in base_feature_cols:
-        base_feature_cols.append(low_indicator_col)
-    
-    # Add solar elevation if requested
-    if 'SolarElevation' in df.columns and use_solar_elevation and 'SolarElevation' not in base_feature_cols:
-        base_feature_cols.append('SolarElevation')
-    
-    # Add time features
-    feature_cols = _add_time_feature_columns(df, base_feature_cols)
-    
-    # Add new dataset features explicitly
-    feature_cols = _add_new_dataset_features(df, df_input, feature_cols)
-    
-    # Remove redundancies
-    feature_cols = _remove_redundant_features(df, df_input, feature_cols, column_map)
-    
-    # Remove duplicates and sort
-    feature_cols = sorted(list(set(feature_cols)))
-    
-    # Verify all selected features exist
-    feature_cols = [f_col for f_col in feature_cols if f_col in df.columns]
-    if not feature_cols:
-        raise ValueError("No feature columns selected or available in the DataFrame after processing.")
-    
-    print(f"Final selected features before scaling ({len(feature_cols)}): {feature_cols}")
-    return feature_cols
-
-
-def _remove_redundant_features(df, df_input, feature_cols, column_map):
-    """Remove redundant features to avoid duplication."""
-    # Define pairs of redundant features (original_name, derived_name)
-    redundant_pairs = [
-        ('dayLength', 'DaylightMinutes'),
-        ('SunlightTime/daylength', 'DaylightPosition'),
-        ('hour', 'HourOfDay'),
-        ('month', 'Month'),
-        ('isSun', 'IsDaylight'),
-        # Add any other redundant pairs here
-    ]
-    
-    # Remove redundancies
-    for orig, derived in redundant_pairs:
-        if orig in feature_cols and derived in feature_cols:
-            print(f"Removing redundant feature '{derived}' since '{orig}' is already present")
-            feature_cols.remove(derived)
-        
-        # Check for mapped column names as well
-        mapped_orig = column_map.get(orig, orig)
-        if mapped_orig in feature_cols and derived in feature_cols:
-            print(f"Removing redundant feature '{derived}' since mapped '{mapped_orig}' (from '{orig}') is already present")
-            feature_cols.remove(derived)
-    
-    return feature_cols
-
-
-def _get_all_relevant_features(df, df_input, base_feature_cols_map, column_map):
-    """Get all relevant features for 'all' mode."""
-    # Start with mapped names from 'all' set, then add relevant columns
-    current_all_selection = [col for col in base_feature_cols_map['all'] 
-                            if col in df.columns or col in df_input.columns]
-    
-    # Add any other original columns not explicitly listed but present in the remapped df
-    for orig_col in df_input.columns:
-        mapped_col = column_map.get(orig_col, orig_col)  # Get mapped name if exists
-        if mapped_col in df.columns and mapped_col not in current_all_selection:
-            current_all_selection.append(mapped_col)
-        elif (orig_col in df.columns and orig_col not in current_all_selection 
-              and orig_col not in column_map.values()):
-            current_all_selection.append(orig_col)
-    
-    return list(set(current_all_selection))  # Use set to remove duplicates
-
-
-def _add_time_feature_columns(df, base_feature_cols):
-    """Add time-related feature columns to the base set."""
-    feature_cols = base_feature_cols.copy()
-    
-    time_features = [
-        'TimeMinutesSin', 'TimeMinutesCos', 'HourOfDay', 'Month',
-        'DaylightMinutes', 'IsDaylight', 'DaylightPosition'
-    ]
-    
-    # Add conditional time features
-    if 'TimeSinceSunrise' in df.columns:
-        time_features.append('TimeSinceSunrise')
-    if 'TimeUntilSunset' in df.columns:
-        time_features.append('TimeUntilSunset')
-    
-    # Add available time features that aren't already in the feature list
-    for feature in time_features:
-        if feature in df.columns and feature not in feature_cols and df[feature].isna().sum() == 0:
-            feature_cols.append(feature)
-    
-    return feature_cols
-
-
-def _add_new_dataset_features(df, df_input, feature_cols):
-    """Add new dataset-specific features."""
-    # Original names from new dataset
-    additional_new_features = ['rain_1h', 'snow_1h', 'clouds_all', 'weather_type']
-    direct_time_features = ['hour', 'month', 'isSun', 'sunlightTime', 'dayLength', 'SunlightTime/daylength']
-    
-    for f in additional_new_features + direct_time_features:
-        # Check if it was renamed through column_map
-        col_to_check = f  # Default to original name
-        if col_to_check in df.columns and col_to_check not in feature_cols:
-            feature_cols.append(col_to_check)
-        elif f in df_input.columns and f not in feature_cols and f not in df.columns:
-            # If it's in original input but not in current df and features
-            df[f] = df_input[f]  # Add to working df
-            feature_cols.append(f)
-    
-    return feature_cols
-
-
-def _prepare_columns_for_scaling(df, feature_cols, target_col_actual):
-    """Prepare columns for scaling and handle missing values."""
-    # Combine feature columns and target column for scaling
-    cols_to_scale = feature_cols.copy()
-    if target_col_actual not in cols_to_scale and target_col_actual in df.columns:
-        cols_to_scale.append(target_col_actual)
-    
-    # Verify columns exist in DataFrame
-    cols_to_scale = [col for col in cols_to_scale if col in df.columns]
-    
-    # Check for valid data
-    if not df[cols_to_scale].isna().all().all():
-        df_for_scaling = df[cols_to_scale].copy()
-        
-        # Handle potential non-numeric types
-        for col in df_for_scaling.columns:
-            if df_for_scaling[col].dtype == 'object':
-                print(f"Warning: Column '{col}' is of object type. Attempting to convert to numeric.")
-                df_for_scaling[col] = pd.to_numeric(df_for_scaling[col], errors='coerce')
-        
-        # Fill missing values
-        df_for_scaling = df_for_scaling.fillna(method='ffill').fillna(method='bfill')
-    else:
-        raise ValueError(f"All values in columns selected for scaling are NaN: {cols_to_scale}")
-    
-    return cols_to_scale, df_for_scaling
-
-
-def _scale_features_and_target(df_for_scaling, feature_cols, target_col_actual, 
-                               standardize_features, power_transform_details):
-    """Scale features and target to prepare for model training."""
-    scalers = {}
-    scaled_data_df = pd.DataFrame(index=df_for_scaling.index)
-    
-    # Choose appropriate scaler for features
-    FeatureScalerClass = StandardScaler if standardize_features else MinMaxScaler
-    print(f"Using {FeatureScalerClass.__name__} for feature scaling.")
-    
-    # Scale each feature
-    for col in feature_cols:
-        if col not in df_for_scaling.columns:
-            print(f"Warning: Feature column '{col}' not found in df_for_scaling. Skipping scaling.")
-            continue
-        
-        # Check for all NaN values
-        if df_for_scaling[col].isnull().all():
-            print(f"Warning: All values in feature column '{col}' are NaN before scaling. Scaled output will be NaN.")
-            scaled_data_df[col] = np.nan
-            scalers[col] = None  # No scaler fitted
-            continue
-        
-        # Create and apply scaler
-        feature_scaler = (FeatureScalerClass() if standardize_features 
-                         else FeatureScalerClass(feature_range=(0, 1)))
-        values = df_for_scaling[col].values.reshape(-1, 1)
-        scaled_data_df[col] = feature_scaler.fit_transform(values).flatten()
-        scalers[col] = feature_scaler
-    
-    # Verify target column exists
-    if target_col_actual not in df_for_scaling.columns:
-        raise ValueError(f"Final target column '{target_col_actual}' not found for scaling.")
-    if df_for_scaling[target_col_actual].isnull().all():
-        raise ValueError(f"All values in target column '{target_col_actual}' are NaN before scaling. Cannot proceed.")
-    
-    # Choose appropriate scaler for target
-    if power_transform_details['applied']:
-        TargetScalerClass = StandardScaler
-        print(f"Using StandardScaler for Yeo-Johnson transformed target '{target_col_actual}'.")
-    else:
-        TargetScalerClass = StandardScaler if standardize_features else MinMaxScaler
-        print(f"Using {TargetScalerClass.__name__} for target '{target_col_actual}'.")
-    
-    # Create and apply target scaler
-    target_scaler = (TargetScalerClass() if TargetScalerClass == StandardScaler 
-                    else TargetScalerClass(feature_range=(0, 1)))
-    target_values_to_scale = df_for_scaling[target_col_actual].values.reshape(-1, 1)
-    
-    # Log target statistics before scaling
-    print(f"DEBUG [PREPARE DATA]: Stats for target '{target_col_actual}' BEFORE scaling: "
-          f"Mean={np.nanmean(target_values_to_scale):.4f}, Std={np.nanstd(target_values_to_scale):.4f}, "
-          f"Min={np.nanmin(target_values_to_scale):.4f}, Max={np.nanmax(target_values_to_scale):.4f}")
-    
-    # Scale target and store scaler
-    scaled_data_df[target_col_actual] = target_scaler.fit_transform(target_values_to_scale).flatten()
-    scalers[target_col_actual] = target_scaler
-    
-    # Log target statistics after scaling
-    print(f"DEBUG [PREPARE DATA]: Stats for target '{target_col_actual}' AFTER scaling: "
-          f"Mean={np.nanmean(scaled_data_df[target_col_actual]):.4f}, Std={np.nanstd(scaled_data_df[target_col_actual]):.4f}, "
-          f"Min={np.nanmin(scaled_data_df[target_col_actual]):.4f}, Max={np.nanmax(scaled_data_df[target_col_actual]):.4f}")
-    
-    # Log scaler parameters
-    if isinstance(target_scaler, StandardScaler):
-        if hasattr(target_scaler, 'mean_') and target_scaler.mean_ is not None:
-            print(f"DEBUG [PREPARE DATA]: Target Scaler learned mean: {target_scaler.mean_[0]:.4f}, "
-                  f"scale (std): {target_scaler.scale_[0]:.4f}")
-        else:
-            print(f"DEBUG [PREPARE DATA]: Target Scaler ({TargetScalerClass.__name__}) attributes "
-                  f"(mean_, scale_) not found (possibly all NaN input or not fitted).")
-    
-    return scaled_data_df, scalers
-
-
-def _create_sequences(scaled_data_df, feature_cols, target_col_actual, window_size, test_size, val_size):
-    """Create sequence data for time series model training."""
-    X, y_seq = [], []
-    
-    # Check if data is sufficient for sequences
-    if len(scaled_data_df) <= window_size:
-        if scaled_data_df.empty or scaled_data_df[feature_cols + [target_col_actual]].isna().all().all():
-            raise ValueError(f"scaled_data_df is empty or all NaN for selected cols. "
-                            f"Data length ({len(scaled_data_df)}) is <= window_size ({window_size}).")
-        raise ValueError(f"Data length ({len(scaled_data_df)}) is <= window_size ({window_size}). "
-                        f"Cannot create sequences.")
-    
-    # Remove rows with NaN values
-    sequence_input_df = scaled_data_df[feature_cols + [target_col_actual]].dropna()
-    if len(sequence_input_df) <= window_size:
-        raise ValueError(f"Data length after dropping NaNs ({len(sequence_input_df)}) is <= window_size ({window_size}).")
-    
-    # Create sliding window sequences
-    for i in range(len(sequence_input_df) - window_size):
-        X.append(sequence_input_df.iloc[i:i+window_size][feature_cols].values)
-        y_seq.append(sequence_input_df[target_col_actual].iloc[i+window_size])
-    
-    # Handle case with no sequences
-    if not X:
-        print("Warning: No sequences were created. X and y will be empty. "
-              "Check data length and window size after NaN handling.")
-        num_features = len(feature_cols)
-        return (np.empty((0, window_size, num_features)), np.empty((0, window_size, num_features)), 
-                np.empty((0, window_size, num_features)), np.empty((0,1)), np.empty((0,1)), np.empty((0,1)))
-    
-    # Convert to arrays
-    X = np.array(X)
-    y_seq = np.array(y_seq).reshape(-1, 1)
-    
-    # Split data into train, validation, and test sets
-    return _split_train_val_test(X, y_seq, test_size, val_size, feature_cols)
-
-
-def _split_train_val_test(X, y_seq, test_size, val_size, feature_cols):
-    """Split sequences into training, validation, and test sets."""
-    # Split off test set
-    X_temp, X_test, y_temp, y_test = train_test_split(X, y_seq, test_size=test_size, shuffle=False)
-    
-    # Calculate validation size relative to remaining data
-    actual_val_size_for_split = val_size / (1 - test_size) if (1 - test_size) > 0 else 0
-    
-    # Handle edge cases
-    if len(X_temp) == 0:
-        X_train, X_val, y_train, y_val = np.array([]), np.array([]), np.array([]), np.array([])
-        print("Warning: No data available for training/validation after initial test split.")
-    elif actual_val_size_for_split >= 1.0 or actual_val_size_for_split <= 0 or len(X_temp) < 2:
-        print(f"Warning: Adjusted validation size ({actual_val_size_for_split:.2f}) is invalid or "
-              f"insufficient data in X_temp ({len(X_temp)} samples).")
-        
-        # Try to split if possible
-        if len(X_temp) >= 2 and 0 < actual_val_size_for_split < 1:
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_temp, y_temp, test_size=actual_val_size_for_split, shuffle=False
-            )
-        else:  # Not enough for split or val_size is 0
-            X_train, y_train = X_temp, y_temp
-            # Create empty validation arrays with correct dimensions
-            if X_train.ndim == 3 and X_train.shape[1] > 0:
-                val_shape_x = (0, X_train.shape[1], X_train.shape[2])
-            elif X_train.ndim == 2 and X_train.shape[1] > 0:
-                val_shape_x = (0, X_train.shape[1])
-            else:
-                val_shape_x = (0, 0, 0)
+        # Handle cases where parsing might fail or times are missing
+        if sunrise_minutes.notna().all() and sunset_minutes.notna().all():
+            df[STD_DAYLIGHT_MINUTES] = sunset_minutes - sunrise_minutes
+            # Handle overnight (sunset < sunrise)
+            df.loc[df[STD_DAYLIGHT_MINUTES] < 0, STD_DAYLIGHT_MINUTES] += minutes_in_day 
             
-            val_shape_y = (0, y_train.shape[1]) if y_train.ndim == 2 else (0,)
-            X_val, y_val = np.empty(val_shape_x), np.empty(val_shape_y)
-            print("Using all remaining data for training, validation set will be empty.")
+            df[STD_IS_DAYLIGHT] = ((current_time_minutes >= sunrise_minutes) & (current_time_minutes <= sunset_minutes)).astype(float)
+            
+            # DaylightPosition: 0 at sunrise, 1 at sunset, normalized
+            # Avoid division by zero or by very small daylight duration
+            daylight_duration_safe = df[STD_DAYLIGHT_MINUTES].replace(0, np.nan) # Avoid division by zero
+            time_since_sunrise = current_time_minutes - sunrise_minutes
+            # Adjust for time_since_sunrise being negative (before sunrise on that day but after midnight)
+            time_since_sunrise[time_since_sunrise < 0] += minutes_in_day 
+            
+            df[STD_DAYLIGHT_POSITION] = (time_since_sunrise / daylight_duration_safe).clip(0, 1)
+            df[STD_DAYLIGHT_POSITION].fillna(0, inplace=True) # Fill NaNs (e.g. night) with 0
+
+            df[STD_TIME_SINCE_SUNRISE] = time_since_sunrise
+            df[STD_TIME_UNTIL_SUNSET] = sunset_minutes - current_time_minutes
+            df.loc[df[STD_TIME_UNTIL_SUNSET] < 0, STD_TIME_UNTIL_SUNSET] += minutes_in_day
+
+
+        else:
+            logging.warning(f"Could not parse all sunrise/sunset times from '{input_cfg.sunrise_col}'/'{input_cfg.sunset_col}'. Daylight features might be incomplete.")
+    # Fallback to raw columns if they exist and parsed ones are missing
+    elif input_cfg.daylength_col_raw in df.columns and STD_DAYLIGHT_MINUTES not in df.columns:
+        df[STD_DAYLIGHT_MINUTES] = pd.to_numeric(df[input_cfg.daylength_col_raw], errors='coerce') * 60 # Assuming dayLength is in hours
+    
+    if input_cfg.is_sun_col_raw in df.columns and STD_IS_DAYLIGHT not in df.columns:
+        df[STD_IS_DAYLIGHT] = df[input_cfg.is_sun_col_raw].astype(float)
+        
+    if input_cfg.sunlight_time_daylength_ratio_raw in df.columns and STD_DAYLIGHT_POSITION not in df.columns:
+         df[STD_DAYLIGHT_POSITION] = pd.to_numeric(df[input_cfg.sunlight_time_daylength_ratio_raw], errors='coerce').clip(0,1)
+
+
+    # Solar Elevation Proxy
+    if feature_cfg.use_solar_elevation_proxy and STD_DAYLIGHT_POSITION in df.columns:
+        # Solar elevation proxy peaks at 1 at solar noon, 0 at sunrise/sunset
+        # Uses sine curve based on normalized daylight position
+        df[STD_SOLAR_ELEVATION] = df[STD_DAYLIGHT_POSITION].apply(lambda x: math.sin(x * math.pi) if pd.notna(x) and 0 <= x <= 1 else 0.0)
+        logging.info(f"Engineered '{STD_SOLAR_ELEVATION}' feature.")
+    elif feature_cfg.use_solar_elevation_proxy:
+        logging.warning(f"Cannot create '{STD_SOLAR_ELEVATION}' as '{STD_DAYLIGHT_POSITION}' is missing.")
+        
+    return df
+
+def _apply_target_transformations(
+    df: pd.DataFrame, 
+    target_col: str, 
+    cfg: TransformationConfig
+) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]]]:
+    """Applies configured transformations to the target column."""
+    logging.debug(f"Applying target transformations to '{target_col}'. Config: {cfg}")
+    
+    current_target_col = target_col
+    applied_transforms_log: List[Dict[str, Any]] = []
+
+    # 0. Initial Min Threshold
+    if cfg.min_target_threshold_initial is not None:
+        logging.info(f"Applying initial min threshold of {cfg.min_target_threshold_initial} to '{current_target_col}'.")
+        df[current_target_col] = df[current_target_col].clip(lower=cfg.min_target_threshold_initial)
+        # No specific log for this simple clip in applied_transforms_log, assumed part of pre-processing.
+
+    # Check if target is radiation-like for specific GHI transforms
+    is_radiation_target = (current_target_col == STD_RADIATION_COL)
+
+    # 1. Piecewise Transform (typically for GHI/Radiation)
+    if is_radiation_target and cfg.use_piecewise_transform_target:
+        logging.info(f"Applying piecewise radiation transform to '{current_target_col}'.")
+        new_col_name = f"{current_target_col}_piecewise"
+        
+        radiation_values = df[current_target_col].values.astype(float)
+        transformed = np.zeros_like(radiation_values)
+        
+        night_mask = radiation_values < cfg.PIECEWISE_NIGHT_THRESHOLD
+        transformed[night_mask] = np.log1p(radiation_values[night_mask]) 
+        
+        moderate_mask = (radiation_values >= cfg.PIECEWISE_NIGHT_THRESHOLD) & \
+                        (radiation_values < cfg.PIECEWISE_MODERATE_THRESHOLD)
+        # Value at the end of night_mask (just before PIECEWISE_NIGHT_THRESHOLD)
+        val_at_night_thresh_end = np.log1p(cfg.PIECEWISE_NIGHT_THRESHOLD - 1e-6) # Approx
+        transformed[moderate_mask] = val_at_night_thresh_end + \
+                                     cfg.PIECEWISE_MODERATE_SLOPE * (radiation_values[moderate_mask] - cfg.PIECEWISE_NIGHT_THRESHOLD)
+        
+        high_mask = radiation_values >= cfg.PIECEWISE_MODERATE_THRESHOLD
+        # Value at the end of moderate_mask
+        val_at_moderate_thresh_end = val_at_night_thresh_end + \
+                                     cfg.PIECEWISE_MODERATE_SLOPE * (cfg.PIECEWISE_MODERATE_THRESHOLD - cfg.PIECEWISE_NIGHT_THRESHOLD -1e-6)
+        transformed[high_mask] = val_at_moderate_thresh_end + \
+                                 cfg.PIECEWISE_HIGH_SLOPE * (radiation_values[high_mask] - cfg.PIECEWISE_MODERATE_THRESHOLD)
+
+        df[new_col_name] = transformed
+        applied_transforms_log.append({'type': 'piecewise', 'original_col': current_target_col, 'new_col': new_col_name, 'applied': True,
+                                       'params': {'night_thresh': cfg.PIECEWISE_NIGHT_THRESHOLD, 
+                                                  'moderate_thresh': cfg.PIECEWISE_MODERATE_THRESHOLD}})
+        current_target_col = new_col_name
+
+    # 2. Power Transform (Yeo-Johnson) OR Log Transform (mutually exclusive)
+    # Power transform takes precedence if both are True
+    if cfg.use_power_transform:
+        logging.info(f"Applying Yeo-Johnson Power Transform to '{current_target_col}'.")
+        new_col_name = f"{current_target_col}_yj"
+        
+        # Optional clipping before power transform
+        clip_bounds_orig = None
+        if cfg.clip_original_target_before_power_transform and is_radiation_target: # Typically for radiation
+            lower_b = np.percentile(df[current_target_col].dropna(), cfg.original_target_clip_lower_percentile)
+            upper_b = np.percentile(df[current_target_col].dropna(), cfg.original_target_clip_upper_percentile)
+            df[current_target_col] = df[current_target_col].clip(lower_b, upper_b)
+            clip_bounds_orig = (float(lower_b), float(upper_b))
+            logging.info(f"Clipped '{current_target_col}' to [{lower_b:.2f}, {upper_b:.2f}] before Yeo-Johnson.")
+
+        if is_radiation_target and cfg.min_radiation_floor_before_power_transform > 0:
+            df[current_target_col] = np.maximum(df[current_target_col].astype(float), cfg.min_radiation_floor_before_power_transform)
+            logging.info(f"Applied floor of {cfg.min_radiation_floor_before_power_transform} to '{current_target_col}' before Yeo-Johnson.")
+
+        power_transformer = PowerTransformer(method='yeo-johnson', standardize=False) # Scaler will handle standardization later
+        values_to_transform = df[current_target_col].values.reshape(-1, 1)
+        
+        # Handle NaNs before fitting PowerTransformer
+        nan_mask = np.isnan(values_to_transform.squeeze())
+        if np.all(nan_mask): 
+            raise ValueError(f"All values in '{current_target_col}' are NaN before PowerTransform. Cannot proceed.")
+        
+        transformed_values = np.full_like(values_to_transform, np.nan)
+        if not np.all(nan_mask): # Only fit if there are non-NaN values
+             transformed_values[~nan_mask] = power_transformer.fit_transform(values_to_transform[~nan_mask])
+        
+        df[new_col_name] = transformed_values.flatten()
+        
+        applied_transforms_log.append({
+            'type': 'yeo-johnson', 'original_col': current_target_col, 'new_col': new_col_name, 'applied': True,
+            'lambda': power_transformer.lambdas_[0] if power_transformer.lambdas_ is not None else None,
+            'power_transformer_object': power_transformer, # Store the fitted object
+            'original_clip_bounds_before_yj': clip_bounds_orig
+        })
+        current_target_col = new_col_name
+    
+    elif cfg.use_log_transform: # Only if power transform was not applied
+        logging.info(f"Applying Log Transform to '{current_target_col}'.")
+        new_col_name = f"{current_target_col}_log"
+        
+        values_for_log = df[current_target_col].copy()
+        if is_radiation_target: # Specific handling for radiation
+            values_for_log = np.maximum(values_for_log, cfg.min_radiation_for_log)
+        
+        # log(x + offset)
+        df[new_col_name] = np.log(values_for_log + cfg.log_transform_offset)
+        
+        clip_bounds_log = None
+        if cfg.clip_log_transformed_target:
+            lower_b = np.percentile(df[new_col_name].dropna(), cfg.log_clip_lower_percentile)
+            upper_b = np.percentile(df[new_col_name].dropna(), cfg.log_clip_upper_percentile)
+            df[new_col_name] = df[new_col_name].clip(lower_b, upper_b)
+            clip_bounds_log = (float(lower_b), float(upper_b))
+            logging.info(f"Clipped log-transformed target '{new_col_name}' to [{lower_b:.2f}, {upper_b:.2f}].")
+
+        applied_transforms_log.append({
+            'type': 'log', 'original_col': current_target_col, 'new_col': new_col_name, 'applied': True,
+            'offset': cfg.log_transform_offset, 
+            'min_val_before_log': cfg.min_radiation_for_log if is_radiation_target else None,
+            'clip_bounds_after_log': clip_bounds_log
+        })
+        current_target_col = new_col_name
+        
+    return df, current_target_col, applied_transforms_log
+
+
+def _engineer_other_domain_features(df: pd.DataFrame, target_col_after_transforms: str, 
+                                    feature_cfg: FeatureEngineeringConfig, 
+                                    standardized_target_col_name: str) -> pd.DataFrame:
+    """Engineers other domain-specific features, e.g., low target indicator."""
+    logging.debug("Engineering other domain features.")
+    
+    # Low Target Indicator (based on the structurally transformed target, or original standardized if no structural transforms)
+    # This helps the model identify periods of very low values, which might behave differently.
+    # The reference for "low" should ideally be the target column *before* any scaling,
+    # but after structural transforms if they significantly change the distribution (e.g. log).
+    # If no structural transforms, use standardized_target_col_name.
+    
+    col_for_low_indicator_ref = target_col_after_transforms # This is after structural, before scaling.
+                                                           # If no structural, it's same as standardized_target_col_name.
+
+    if feature_cfg.create_low_target_indicator and col_for_low_indicator_ref in df.columns:
+        try:
+            # Ensure the reference column is numeric and has variance
+            if pd.api.types.is_numeric_dtype(df[col_for_low_indicator_ref]) and df[col_for_low_indicator_ref].nunique() > 1:
+                low_threshold = df[col_for_low_indicator_ref].quantile(feature_cfg.low_target_indicator_quantile)
+                indicator_col_name = f"{standardized_target_col_name}_is_low" # Name based on original standardized target
+                df[indicator_col_name] = (df[col_for_low_indicator_ref] < low_threshold).astype(float)
+                logging.info(f"Engineered '{indicator_col_name}' feature with threshold {low_threshold:.4f} (based on '{col_for_low_indicator_ref}').")
+            else:
+                logging.warning(f"Cannot create low target indicator for '{col_for_low_indicator_ref}': not numeric or no variance.")
+        except Exception as e:
+            logging.warning(f"Failed to create low target indicator for '{col_for_low_indicator_ref}': {e}")
+            
+    return df
+
+
+def _get_base_feature_set(df_columns: pd.Index, feature_cfg: FeatureEngineeringConfig) -> List[str]:
+    """Determines the base set of features based on selection mode and availability."""
+    if feature_cfg.feature_selection_mode == 'minimal':
+        selected_set = feature_cfg.minimal_features
+    elif feature_cfg.feature_selection_mode == 'basic':
+        selected_set = feature_cfg.basic_features
+    elif feature_cfg.feature_selection_mode == 'all':
+        # For 'all', we can be more dynamic. Start with a broad list of known standardized cols.
+        # This list should contain all potentially useful standardized column names.
+        potential_all_features = [
+            STD_RADIATION_COL, STD_TEMP_COL, STD_PRESSURE_COL, STD_HUMIDITY_COL, 
+            STD_WINDSPEED_COL, STD_CLOUDCOVER_COL, STD_RAIN_COL, STD_SNOW_COL, STD_WEATHER_TYPE_COL,
+            # Add all engineered time features that are always generated
+            STD_HOUR_OF_DAY, STD_MONTH, STD_TIME_MINUTES_SIN, STD_TIME_MINUTES_COS,
+            STD_DAYLIGHT_MINUTES, STD_IS_DAYLIGHT, STD_DAYLIGHT_POSITION, STD_SOLAR_ELEVATION,
+            STD_TIME_SINCE_SUNRISE, STD_TIME_UNTIL_SUNSET
+        ]
+        selected_set = [col for col in potential_all_features if col in df_columns]
     else:
-        # Normal case: split remaining data into train and validation
+        logging.warning(f"Unknown feature_selection_mode: '{feature_cfg.feature_selection_mode}'. Defaulting to 'all'.")
+        # Recursive call with 'all' or define default 'all' set here. For safety, use a defined 'all'.
+        all_mode_cfg = replace(feature_cfg, feature_selection_mode='all')
+        return _get_base_feature_set(df_columns, all_mode_cfg)
+
+    # Filter the selected set by actual columns present in the DataFrame
+    available_features = [col for col in selected_set if col in df_columns]
+    
+    # Add low target indicator if created and not already included by chance in 'all'
+    # The indicator name is based on the original standardized target name.
+    # We need to know that name here. This suggests a slight refactor or passing it.
+    # For now, let's assume we can construct it if needed.
+    # This part is tricky as standardized_target_col_name is not directly available here.
+    # This indicates that feature selection might need the standardized target name.
+    # Temporarily, we'll rely on it being added if it exists in df_columns.
+    
+    return available_features
+
+
+def _select_final_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, 
+                           target_col_after_transforms: str) -> List[str]:
+    """Selects the final list of feature columns to be used for modeling."""
+    logging.debug("Selecting final feature columns.")
+    
+    base_features = _get_base_feature_set(df.columns, feature_cfg)
+    
+    # Add low target indicator if it was created (its name depends on original standardized target)
+    # This logic is a bit indirect here. It's better if _engineer_other_domain_features returns the name.
+    # Assuming it follows a pattern like f"{STD_SOME_TARGET}_is_low"
+    possible_low_indicator_cols = [col for col in df.columns if col.endswith("_is_low")]
+    for lic in possible_low_indicator_cols:
+        if lic not in base_features:
+            base_features.append(lic)
+            logging.info(f"Including low target indicator '{lic}' in features.")
+
+    # Ensure the actual target column (after transforms, before scaling) is NOT in features
+    final_feature_list = [col for col in base_features if col != target_col_after_transforms]
+    
+    # Remove duplicates that might have crept in
+    final_feature_list = sorted(list(set(final_feature_list)))
+
+    if not final_feature_list:
+        raise ValueError("No feature columns were selected or are available after processing.")
+    
+    logging.info(f"Final selected features for scaling ({len(final_feature_list)}): {final_feature_list}")
+    return final_feature_list
+
+
+def _scale_data(
+    df: pd.DataFrame, 
+    feature_cols: List[str], 
+    target_col_to_scale: str, # This is the target after structural transforms
+    scaling_cfg: ScalingConfig,
+    applied_target_transforms_info: List[Dict[str, Any]]
+) -> Tuple[pd.DataFrame, Dict[str, Any], str]:
+    """Scales features and the (potentially transformed) target column."""
+    logging.debug(f"Scaling data. Features: {feature_cols}, Target to scale: {target_col_to_scale}")
+    
+    scalers: Dict[str, Any] = {}
+    scaled_df_data = {} # To build the new DataFrame
+
+    # Determine feature scaler type
+    FeatureScalerClass = StandardScaler if scaling_cfg.standardize_features else MinMaxScaler
+    logging.info(f"Using {FeatureScalerClass.__name__} for feature scaling.")
+
+    # Scale features
+    for col in feature_cols:
+        if col not in df.columns:
+            logging.warning(f"Feature column '{col}' not found in DataFrame for scaling. Skipping.")
+            continue
+        if df[col].isnull().all():
+            logging.warning(f"All values in feature column '{col}' are NaN. Scaled output will be NaN.")
+            scaled_df_data[col] = np.nan
+            continue
+        
+        feature_values = df[col].ffill().bfill().values.reshape(-1, 1) # Fill NaNs before scaling
+        scaler = FeatureScalerClass()
+        scaled_df_data[col] = scaler.fit_transform(feature_values).flatten()
+        scalers[col] = scaler
+
+    # Scale target
+    if target_col_to_scale not in df.columns:
+        raise ValueError(f"Target column for scaling '{target_col_to_scale}' not found in DataFrame.")
+    if df[target_col_to_scale].isnull().all():
+        raise ValueError(f"All values in target column '{target_col_to_scale}' are NaN before scaling.")
+
+    # Determine target scaler type
+    # If Yeo-Johnson was applied, it's common to follow with StandardScaler.
+    # The PowerTransformer itself has a 'standardize=True' option, but if False, we scale after.
+    # Let's check if the last structural transform was Yeo-Johnson and if its object implies standardization.
+    
+    TargetScalerClass = StandardScaler # Default or if Yeo-Johnson was applied
+    yj_was_applied = any(t['type'] == 'yeo-johnson' for t in applied_target_transforms_info if t['applied'])
+    
+    if yj_was_applied:
+        logging.info(f"Yeo-Johnson was applied to target. Using StandardScaler for '{target_col_to_scale}'.")
+    else: # No Yeo-Johnson, use general scaling config
+        TargetScalerClass = StandardScaler if scaling_cfg.standardize_features else MinMaxScaler
+        logging.info(f"Using {TargetScalerClass.__name__} for target '{target_col_to_scale}'.")
+
+    target_values = df[target_col_to_scale].ffill().bfill().values.reshape(-1, 1)
+    target_scaler_instance = TargetScalerClass()
+    
+    scaled_target_col_name = f"{target_col_to_scale}_scaled"
+    scaled_df_data[scaled_target_col_name] = target_scaler_instance.fit_transform(target_values).flatten()
+    scalers[scaled_target_col_name] = target_scaler_instance # Store under its scaled name
+    
+    # If Yeo-Johnson was used, its transformer object is already in applied_target_transforms_info.
+    # We need to ensure it's passed to the final `scalers` dict for inverse transform.
+    for transform_detail in applied_target_transforms_info:
+        if transform_detail.get('type') == 'yeo-johnson' and 'power_transformer_object' in transform_detail:
+            scalers['power_transformer_object_for_target'] = transform_detail['power_transformer_object']
+            break
+            
+    logging.info(f"Target '{target_col_to_scale}' scaled to '{scaled_target_col_name}'.")
+    if isinstance(target_scaler_instance, StandardScaler):
+        logging.info(f"Target scaler ({scaled_target_col_name}): mean={target_scaler_instance.mean_[0]:.4f}, std={target_scaler_instance.scale_[0]:.4f}")
+    elif isinstance(target_scaler_instance, MinMaxScaler):
+         logging.info(f"Target scaler ({scaled_target_col_name}): min={target_scaler_instance.min_[0]:.4f}, scale={target_scaler_instance.scale_[0]:.4f} (data_min={target_scaler_instance.data_min_[0]:.4f}, data_max={target_scaler_instance.data_max_[0]:.4f})")
+
+
+    final_scaled_df = pd.DataFrame(scaled_df_data, index=df.index)
+    return final_scaled_df, scalers, scaled_target_col_name
+
+
+def _create_sequences_and_split(
+    scaled_df: pd.DataFrame, 
+    feature_cols: List[str], 
+    target_col_scaled: str, 
+    sequence_cfg: SequenceConfig
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Creates sequences from scaled data and splits into train, validation, and test sets."""
+    logging.debug("Creating sequences and splitting data.")
+    
+    if not (feature_cols and target_col_scaled in scaled_df.columns):
+        raise ValueError("Feature columns list is empty or scaled target column not in DataFrame for sequencing.")
+
+    # Ensure no NaNs in the data used for sequences
+    # ffill/bfill should have handled most, but drop any remaining full NaN rows if windowing is affected.
+    data_for_sequences = scaled_df[feature_cols + [target_col_scaled]].copy()
+    data_for_sequences.dropna(how='all', inplace=True) # Drop rows where ALL selected cols are NaN
+    data_for_sequences.ffill(inplace=True) # Apply ffill inplace
+    data_for_sequences.bfill(inplace=True) # Then apply bfill inplace
+
+    if len(data_for_sequences) <= sequence_cfg.window_size:
+        raise ValueError(f"Data length ({len(data_for_sequences)}) after NaN handling is <= window_size ({sequence_cfg.window_size}). Cannot create sequences.")
+
+    X_list, y_list = [], []
+    for i in range(len(data_for_sequences) - sequence_cfg.window_size):
+        X_list.append(data_for_sequences.iloc[i : i + sequence_cfg.window_size][feature_cols].values)
+        y_list.append(data_for_sequences[target_col_scaled].iloc[i + sequence_cfg.window_size])
+
+    if not X_list:
+        logging.warning("No sequences were created. Check data length and window size.")
+        # Return empty arrays with correct number of dimensions for downstream compatibility
+        num_features = len(feature_cols)
+        empty_X_shape = (0, sequence_cfg.window_size, num_features)
+        empty_y_shape = (0, 1) # Assuming target is scalar
+        return (np.empty(empty_X_shape), np.empty(empty_X_shape), np.empty(empty_X_shape),
+                np.empty(empty_y_shape), np.empty(empty_y_shape), np.empty(empty_y_shape))
+
+    X_all = np.array(X_list)
+    y_all = np.array(y_list).reshape(-1, 1) # Ensure y is a column vector
+
+    # Split: Test set first
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        X_all, y_all, test_size=sequence_cfg.test_size, shuffle=False
+    )
+
+    # Split: Validation from remaining train_val
+    if len(X_train_val) > 1 and sequence_cfg.val_size_from_train_val > 0:
         X_train, X_val, y_train, y_val = train_test_split(
-            X_temp, y_temp, test_size=actual_val_size_for_split, shuffle=False
+            X_train_val, y_train_val, test_size=sequence_cfg.val_size_from_train_val, shuffle=False
         )
-    
-    # Log split sizes
-    print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-    print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
-    print(f"X_test shape: {X_test.shape}, y_test shape: {y_test.shape}")
-    print(f"Final features used for sequences ({len(feature_cols)}): {feature_cols}")
-    
+    else: # Not enough data for validation split or val_size is 0
+        logging.warning("Insufficient data for validation split or val_size_from_train_val is 0. Validation set will be empty or X_train_val used as X_train.")
+        X_train, y_train = X_train_val, y_train_val
+        # Create empty val arrays with correct dimensions
+        val_X_shape = (0, X_train.shape[1], X_train.shape[2]) if X_train.ndim == 3 and X_train.shape[0] > 0 else (0,0,0)
+        val_y_shape = (0, y_train.shape[1]) if y_train.ndim == 2 and y_train.shape[0] > 0 else (0,1)
+        X_val, y_val = np.empty(val_X_shape), np.empty(val_y_shape)
+
+
+    logging.info(f"Data split complete: "
+                 f"X_train: {X_train.shape}, y_train: {y_train.shape}, "
+                 f"X_val: {X_val.shape}, y_val: {y_val.shape}, "
+                 f"X_test: {X_test.shape}, y_test: {y_test.shape}")
     return X_train, X_val, X_test, y_train, y_val, y_test
 
-
-def _prepare_transform_info(original_target_col_name, target_col, target_col_actual,
-                           piecewise_transform_details, power_transform_details, 
-                           log_transform_details, scalers):
-    """Prepare transform information for return."""
-    combined_transform_info = {
-        'transforms': [],
-        'target_col_original': original_target_col_name,        # Very original name
-        'target_col_processed_name': target_col,                # Name after potential rename
-        'target_col_transformed_final': target_col_actual       # Name after transforms, before scaling
-    }
-    
-    # Add transforms in order of application
-    if piecewise_transform_details['applied']:
-        combined_transform_info['transforms'].append(piecewise_transform_details)
-    
-    if power_transform_details['applied']:
-        if 'power_transformer_obj' in power_transform_details:
-            scalers['power_transformer_object_for_target'] = power_transform_details.pop('power_transformer_obj')
-        combined_transform_info['transforms'].append(power_transform_details)
-    elif log_transform_details['applied']:  # log and power are mutually exclusive
-        combined_transform_info['transforms'].append(log_transform_details)
-    
-    return combined_transform_info
