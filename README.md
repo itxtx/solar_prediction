@@ -103,31 +103,6 @@ The model demonstrates excellent predictive power on the unseen test data.
 
 *Note: The high Capped MAPE on the original scale is expected, as percentage-based errors become very large when the true radiation values are close to zero.*
 
-### Visualizations
-
-#### Training History
-
-The training and validation loss decreased consistently, with the model stopping early at epoch 89 as validation performance plateaued, preventing overfitting.
-
-*(Image placeholder for `model.plot_training_history()`)*
-
-#### Predictions vs. Actuals
-
-The model's predictions align almost perfectly with the actual values on the test set, as shown by the tight clustering around the ideal y=x line.
-
-*(Image placeholder for the Predictions vs. Actuals scatter plot)*
-
-#### Time Series Forecast
-
-A plot of the predictions overlaid on the actuals for a sample of the test set shows the model's ability to capture the dynamic patterns of solar radiation.
-
-*(Image placeholder for the time series forecast plot)*
-
-#### Prediction with Uncertainty
-
-The MC Dropout method provides a 95% confidence interval, giving insight into the model's certainty for each prediction.
-
-*(Image placeholder for `plot_prediction_with_uncertainty()`)*
 
 -----
 
