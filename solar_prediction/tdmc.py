@@ -8,13 +8,16 @@ from sklearn.cluster import KMeans
 from scipy.stats import multivariate_normal
 from typing import List, Tuple, Optional, Dict, Any, Union
 
+# Import centralized configuration
+from .config import get_config
+
 class SolarTDMC:
     """
     Time-dynamic Markov Chain (TDMC) implementation for solar irradiance prediction.
     This is a specialized Hidden Markov Model with time-dependent transition probabilities.
     """
 
-    def __init__(self, n_states: int = 4, n_emissions: int = 2, time_slices: int = 24):
+    def __init__(self, n_states: Optional[int] = None, n_emissions: Optional[int] = None, time_slices: Optional[int] = None):
         """
         Initialize the TDMC model.
 
@@ -27,9 +30,13 @@ class SolarTDMC:
         time_slices : int
             Number of time slices for the day (e.g., 24 for hourly).
         """
-        self.n_states = n_states
-        self.n_emissions = n_emissions
-        self.time_slices = time_slices
+        # Use centralized configuration for defaults
+        config = get_config()
+        tdmc_config = config.models.tdmc
+        
+        self.n_states = n_states if n_states is not None else tdmc_config.n_states
+        self.n_emissions = n_emissions if n_emissions is not None else tdmc_config.n_emissions
+        self.time_slices = time_slices if time_slices is not None else tdmc_config.time_slices
 
         self.transitions = np.zeros((time_slices, n_states, n_states))
         for t in range(time_slices):
@@ -68,10 +75,17 @@ class SolarTDMC:
         return X_scaled, time_indices
 
     def fit(self, X: np.ndarray, timestamps: Optional[Union[np.ndarray, pd.Series]] = None, 
-            max_iter: int = 100, tol: float = 1e-4, state_names: Optional[List[str]] = None):
+            max_iter: Optional[int] = None, tol: Optional[float] = None, state_names: Optional[List[str]] = None):
         """
         Fit the TDMC model to data using the Baum-Welch algorithm.
         """
+        config = get_config()
+        tdmc_config = config.models.tdmc
+        
+        # Use centralized config for defaults
+        max_iter = max_iter if max_iter is not None else tdmc_config.max_iter
+        tol = tol if tol is not None else tdmc_config.tolerance
+        
         X_scaled, time_indices = self._preprocess_data(X, timestamps)
         self._initialize_parameters(X_scaled, time_indices)
         self._baum_welch_update(X_scaled, time_indices, max_iter, tol)
@@ -84,7 +98,10 @@ class SolarTDMC:
 
     def _initialize_parameters(self, X_scaled: np.ndarray, time_indices: np.ndarray):
         """Initialize model parameters using K-means clustering."""
-        kmeans = KMeans(n_clusters=self.n_states, random_state=42, n_init='auto')
+        config = get_config()
+        tdmc_config = config.models.tdmc
+        
+        kmeans = KMeans(n_clusters=self.n_states, random_state=tdmc_config.random_state, n_init=tdmc_config.kmeans_n_init)
         state_assignments = kmeans.fit_predict(X_scaled)
 
         for s in range(self.n_states):
@@ -93,9 +110,11 @@ class SolarTDMC:
                 self.emission_means[s] = np.mean(state_data, axis=0)
                 cov = np.cov(state_data.T)
                 min_eig = np.min(np.real(np.linalg.eigvals(cov)))
+                config = get_config()
+                tdmc_config = config.models.tdmc
                 if min_eig <= 0: # Ensure positive definiteness
-                    cov += (-min_eig + 1e-6) * np.eye(self.n_emissions) # Add offset to make eigenvalues positive
-                self.emission_covars[s] = cov + 1e-4 * np.eye(self.n_emissions) # Regularization
+                    cov += (-min_eig + tdmc_config.min_eigenvalue_threshold) * np.eye(self.n_emissions) # Add offset to make eigenvalues positive
+                self.emission_covars[s] = cov + tdmc_config.covariance_regularization * np.eye(self.n_emissions) # Regularization
             elif len(state_data) == 1:
                  self.emission_means[s] = state_data[0]
                  self.emission_covars[s] = np.eye(self.n_emissions) * 1e-4 # Default small covariance

@@ -14,16 +14,37 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Union
 
+# Import centralized configuration
+from .config import get_config
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Configuration for data processing (shared with LSTM or can be defined here if specific)
-class DataProcessingConfig:
-    MAX_EXP_INPUT: float = 700.0
-    MIN_RADIATION_CLIP: float = 0.0
-    MAX_RADIATION_CLIP: float = 2000.0
+# Use centralized configuration for data processing constants
+# Legacy DataProcessingConfig class is deprecated - use get_config().data instead
+
+# Use centralized configuration for GRU model hyperparameters
+# GRUModelHyperparameters dataclass is deprecated - create from config instead
+def create_gru_model_hyperparameters_from_config(input_dim: int, config_override: Optional[dict] = None) -> 'GRUModelHyperparameters':
+    """Create GRUModelHyperparameters from centralized config with optional overrides."""
+    config = get_config()
+    gru_config = config.models.gru
+    
+    params = {
+        'input_dim': input_dim,
+        'hidden_dim': gru_config.hidden_dim,
+        'num_layers': gru_config.num_layers,
+        'output_dim': gru_config.output_dim,
+        'dropout_prob': gru_config.dropout_prob,
+        'bidirectional': gru_config.bidirectional
+    }
+    
+    if config_override:
+        params.update(config_override)
+    
+    return GRUModelHyperparameters(**params)
 
 @dataclass
 class GRUModelHyperparameters: # Specific to GRU
@@ -37,6 +58,32 @@ class GRUModelHyperparameters: # Specific to GRU
     def __post_init__(self):
         if not (0 <= self.dropout_prob <= 1):
             raise ValueError("dropout_prob must be between 0 and 1")
+
+# Use centralized configuration for GRU training parameters
+# TrainingConfig dataclass is deprecated - create from config instead
+def create_gru_training_config_from_config(config_override: Optional[dict] = None) -> 'TrainingConfig':
+    """Create TrainingConfig from centralized config with optional overrides."""
+    config = get_config()
+    gru_config = config.models.gru
+    
+    params = {
+        'epochs': gru_config.epochs,
+        'batch_size': gru_config.batch_size,
+        'learning_rate': gru_config.learning_rate,
+        'patience': gru_config.patience,
+        'factor': gru_config.lr_scheduler_factor,
+        'min_lr': gru_config.min_lr,
+        'weight_decay': gru_config.weight_decay,
+        'clip_grad_norm': gru_config.clip_grad_norm,
+        'scheduler_type': gru_config.scheduler_type,
+        'T_max_cosine': gru_config.t_max_cosine,
+        'loss_type': gru_config.loss_type
+    }
+    
+    if config_override:
+        params.update(config_override)
+    
+    return TrainingConfig(**params)
 
 @dataclass
 class TrainingConfig: 
@@ -163,8 +210,10 @@ class WeatherGRU(nn.Module):
             
             val_preds = np.vstack(val_outputs_all); val_acts = np.vstack(val_targets_all)
             val_rmse = np.sqrt(mean_squared_error(val_acts, val_preds)); val_r2 = r2_score(val_acts, val_preds)
-            val_mae = mean_absolute_error(val_acts, val_preds); epsilon_mape = 1e-8 
-            val_mape_cap = np.mean(np.clip(np.abs((val_acts - val_preds) / (np.abs(val_acts) + epsilon_mape)), 0, 1.0)) * 100 
+            val_mae = mean_absolute_error(val_acts, val_preds)
+            config = get_config()
+            epsilon_mape = config.evaluation.mape_epsilon
+            val_mape_cap = np.mean(np.clip(np.abs((val_acts - val_preds) / (np.abs(val_acts) + epsilon_mape)), 0, config.evaluation.mape_clip_max)) * 100
 
             self.history['epochs'].append(epoch + 1); self.history['train_loss'].append(train_loss_epoch)
             self.history['val_loss'].append(val_loss_epoch); self.history['val_rmse'].append(val_rmse)
@@ -220,8 +269,9 @@ class WeatherGRU(nn.Module):
                 t_type = t_details.get('type')
                 logging.info(f"GRU Applying inverse structural transform: {t_type} for {target_col_orig_name}")
                 if t_type == 'log':
+                    config = get_config()
                     offset = t_details.get('offset', 0)
-                    exp_input = np.clip(y_proc, -DataProcessingConfig.MAX_EXP_INPUT, DataProcessingConfig.MAX_EXP_INPUT)
+                    exp_input = np.clip(y_proc, -config.data.max_exp_input, config.data.max_exp_input)
                     y_proc = np.exp(exp_input)
                     if offset > 0: y_proc -= offset
                 elif t_type == 'yeo-johnson':
@@ -238,7 +288,8 @@ class WeatherGRU(nn.Module):
     def _apply_domain_clipping(self, y: np.ndarray, transform_info: Dict) -> np.ndarray:
         y_proc = y
         if transform_info and transform_info.get('target_col_original') == 'Radiation':
-            y_proc = np.clip(y, DataProcessingConfig.MIN_RADIATION_CLIP, DataProcessingConfig.MAX_RADIATION_CLIP)
+            config = get_config()
+            y_proc = np.clip(y, config.data.min_radiation_clip, config.data.max_radiation_clip)
         return y_proc
 
     def _inverse_transform_target(self, y: np.ndarray, target_scaler: Any, 
@@ -252,7 +303,10 @@ class WeatherGRU(nn.Module):
     def evaluate(self, X_test_data: np.ndarray, y_test_data: np.ndarray, device: str = "cpu", 
                  target_scaler_object: Optional[Any] = None, 
                  transform_info_dict: Optional[Dict] = None, 
-                 scalers_dict: Optional[Dict] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
+                 scalers_dict: Optional[Dict] = None,
+                 batch_size: int = 256,
+                 return_predictions: bool = True,
+                 plot_results: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
         self.eval(); self.to(device)
         actuals_s_np = np.asarray(y_test_data).flatten()
         inputs_t = torch.FloatTensor(X_test_data).to(device)
@@ -445,7 +499,8 @@ class WeatherGRU(nn.Module):
             min_y_p = min([low] + ([y_true_orig[s_idx_batch]] if y_true_orig is not None and s_idx_batch < len(y_true_orig) else [])); min_y_p = min_y_p if min_y_p is not None else 0
             max_y_p = max([upp] + ([y_true_orig[s_idx_batch]] if y_true_orig is not None and s_idx_batch < len(y_true_orig) else [])); max_y_p = max_y_p if max_y_p is not None else 1
             pad=0.2*(max_y_p-min_y_p) if (max_y_p-min_y_p)>1e-6 else 1.0
-            ax.set_ylim([max(DataProcessingConfig.MIN_RADIATION_CLIP,min_y_p-pad),max_y_p+pad]); ax.set_xticks([]); ax.set_ylabel("GHI (Original)",fontsize=9)
+            config = get_config()
+            ax.set_ylim([max(config.data.min_radiation_clip,min_y_p-pad),max_y_p+pad]); ax.set_xticks([]); ax.set_ylabel("GHI (Original)",fontsize=9)
             if i==0: ax.legend(fontsize=8,loc='best')
         plt.suptitle(f'GRU Preds w {int((1-alpha)*100)}% CI (Original Scale)',fontsize=14,fontweight='bold'); plt.tight_layout(rect=[0,0.03,1,0.95]); return fig
 

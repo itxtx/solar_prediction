@@ -146,6 +146,33 @@ An initial histogram of the target variable (GHI) shows the distribution of sola
 
 ## How to Use
 
+### Dataset
+
+The project includes two dataset options:
+
+1. **Full Dataset** (`data/SolarPrediction.csv`): Complete dataset with ~32,600 records spanning 4 months (Sep-Dec 2016) with ~5-minute intervals.
+
+2. **Sample Dataset** (`data/sample/SolarPrediction_sample.csv`): A 1-week subset (Sep 1-8, 2016) with ~1,850 records, ideal for:
+   - Quick testing and development
+   - CI/CD pipelines
+   - Learning and experimentation
+   - Resource-constrained environments
+
+The notebooks automatically detect which dataset is available and load accordingly. If the full dataset is missing, the pipeline will seamlessly fall back to the sample dataset.
+
+**Dataset Schema** (both files have identical structure):
+- `UNIXTime`: Unix timestamp
+- `Data`: Date string
+- `Time`: Time string  
+- `Radiation`: Solar radiation (GHI) - target variable
+- `Temperature`: Air temperature
+- `Pressure`: Atmospheric pressure
+- `Humidity`: Relative humidity
+- `WindDirection(Degrees)`: Wind direction
+- `Speed`: Wind speed
+- `TimeSunRise`: Sunrise time
+- `TimeSunSet`: Sunset time
+
 ### Prerequisites
 
   - Python 3.8+
@@ -169,9 +196,12 @@ An initial histogram of the target variable (GHI) shows the distribution of sola
 ```
 .
 ├── data/
-│   └── SolarPrediction.csv              # Dataset
+│   ├── SolarPrediction.csv              # Full dataset (32k+ records)
+│   └── sample/
+│       └── SolarPrediction_sample.csv   # Sample dataset (1-week, ~1.8k records)
 ├── solar_prediction/
 │   ├── data_prep.py                     # Module for data preparation pipeline
+│   ├── data_loader.py                   # Data loading utility with fallback logic
 │   ├── lstm.py                          # Contains the WeatherLSTM model class and helper dataclasses
 │   └── ...
 ├── notebooks/

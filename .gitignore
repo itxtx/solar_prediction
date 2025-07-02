@@ -15,5 +15,10 @@ n.md
 
 .vscode
 
+*.log
+*venv_test/
 
 
+.github/
+.vscode/
+.pytest_cache/
