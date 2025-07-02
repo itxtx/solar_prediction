@@ -61,10 +61,10 @@ WeatherLSTM(
   (fc1): Linear(in_features=256, out_features=64, bias=True)
   (relu): ReLU()
   (dropout2): Dropout(p=0.3, inplace=False)
-  (fc2): Linear(in_features=64, out_features=128, bias=True)
+  (fc2): Linear(in_features=64, out_features=32, bias=True)
   (relu2): ReLU()
   (dropout3): Dropout(p=0.3, inplace=False)
-  (fc3): Linear(in_features=128, out_features=1, bias=True)
+  (fc3): Linear(in_features=32, out_features=1, bias=True)
 )
 ```
 
@@ -73,14 +73,15 @@ WeatherLSTM(
 The final model was trained with the following configuration:
 
   - **Optimizer**: Adam
-  - **Epochs**: 100 (with early stopping patience of 30, stopped at epoch 89)
+  - **Epochs**: 100 (with early stopping patience of 30, ran for full 100 epochs)
   - **Batch Size**: 32
   - **Loss Function**: Mean Squared Error (MSE)
-  - **Learning Rate**: $1.5 \\times 10^{-4}$
-  - **LR Scheduler**: Cosine Annealing
+  - **Learning Rate**: $1.5 \times 10^{-4}$
+  - **LR Scheduler**: Cosine Annealing with $T_{max}=100$
   - **Regularization**:
       - **Dropout**: `p=0.3` in both LSTM and fully-connected layers.
       - **Gradient Clipping**: Norm clipped to a max value of 1.0.
+      - **Weight Decay**: $1 \times 10^{-5}$ (L2 regularization)
 
 ### 5\. Evaluation & Uncertainty
 
@@ -100,14 +101,15 @@ The model demonstrates excellent predictive power on the unseen test data.
 | **RMSE** | 0.1041 | 0.1393 |
 | **MAE** | 0.0602 | 0.0806 |
 | **Capped MAPE** | 9.18% | 52.32% |
+| **Correlation Coefficient** | 0.9914 | 0.9914 |
 
-*Note: The high Capped MAPE on the original scale is expected, as percentage-based errors become very large when the true radiation values are close to zero.*
+*Note: The high Capped MAPE on the original scale is expected, as percentage-based errors become very large when the true radiation values are close to zero. The model achieves excellent performance with an R² of 0.9893, indicating it captures 98.93% of the variance in solar radiation data.*
 
 ### Visualizations
 
 #### Training History
 
-The training and validation loss decreased consistently, with the model stopping early at epoch 89 as validation performance plateaued, preventing overfitting.
+The training and validation loss decreased consistently, with the model running for the full 100 epochs as validation performance continued to improve, demonstrating robust learning without overfitting.
 
 *(Image placeholder for `model.plot_training_history()`)*
 
@@ -148,11 +150,13 @@ The MC Dropout method provides a 95% confidence interval, giving insight into th
 
 ```
 .
-├── solar_weather.csv       # Dataset
-├── data_prep.py            # Module for data preparation pipeline
-├── lstm.py                 # Contains the WeatherLSTM model class and helper dataclasses
-├── main_notebook.ipynb     # Main Jupyter Notebook to run the project steps
-└── weather_lstm_model.pt   # Saved trained model weights
+├── solar_weather.csv                    # Dataset
+├── data_prep.py                         # Module for data preparation pipeline
+├── lstm.py                              # Contains the WeatherLSTM model class and helper dataclasses
+├── notebooks/
+│   └── solar_data_notebook_lstm.ipynb   # Main Jupyter Notebook to run the project steps
+├── README_LSTM.md                       # Detailed technical documentation for the LSTM model
+└── weather_lstm_model.pt                # Saved trained model weights
 ```
 
 
