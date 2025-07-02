@@ -107,29 +107,33 @@ The model demonstrates excellent predictive power on the unseen test data.
 
 ### Visualizations
 
+The notebook generates several comprehensive visualizations to analyze model performance:
+
 #### Training History
 
-The training and validation loss decreased consistently, with the model running for the full 100 epochs as validation performance continued to improve, demonstrating robust learning without overfitting.
+The `model.plot_training_history()` function generates plots showing the training and validation loss curves, learning rate progression, and validation metrics (RMSE, R², MAE, MAPE) over epochs. The model ran for the full 100 epochs with consistent improvement in validation performance.
 
-*(Image placeholder for `model.plot_training_history()`)*
+#### Residual Analysis
 
-#### Predictions vs. Actuals
+A histogram of residuals (actual - predicted values) shows the distribution of prediction errors, with mean residual near zero and standard deviation of 0.0275, indicating well-calibrated predictions.
 
-The model's predictions align almost perfectly with the actual values on the test set, as shown by the tight clustering around the ideal y=x line.
+#### Predictions vs. Actuals Scatter Plot
 
-*(Image placeholder for the Predictions vs. Actuals scatter plot)*
+A scatter plot comparing predicted vs. actual values with the ideal y=x line and observed trend line, demonstrating the model's high accuracy with tight clustering around the ideal line.
 
 #### Time Series Forecast
 
-A plot of the predictions overlaid on the actuals for a sample of the test set shows the model's ability to capture the dynamic patterns of solar radiation.
+Two time series plots show:
+1. Full test set predictions overlaid on actual values
+2. A zoomed-in view (samples 2950-3150) showing detailed temporal patterns
 
-*(Image placeholder for the time series forecast plot)*
+#### Uncertainty Quantification
 
-#### Prediction with Uncertainty
+The MC Dropout method generates predictions with 95% confidence intervals, providing uncertainty estimates for each prediction. The `plot_prediction_with_uncertainty()` function visualizes these confidence bands.
 
-The MC Dropout method provides a 95% confidence interval, giving insight into the model's certainty for each prediction.
+#### Radiation Distribution
 
-*(Image placeholder for `plot_prediction_with_uncertainty()`)*
+An initial histogram of the target variable (GHI) shows the distribution of solar radiation values in the dataset.
 
 -----
 
@@ -146,17 +150,32 @@ The MC Dropout method provides a 95% confidence interval, giving insight into th
   - Seaborn
   - Optuna
 
+### Installation
+
+1. Clone the repository
+2. Install dependencies: `pip install -r requirements.txt`
+3. Navigate to the notebooks directory: `cd notebooks`
+4. Run the LSTM notebook: `jupyter notebook solar_data_notebook_lstm.ipynb`
+
 ### File Structure
 
 ```
 .
-├── solar_weather.csv                    # Dataset
-├── data_prep.py                         # Module for data preparation pipeline
-├── lstm.py                              # Contains the WeatherLSTM model class and helper dataclasses
+├── data/
+│   └── SolarPrediction.csv              # Dataset
+├── solar_prediction/
+│   ├── data_prep.py                     # Module for data preparation pipeline
+│   ├── lstm.py                          # Contains the WeatherLSTM model class and helper dataclasses
+│   └── ...
 ├── notebooks/
-│   └── solar_data_notebook_lstm.ipynb   # Main Jupyter Notebook to run the project steps
-├── README_LSTM.md                       # Detailed technical documentation for the LSTM model
-└── weather_lstm_model.pt                # Saved trained model weights
+│   ├── solar_data_notebook_lstm.ipynb   # Main Jupyter Notebook to run the project steps
+│   ├── solar_data_gru.ipynb             # GRU model implementation
+│   ├── solar_data_sarima.ipynb          # SARIMA model implementation
+│   └── solar_data_tdmc.ipynb            # TDMC model implementation
+├── models/
+│   └── weather_lstm_model.pt            # Saved trained model weights
+├── README.md                            # Main project documentation
+└── README_LSTM.md                       # Detailed technical documentation for the LSTM model
 ```
 
 
