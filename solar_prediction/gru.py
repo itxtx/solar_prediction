@@ -807,10 +807,14 @@ class WeatherGRU(nn.Module):
                 # Add comprehensive list of NumPy types that might be in the saved model
                 safe_globals = [
                     GRUModelHyperparameters, 
-                    np.core.multiarray.scalar,
                     np.dtype,
                     np.ndarray,
-                    np.core.multiarray._reconstruct
+                    # Use numpy's public API instead of private core module
+                    np.float64,
+                    np.float32,
+                    np.int64,
+                    np.int32,
+                    np.bool_
                 ]
                 
                 # Add specific dtype classes for newer NumPy versions

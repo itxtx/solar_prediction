@@ -22,7 +22,7 @@ def create_test_csv(file_path: str, num_rows: int = 1000):
     np.random.seed(42)  # For reproducible test data
     
     # Generate sample data
-    timestamps = pd.date_range('2023-01-01', periods=num_rows, freq='H')
+    timestamps = pd.date_range('2023-01-01', periods=num_rows, freq='h')
     data = {
         'Timestamp': timestamps,
         'Radiation': np.random.uniform(0, 800, num_rows),

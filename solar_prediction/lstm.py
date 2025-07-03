@@ -291,7 +291,7 @@ class WeatherLSTM(nn.Module):
                 optimizer.zero_grad()
                 
                 # Use automatic mixed precision for forward pass and loss calculation
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     outputs = self(inputs)
                     # Pass value_multiplier if criterion is CombinedLoss and mode is value_aware
                     if isinstance(criterion, CombinedLoss) and criterion.loss_mode == "value_aware":
@@ -1002,10 +1002,14 @@ class WeatherLSTM(nn.Module):
                 # Add comprehensive list of NumPy types that might be in the saved model
                 safe_globals = [
                     ModelHyperparameters, 
-                    np.core.multiarray.scalar,
                     np.dtype,
                     np.ndarray,
-                    np.core.multiarray._reconstruct
+                    # Use numpy's public API instead of private core module
+                    np.float64,
+                    np.float32,
+                    np.int64,
+                    np.int32,
+                    np.bool_
                 ]
                 
                 # Add specific dtype classes for newer NumPy versions

@@ -207,7 +207,8 @@ class LSTMConfig(BaseModel):
     mc_dropout_samples: int = Field(30, description="Number of Monte Carlo dropout samples")
     uncertainty_alpha: float = Field(0.05, description="Alpha for uncertainty confidence intervals")
     
-    @validator('dropout_prob')
+    @field_validator('dropout_prob')
+    @classmethod
     def validate_dropout(cls, v):
         if not 0 <= v <= 1:
             raise ValueError("Dropout probability must be between 0 and 1")
@@ -247,7 +248,8 @@ class GRUConfig(BaseModel):
     eval_batch_size: int = Field(256, description="Batch size for evaluation")
     mape_epsilon: float = Field(1e-8, description="Epsilon for MAPE calculation")
     
-    @validator('dropout_prob')
+    @field_validator('dropout_prob')
+    @classmethod
     def validate_dropout(cls, v):
         if not 0 <= v <= 1:
             raise ValueError("Dropout probability must be between 0 and 1")
