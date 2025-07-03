@@ -93,16 +93,16 @@ class FeatureEngineeringConfig(BaseModel):
     # Predefined feature sets
     minimal_features: List[str] = Field(
         default_factory=lambda: [
-            'Radiation', 'Temperature', 'Humidity', 
-            'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover'
+            'GHI', 'temp', 'humidity', 
+            'TimeMinutesSin', 'TimeMinutesCos', 'clouds_all'
         ],
         description="Minimal feature set"
     )
     
     basic_features: List[str] = Field(
         default_factory=lambda: [
-            'Radiation', 'Temperature', 'Pressure', 'Humidity', 'WindSpeed',
-            'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover', 'Rain'
+            'GHI', 'temp', 'pressure', 'humidity', 'wind_speed',
+            'TimeMinutesSin', 'TimeMinutesCos', 'clouds_all', 'rain_1h'
         ],
         description="Basic feature set"
     )
@@ -425,6 +425,7 @@ class SolarPredictionConfig(BaseModel):
     
     # Configuration sections
     data: DataProcessingConfig = Field(default_factory=DataProcessingConfig)
+    input: DataInputConfig = Field(default_factory=lambda: DataInputConfig(target_col_original_name="GHI"))
     transformation: DataTransformationConfig = Field(default_factory=DataTransformationConfig)
     features: FeatureEngineeringConfig = Field(default_factory=FeatureEngineeringConfig)
     scaling: ScalingConfig = Field(default_factory=ScalingConfig)

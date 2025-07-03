@@ -57,7 +57,7 @@ class TestDataPipelineEndToEnd:
         
         result = prepare_weather_data(
             df,
-            config.data,
+            config.input,
             config.transformation,
             config.features,
             config.scaling,
@@ -99,7 +99,7 @@ class TestDataPipelineEndToEnd:
         
         result = prepare_weather_data(
             df,
-            config.data,
+            config.input,
             config.transformation,
             config.features,
             config.scaling,
@@ -167,7 +167,7 @@ class TestDataPipelineScaling:
         
         result = prepare_weather_data(
             df,
-            config.data,
+            config.input,
             config.transformation,
             config.features,
             config.scaling,
@@ -202,7 +202,7 @@ class TestDataPipelineScaling:
         
         result = prepare_weather_data(
             df,
-            config.data,
+            config.input,
             config.transformation,
             config.features,
             config.scaling,
@@ -245,7 +245,7 @@ class TestDataPipelineTransformations:
         
         result = prepare_weather_data(
             df,
-            config.data,
+            config.input,
             config.transformation,
             config.features,
             config.scaling,
@@ -281,7 +281,7 @@ class TestDataPipelineTransformations:
         
         result = prepare_weather_data(
             df,
-            config.data,
+            config.input,
             config.transformation,
             config.features,
             config.scaling,
@@ -327,7 +327,7 @@ class TestDataPipelineEdgeCases:
         try:
             result = prepare_weather_data(
                 minimal_data,
-                config.data,
+                config.input,
                 config.transformation,
                 config.features,
                 config.scaling,
@@ -371,7 +371,7 @@ class TestDataPipelineEdgeCases:
         try:
             result = prepare_weather_data(
                 constant_data,
-                config.data,
+                config.input,
                 config.transformation,
                 config.features,
                 config.scaling,
@@ -415,7 +415,7 @@ class TestDataPipelineEdgeCases:
         try:
             result = prepare_weather_data(
                 extreme_data,
-                config.data,
+                config.input,
                 config.transformation,
                 config.features,
                 config.scaling,

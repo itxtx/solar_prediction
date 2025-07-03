@@ -68,7 +68,7 @@ class TestMemoryStability:
             for _ in range(5):
                 _ = model(X)
         
-        if device.type == 'cuda':
+        if device == 'cuda':
             torch.cuda.empty_cache()
         
         # Memory after warmup
@@ -96,7 +96,7 @@ class TestMemoryStability:
                 del output
         
         # Final memory check
-        if device.type == 'cuda':
+        if device == 'cuda':
             torch.cuda.empty_cache()
         
         memory_tracker.snapshot("after_100_iterations", "after 100 forward passes")
@@ -134,7 +134,7 @@ class TestMemoryStability:
                 f"Memory grew too much: {memory_growth:.1f}MB > {max_growth_mb}MB"
         
         # Final memory should not be significantly higher than after warmup
-        if device.type == 'cuda':
+        if device == 'cuda':
             memory_increase = final_memory['allocated'] - warmup_memory['allocated']
             max_increase_mb = 20  # Allow up to 20MB increase
             assert memory_increase <= max_increase_mb, \
@@ -169,7 +169,7 @@ class TestMemoryStability:
             for _ in range(3):
                 _ = model(X)
         
-        if device.type == 'cuda':
+        if device == 'cuda':
             torch.cuda.empty_cache()
         
         memory_tracker.snapshot("gru_warmup", "after GRU warmup")
@@ -206,7 +206,7 @@ class TestMemoryStability:
 
     def test_memory_leak_detection(self, memory_tracker, device):
         """Test for memory leaks during model operations."""
-        if device.type == 'cpu':
+        if device == 'cpu':
             pytest.skip("Memory leak detection test is more relevant for GPU")
         
         print(f"\nTesting memory leak detection on device: {device}")
@@ -312,7 +312,7 @@ class TestMemoryTrackerFunctionality:
         
     def test_memory_cleanup(self, memory_tracker, device):
         """Test memory cleanup functionality."""
-        if device.type == 'cpu':
+        if device == 'cpu':
             pytest.skip("Memory cleanup test is for GPU devices")
         
         # Allocate some memory
@@ -347,7 +347,7 @@ class TestMemoryEdgeCases:
     
     def test_large_batch_memory(self, device, memory_budget):
         """Test memory usage with larger batch sizes."""
-        if device.type == 'cpu':
+        if device == 'cpu':
             pytest.skip("Large batch memory test is for GPU devices")
         
         print(f"\nTesting large batch memory usage on device: {device}")

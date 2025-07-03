@@ -16,7 +16,7 @@ sys.path.insert(0, str(project_root))
 @pytest.fixture(scope="session")
 def sample_data_path():
     """Path to the sample CSV file."""
-    return project_root / "SolarPrediction_sample.csv"
+    return project_root / "data" / "solar_weather.csv"
 
 @pytest.fixture(scope="session")
 def sample_data(sample_data_path):

@@ -50,12 +50,12 @@ class TestTDMCTraining:
         df = sample_data.head(200).copy()
         
         # Prepare features for TDMC
-        # Use radiation and temperature as emission variables
-        emission_features = ['Radiation', 'Temperature']
+        # Use GHI and temperature as emission variables
+        emission_features = ['GHI', 'temp']
         X_emissions = df[emission_features].values
         
         # Create timestamps
-        timestamps = pd.to_datetime(df['Timestamp'])
+        timestamps = pd.to_datetime(df['Time'])
         
         # Initialize TDMC model
         model = SolarTDMC(n_states=3, n_emissions=len(emission_features), time_slices=24)
@@ -80,9 +80,9 @@ class TestTDMCTraining:
         """Test that log-likelihood increases during training."""
         df = sample_data.head(100).copy()  # Smaller dataset for faster testing
         
-        emission_features = ['Radiation', 'Temperature']
+        emission_features = ['GHI', 'temp']
         X_emissions = df[emission_features].values
-        timestamps = pd.to_datetime(df['Timestamp'])
+        timestamps = pd.to_datetime(df['Time'])
         
         model = SolarTDMC(n_states=3, n_emissions=len(emission_features), time_slices=24)
         
@@ -109,9 +109,9 @@ class TestTDMCTraining:
         """Test that transition matrices have row sums ≈ 1."""
         df = sample_data.head(50).copy()  # Small dataset for quick test
         
-        emission_features = ['Radiation', 'Temperature']
+        emission_features = ['GHI', 'temp']
         X_emissions = df[emission_features].values
-        timestamps = pd.to_datetime(df['Timestamp'])
+        timestamps = pd.to_datetime(df['Time'])
         
         model = SolarTDMC(n_states=3, n_emissions=len(emission_features), time_slices=24)
         
@@ -143,9 +143,9 @@ class TestTDMCPrediction:
         """Test that TDMC predictions have correct shapes."""
         df = sample_data.head(30).copy()
         
-        emission_features = ['Radiation', 'Temperature'] 
+        emission_features = ['GHI', 'temp'] 
         X_emissions = df[emission_features].values
-        timestamps = pd.to_datetime(df['Timestamp'])
+        timestamps = pd.to_datetime(df['Time'])
         
         model = SolarTDMC(n_states=3, n_emissions=len(emission_features), time_slices=24)
         
@@ -170,9 +170,9 @@ class TestTDMCPrediction:
         """Test TDMC state sequence generation."""
         df = sample_data.head(20).copy()
         
-        emission_features = ['Radiation', 'Temperature']
+        emission_features = ['GHI', 'temp']
         X_emissions = df[emission_features].values
-        timestamps = pd.to_datetime(df['Timestamp'])
+        timestamps = pd.to_datetime(df['Time'])
         
         model = SolarTDMC(n_states=3, n_emissions=len(emission_features), time_slices=24)
         

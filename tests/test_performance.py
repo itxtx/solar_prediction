@@ -152,7 +152,7 @@ class TestPerformanceBudgets:
         def run_data_prep():
             return prepare_weather_data(
                 small_sample_data.copy(),
-                config.data,
+                config.input,
                 config.transformation,
                 config.features,
                 config.scaling,

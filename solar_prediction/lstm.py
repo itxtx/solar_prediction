@@ -268,7 +268,7 @@ class WeatherLSTM(nn.Module):
         use_amp = scaler is not None
         
         if train_config.scheduler_type.lower() == "plateau":
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=train_config.factor, patience=train_config.patience//2, min_lr=train_config.min_lr, verbose=True)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=train_config.factor, patience=train_config.patience//2, min_lr=train_config.min_lr)
         elif train_config.scheduler_type.lower() == "cosine":
             T_max = train_config.T_max_cosine if train_config.T_max_cosine is not None else train_config.epochs
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=train_config.min_lr)

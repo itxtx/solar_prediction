@@ -178,19 +178,19 @@ class SolarTDMC:
         self.n_emissions = n_emissions if n_emissions is not None else tdmc_config.n_emissions
         self.time_slices = time_slices if time_slices is not None else tdmc_config.time_slices
 
-        self.transitions = np.zeros((time_slices, n_states, n_states))
-        for t in range(time_slices):
-            self.transitions[t] = np.ones((n_states, n_states)) / n_states
+        self.transitions = np.zeros((self.time_slices, self.n_states, self.n_states))
+        for t in range(self.time_slices):
+            self.transitions[t] = np.ones((self.n_states, self.n_states)) / self.n_states
 
-        self.emission_means = np.zeros((n_states, n_emissions))
-        self.emission_covars = np.zeros((n_states, n_emissions, n_emissions))
-        for s in range(n_states):
-            self.emission_covars[s] = np.eye(n_emissions)
+        self.emission_means = np.zeros((self.n_states, self.n_emissions))
+        self.emission_covars = np.zeros((self.n_states, self.n_emissions, self.n_emissions))
+        for s in range(self.n_states):
+            self.emission_covars[s] = np.eye(self.n_emissions)
 
-        self.initial_probs = np.ones(n_states) / n_states
+        self.initial_probs = np.ones(self.n_states) / self.n_states
         self.scaler = StandardScaler()
         self.trained = False
-        self.state_names: List[str] = [f"State_{i}" for i in range(n_states)]
+        self.state_names: List[str] = [f"State_{i}" for i in range(self.n_states)]
 
     def _preprocess_data(self, X: np.ndarray, 
                          timestamps: Optional[Union[np.ndarray, pd.Series]] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -221,6 +221,12 @@ class SolarTDMC:
         """
         config = get_config()
         tdmc_config = config.models.tdmc
+        
+        # Input validation
+        if timestamps is not None and len(X) != len(timestamps):
+            raise ValueError(f"X and timestamps must have the same length. Got X: {len(X)}, timestamps: {len(timestamps)}")
+        if X.shape[1] != self.n_emissions:
+            raise ValueError(f"X has {X.shape[1]} features, but model expects {self.n_emissions} emissions.")
         
         # Initialize logger based on config
         logger = _get_logger(tdmc_config.verbose_logging) if tdmc_config.verbose_logging else None
