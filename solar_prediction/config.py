@@ -19,7 +19,7 @@ Usage:
 from typing import List, Dict, Optional, Union, Any
 from pathlib import Path
 from dataclasses import dataclass, field
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import os
 
 
@@ -152,7 +152,8 @@ class SequenceConfig(BaseModel):
     test_size: float = Field(0.2, description="Test set proportion")
     val_size_from_train_val: float = Field(0.25, description="Validation size as fraction of train+val")
     
-    @validator('test_size', 'val_size_from_train_val')
+    @field_validator('test_size', 'val_size_from_train_val')
+    @classmethod
     def validate_proportions(cls, v):
         if not 0 < v < 1:
             raise ValueError("Proportions must be between 0 and 1")
