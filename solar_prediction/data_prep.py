@@ -200,7 +200,8 @@ def _parse_time_to_minutes_vectorized(time_series: pd.Series) -> np.ndarray:
     
     # Try to parse as datetime first (most efficient)
     try:
-        parsed_times = pd.to_datetime(valid_times, cache=True, errors='coerce')
+        # Try common datetime formats first to avoid the warning
+        parsed_times = pd.to_datetime(valid_times, format='mixed', cache=True, errors='coerce')
         datetime_mask = parsed_times.notna()
         if datetime_mask.any():
             dt_values = parsed_times[datetime_mask]

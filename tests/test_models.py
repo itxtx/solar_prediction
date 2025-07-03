@@ -387,6 +387,9 @@ class TestModelEdgeCases:
     
     def test_model_with_minimal_data(self, device):
         """Test models with minimal training data."""
+        import warnings
+        from sklearn.exceptions import UndefinedMetricWarning
+        
         # Create minimal data
         X = np.random.randn(3, 5, 4)  # 3 samples, 5 timesteps, 4 features
         y = np.random.randn(3, 1)
@@ -404,7 +407,10 @@ class TestModelEdgeCases:
         lstm_model.to(device)
         
         try:
-            lstm_model.fit(X[:2], y[:2], X[2:], y[2:], training_config, device=device)
+            # Filter out the UndefinedMetricWarning for R² with minimal data
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+                lstm_model.fit(X[:2], y[:2], X[2:], y[2:], training_config, device=device)
             predictions = lstm_model.predict(X, device=device)
             assert predictions.shape[0] == X.shape[0]
         except Exception as e:
