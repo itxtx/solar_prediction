@@ -112,35 +112,6 @@ The LSTM model demonstrates exceptional predictive performance on the unseen tes
 
 *Note: The high Capped MAPE (52.32%) on the original scale is expected and not concerning, as percentage-based errors become very large when the true radiation values are close to zero. This is a common phenomenon in solar radiation prediction where many values are near zero during nighttime or cloudy conditions.*
 
-### Visualizations
-
-The notebook generates several comprehensive visualizations to analyze model performance:
-
-#### Training History
-
-The `model.plot_training_history()` function generates plots showing the training and validation loss curves, learning rate progression, and validation metrics (RMSE, R², MAE, MAPE) over epochs. The model ran for the full 100 epochs with consistent improvement in validation performance.
-
-#### Residual Analysis
-
-A histogram of residuals (actual - predicted values) shows the distribution of prediction errors. The residuals are well-distributed around zero with a small mean residual, indicating the model is well-calibrated and unbiased. The standard deviation of residuals provides insight into the typical prediction error magnitude.
-
-#### Predictions vs. Actuals Scatter Plot
-
-A scatter plot comparing predicted vs. actual values with the ideal y=x line and observed trend line, demonstrating the model's high accuracy with tight clustering around the ideal line.
-
-#### Time Series Forecast
-
-Two time series plots show:
-1. Full test set predictions overlaid on actual values
-2. A zoomed-in view (samples 2950-3150) showing detailed temporal patterns
-
-#### Uncertainty Quantification
-
-The MC Dropout method generates predictions with 95% confidence intervals, providing uncertainty estimates for each prediction. The `plot_prediction_with_uncertainty()` function visualizes these confidence bands.
-
-#### Radiation Distribution
-
-An initial histogram of the target variable (GHI) shows the distribution of solar radiation values in the dataset.
 
 -----
 
