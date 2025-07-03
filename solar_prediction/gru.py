@@ -16,6 +16,8 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 
 # Import centralized configuration
 from .config import get_config
+# Import memory tracking utility
+from .memory_tracker import MemoryTracker
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -156,7 +158,7 @@ class WeatherGRU(nn.Module):
              raise ValueError(f"Target y must be 2D and match model output_dim={self.params.output_dim}.")
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray, 
-            train_config: TrainingConfig, device: str = "cpu"):
+            train_config: TrainingConfig, device: str = "cpu", memory_tracker: Optional[MemoryTracker] = None):
         try:
             self._validate_fit_inputs(X_train, y_train, X_val, y_val)
         except ValueError as e:
@@ -164,6 +166,15 @@ class WeatherGRU(nn.Module):
             raise
 
         logging.info(f"GRU Training started. Device: {device}, Config: {train_config}")
+        
+        # Initialize memory tracker if not provided
+        if memory_tracker is None:
+            config = get_config()
+            memory_tracker = MemoryTracker(device=device, verbose=config.logging.level == "DEBUG")
+        
+        memory_tracker.log_device_info()
+        memory_tracker.snapshot("training_start", "before GRU training loop")
+        
         self.history = {key: [] for key in self.history}
         
         train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
@@ -173,6 +184,10 @@ class WeatherGRU(nn.Module):
         
         optimizer = optim.Adam(self.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
         criterion = self._get_criterion(train_config)
+        
+        # Initialize gradient scaler for mixed precision if CUDA is available
+        scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() and 'cuda' in device else None
+        use_amp = scaler is not None
         
         if train_config.scheduler_type.lower() == "plateau":
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=train_config.factor, patience=train_config.patience//2, min_lr=train_config.min_lr, verbose=True)
@@ -186,26 +201,63 @@ class WeatherGRU(nn.Module):
         early_stopping_counter = 0
         self.to(device)
         
+        logging.info(f"GRU training with mixed precision: {use_amp}")
+        
         for epoch in range(train_config.epochs):
+            memory_tracker.snapshot(f"epoch_{epoch}_start", f"start of GRU epoch {epoch}")
+            
             self.train()
             train_loss_epoch = 0.0
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-                optimizer.zero_grad(); outputs = self(inputs); loss = criterion(outputs, targets)
-                loss.backward()
-                if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
-                     torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
-                optimizer.step(); train_loss_epoch += loss.item() * inputs.size(0)
+                optimizer.zero_grad()
+                
+                # Use automatic mixed precision for forward pass and loss calculation
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = self(inputs)
+                    loss = criterion(outputs, targets)
+                
+                # Backward pass with gradient scaling
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    # Gradient clipping with scaled gradients
+                    if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
+                    optimizer.step()
+                
+                train_loss_epoch += loss.item() * inputs.size(0)
+                
+                # Clean up batch tensors
+                del inputs, targets, outputs, loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
             train_loss_epoch /= len(train_loader.dataset)
+            
+            # Validation phase with memory tracking
+            memory_tracker.snapshot(f"epoch_{epoch}_val_start", f"start of GRU validation for epoch {epoch}")
             
             self.eval()
             val_loss_epoch = 0.0; val_outputs_all, val_targets_all = [], []
-            with torch.no_grad():
+            with torch.inference_mode():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = self(inputs); loss_val = criterion(outputs, targets)
                     val_loss_epoch += loss_val.item() * inputs.size(0)
                     val_outputs_all.append(outputs.cpu().numpy()); val_targets_all.append(targets.cpu().numpy())
+                    
+                    # Clean up validation tensors
+                    del inputs, targets, outputs, loss_val
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
             val_loss_epoch /= len(val_loader.dataset)
             
             val_preds = np.vstack(val_outputs_all); val_acts = np.vstack(val_targets_all)
@@ -230,9 +282,27 @@ class WeatherGRU(nn.Module):
             else: early_stopping_counter += 1
             if early_stopping_counter >= train_config.patience:
                 logging.info(f"GRU Early stopping at epoch {epoch+1}"); break
+                
+            # Memory tracking at end of each epoch
+            memory_tracker.snapshot(f"epoch_{epoch}_end", f"end of GRU epoch {epoch}")
+            memory_tracker.log_memory_diff(f"epoch_{epoch}_start", f"epoch_{epoch}_end", f"GRU_epoch_{epoch}")
+            
+            # Clean up memory periodically
+            if (epoch + 1) % 5 == 0:  # Every 5 epochs
+                memory_tracker.cleanup_memory()
+        
+        # Final memory cleanup
+        memory_tracker.snapshot("training_end", "GRU training completed")
+        memory_tracker.log_memory_diff("training_start", "training_end", "full_GRU_training")
+        memory_tracker.cleanup_memory(force=True)
         
         if best_model_state: self.load_state_dict(best_model_state)
         logging.info("GRU Training complete. Best model state loaded.")
+        
+        # Final memory summary if verbose
+        if memory_tracker.verbose:
+            logging.info(memory_tracker.get_summary())
+            
         return self
 
     def _ensure_2d(self, arr: np.ndarray) -> np.ndarray:
@@ -346,8 +416,8 @@ class WeatherGRU(nn.Module):
             all_predictions_scaled = []
             all_actuals_scaled = []
         
-        # Process in batches
-        with torch.no_grad():
+        # Process in batches with inference mode for better performance
+        with torch.inference_mode():
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 predictions = self(inputs)
@@ -379,6 +449,11 @@ class WeatherGRU(nn.Module):
                 if return_predictions:
                     all_predictions_scaled.append(pred_batch)
                     all_actuals_scaled.append(actual_batch)
+                
+                # Clean up batch tensors for memory efficiency
+                del inputs, targets, predictions
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # Calculate scaled metrics from accumulated statistics
         mse_scaled = sum_squared_error / n_samples
@@ -561,9 +636,16 @@ class WeatherGRU(nn.Module):
         dataset = TensorDataset(X_batch_t)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         preds_s_list = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for (inputs_b,) in loader:
-                preds_s_list.append(self(inputs_b).cpu().numpy())
+                outputs = self(inputs_b)
+                preds_s_list.append(outputs.cpu().numpy())
+                
+                # Clean up batch tensors
+                del inputs_b, outputs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
         preds_s_np = np.concatenate(preds_s_list, axis=0)
         if target_scaler and transform_info:
             if preds_s_np.ndim == 1: preds_s_np = preds_s_np.reshape(-1,1) # Ensure 2D for inverse
@@ -606,25 +688,114 @@ class WeatherGRU(nn.Module):
         if len(axes)>7 and fig.axes[-1]==axes[7]: fig.delaxes(axes[7])
         plt.suptitle('GRU Model Training Metrics',fontsize=16,fontweight='bold'); plt.tight_layout(rect=[0,0,1,0.96]); return fig
 
-    def save(self, path: str):
+    def save(self, path: str, train_cfg=None, metrics=None, use_enhanced=True):
+        """Save GRU model using enhanced checkpointing or legacy format.
+        
+        Parameters:
+        -----------
+        path : str
+            Path to save the model
+        train_cfg : TrainingConfig or dict, optional
+            Training configuration (for enhanced checkpointing)
+        metrics : dict, optional
+            Final metrics dictionary (for enhanced checkpointing)
+        use_enhanced : bool
+            Whether to use enhanced checkpointing format (default True)
+        """
         try:
-            # Convert dataclass to dict to avoid module path serialization issues
-            model_params_dict = {
-                'input_dim': self.params.input_dim,
-                'hidden_dim': self.params.hidden_dim,
-                'num_layers': self.params.num_layers,
-                'output_dim': self.params.output_dim,
-                'dropout_prob': self.params.dropout_prob,
-                'bidirectional': self.params.bidirectional
-            }
-            
-            torch.save({'model_state_dict': self.state_dict(), 'model_params': model_params_dict, 
-                        'history': self.history, 'transform_info': self.transform_info}, path)
-            logging.info(f"GRU Model saved to {path}")
-        except Exception as e: logging.error(f"Failed to save GRU model: {e}"); raise
+            if use_enhanced:
+                # Use enhanced checkpointing
+                from .checkpointing import save_checkpoint
+                
+                # Create default values if not provided
+                if train_cfg is None:
+                    train_cfg = {}
+                if metrics is None:
+                    metrics = {}
+                
+                save_checkpoint(
+                    model=self,
+                    path=path,
+                    hp=self.params,
+                    train_cfg=train_cfg,
+                    history=self.history,
+                    metrics=metrics
+                )
+            else:
+                # Use legacy format
+                # Convert dataclass to dict to avoid module path serialization issues
+                model_params_dict = {
+                    'input_dim': self.params.input_dim,
+                    'hidden_dim': self.params.hidden_dim,
+                    'num_layers': self.params.num_layers,
+                    'output_dim': self.params.output_dim,
+                    'dropout_prob': self.params.dropout_prob,
+                    'bidirectional': self.params.bidirectional
+                }
+                
+                torch.save({'model_state_dict': self.state_dict(), 'model_params': model_params_dict, 
+                            'history': self.history, 'transform_info': self.transform_info}, path)
+                logging.info(f"GRU Model saved to {path} (legacy format)")
+        except Exception as e: 
+            logging.error(f"Failed to save GRU model: {e}"); 
+            raise
     
     @classmethod
-    def load(cls, path: str, device: str = "cpu") -> 'WeatherGRU':
+    def load(cls, path: str, device: str = "cpu", strict: bool = False) -> 'WeatherGRU':
+        """Load GRU model from file using enhanced checkpointing or legacy format.
+        
+        Parameters:
+        -----------
+        path : str
+            Path to the saved model file
+        device : str
+            Device to load model on
+        strict : bool
+            Whether to enforce strict checkpoint format compatibility
+            
+        Returns:
+        --------
+        WeatherGRU
+            Loaded model instance
+        """
+        from pathlib import Path
+        
+        # Determine file format by extension
+        file_path = Path(path)
+        
+        if file_path.suffix == '.pt':
+            # Try enhanced checkpointing first
+            try:
+                from .checkpointing import load_checkpoint
+                checkpoint, metadata = load_checkpoint(path, device, strict)
+                
+                # Verify it's a GRU model
+                if metadata.get('model_type') != 'GRU':
+                    raise ValueError(f"Expected GRU model, got {metadata.get('model_type')}")
+                
+                # Create model parameters
+                model_params_dict = checkpoint.get('model_params', checkpoint.get('hyperparameters', {}))
+                model_params = GRUModelHyperparameters(**model_params_dict)
+                
+                # Create model
+                model = cls(model_params)
+                model.load_state_dict(checkpoint['state_dict'])
+                
+                # Load additional attributes
+                model.history = checkpoint.get('history', {key: [] for key in model.history})
+                model.transform_info = checkpoint.get('transform_info')
+                
+                model.to(device)
+                logging.info(f"GRU Model loaded from enhanced checkpoint (version {metadata.get('version')})")
+                return model
+                
+            except Exception as e:
+                if strict:
+                    raise ValueError(f"Failed to load enhanced checkpoint: {e}")
+                else:
+                    logging.warning(f"Enhanced checkpointing failed ({e}), falling back to legacy format")
+        
+        # Legacy format loading
         try:
             # Try loading with weights_only=False first (for backward compatibility)
             try:
@@ -679,7 +850,7 @@ class WeatherGRU(nn.Module):
             model.history = ckpt.get('history', {key:[] for key in model.history})
             model.transform_info = ckpt.get('transform_info')
             model.to(device)
-            logging.info(f"GRU Model loaded from {path}")
+            logging.info(f"GRU Model loaded from {path} (legacy format)")
             return model
         except Exception as e: 
             logging.error(f"Failed to load GRU model: {e}")
@@ -701,19 +872,64 @@ class WeatherGRU(nn.Module):
                                  return_samples: bool = False, alpha: float = 0.05) -> Dict[str, np.ndarray]:
         self.enable_mc_dropout()
         try:
+            # Get eval_batch_size from config for MC sampling
+            config = get_config()
+            mc_batch_size = config.models.gru.eval_batch_size
+            
             X_batch_t = self._ensure_batched_input(X).to(device)
+            batch_size, seq_len, features = X_batch_t.shape
+            
+            # Process MC samples in mini-batches for memory efficiency
             preds_s_mc_list = []
-            with torch.no_grad():
-                for _ in range(mc_samples): preds_s_mc_list.append(self(X_batch_t).cpu().numpy())
+            
+            with torch.inference_mode():  # Use inference_mode for better performance
+                for batch_start in range(0, mc_samples, mc_batch_size):
+                    batch_end = min(batch_start + mc_batch_size, mc_samples)
+                    current_mc_batch_size = batch_end - batch_start
+                    
+                    # Collect predictions for this MC batch
+                    mc_batch_predictions = []
+                    for i in range(current_mc_batch_size):
+                        pred = self(X_batch_t).cpu().numpy()
+                        mc_batch_predictions.append(pred)
+                        
+                        # Clean up tensors
+                        del pred
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    # Add to main list
+                    preds_s_mc_list.extend(mc_batch_predictions)
+                    
+                    # Clean up batch list
+                    del mc_batch_predictions
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                    if len(preds_s_mc_list) % 10 == 0:  # Log progress
+                        logging.debug(f"Completed {len(preds_s_mc_list)}/{mc_samples} GRU MC samples")
+            
             preds_s_mc_np = np.stack(preds_s_mc_list, axis=0)
             
+            # Process inverse transforms in batches for memory efficiency
             preds_orig_mc = np.zeros_like(preds_s_mc_np)
             if target_scaler and transform_info:
-                for i in range(mc_samples):
-                    curr_batch_s = preds_s_mc_np[i,:,:]
-                    inverted_s = self._inverse_transform_target(curr_batch_s, target_scaler, transform_info, scalers_dict)
-                    preds_orig_mc[i,:,:] = inverted_s.reshape(curr_batch_s.shape)
-            else: logging.warning("No scalers/transform for GRU uncertainty. Returning scaled."); preds_orig_mc = preds_s_mc_np
+                inverse_batch_size = min(10, mc_samples)  # Process inverse transforms in smaller batches
+                
+                for batch_start in range(0, mc_samples, inverse_batch_size):
+                    batch_end = min(batch_start + inverse_batch_size, mc_samples)
+                    
+                    for i in range(batch_start, batch_end):
+                        curr_batch_s = preds_s_mc_np[i,:,:]
+                        inverted_s = self._inverse_transform_target(curr_batch_s, target_scaler, transform_info, scalers_dict)
+                        preds_orig_mc[i,:,:] = inverted_s.reshape(curr_batch_s.shape)
+                    
+                    # Clean up memory after each inverse transform batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            else: 
+                logging.warning("No scalers/transform for GRU uncertainty. Returning scaled.")
+                preds_orig_mc = preds_s_mc_np
             
             res = {'mean': np.mean(preds_orig_mc, axis=0), 'std': np.std(preds_orig_mc, axis=0),
                    'lower_ci': np.percentile(preds_orig_mc, (alpha/2)*100, axis=0),

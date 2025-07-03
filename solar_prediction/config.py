@@ -275,6 +275,11 @@ class TDMCConfig(BaseModel):
     # Numerical stability
     eigenvalue_min_tolerance: float = Field(1e-9, description="Minimum eigenvalue tolerance")
     min_probability: float = Field(1e-300, description="Minimum probability to avoid numerical issues")
+    probability_floor: float = Field(1e-300, description="Floor value for probabilities to avoid underflow")
+    
+    # Logging
+    verbose_logging: bool = Field(False, description="Enable verbose logging for debugging")
+    log_likelihood_every_n_iter: int = Field(10, description="Log likelihood every N iterations")
     
     # K-means initialization
     kmeans_n_init: str = Field("auto", description="Number of K-means initializations")
