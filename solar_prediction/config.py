@@ -303,9 +303,9 @@ class PathsConfig(BaseModel):
     plots_dir: str = Field("plots", description="Plots output directory")
     
     # Data files
-    full_dataset_filename: str = Field("SolarPrediction.csv", description="Full dataset filename")
+    #full_dataset_filename: str = Field("SolarPrediction.csv", description="Full dataset filename")
     sample_dataset_filename: str = Field("SolarPrediction_sample.csv", description="Sample dataset filename")
-    weather_dataset_filename: str = Field("solar_weather.csv", description="Weather dataset filename")
+    full_dataset_filename: str = Field("solar_weather.csv", description="Weather dataset filename")
     
     # Model files
     lstm_model_filename: str = Field("lstm_model.pth", description="LSTM model filename")

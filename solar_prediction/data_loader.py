@@ -29,7 +29,7 @@ def load_solar_dataset(data_dir: str = None, prefer_sample: bool = False) -> pd.
     else:
         data_dir = Path(data_dir)
     
-    full_data_path = data_dir / "SolarPrediction.csv" 
+    full_data_path = data_dir / "solar_weather.csv" 
     sample_data_path = data_dir / "sample" / "SolarPrediction_sample.csv"
     
     # Define the preferred order based on prefer_sample flag
@@ -71,7 +71,7 @@ def get_dataset_info(data_dir: str = None) -> dict:
     else:
         data_dir = Path(data_dir)
     
-    full_data_path = data_dir / "SolarPrediction.csv"
+    full_data_path = data_dir / "solar_weather.csv"
     sample_data_path = data_dir / "sample" / "SolarPrediction_sample.csv"
     
     info = {

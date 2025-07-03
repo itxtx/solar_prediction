@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import List, Dict, Tuple, Optional, Any
 
 # Import centralized configuration
-from .config import get_config, DataInputConfig, DataTransformationConfig, FeatureEngineeringConfig, ScalingConfig, SequenceConfig
+from .config import get_config, DataInputConfig, DataTransformationConfig as TransformationConfig, FeatureEngineeringConfig, ScalingConfig, SequenceConfig
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
