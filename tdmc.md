@@ -178,6 +178,7 @@ The log-likelihood of observing sequence $O$ given the model $\lambda$.
 $$
 \log P(O \mid \lambda) = \log\left(\sum_{i=1}^{N} \alpha_{T-1}(i)\right)
 $$
+
 or
 
 $$
@@ -190,6 +191,7 @@ The algorithm guarantees that the likelihood does not decrease with each iterati
 $$
 L(\lambda^{(n+1)}) \geq L(\lambda^{(n)})
 $$
+
 This is achieved by maximizing the auxiliary Q-function:
 
 $$
