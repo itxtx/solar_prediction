@@ -23,3 +23,6 @@ ipykernel>=6.0.0
 
 # Additional utilities
 tqdm>=4.62.0
+
+# Testing framework
+pytest>=6.0.0

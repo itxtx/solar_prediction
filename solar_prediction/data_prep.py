@@ -6,9 +6,11 @@ import math
 import logging
 from dataclasses import dataclass, field, replace
 from typing import List, Dict, Tuple, Optional, Any
+from numpy.lib.stride_tricks import sliding_window_view
 
 # Import centralized configuration
 from .config import get_config, DataInputConfig, DataTransformationConfig as TransformationConfig, FeatureEngineeringConfig, ScalingConfig, SequenceConfig
+from .benchmark import benchmark, benchmark_context
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,6 +44,7 @@ STD_TIME_UNTIL_SUNSET = 'TimeUntilSunset'
 
 
 # --- Main Data Preparation Function ---
+@benchmark(stage_name="prepare_weather_data_pipeline", track_memory=True)
 def prepare_weather_data(
     df_input: pd.DataFrame,
     input_cfg: DataInputConfig,
@@ -61,20 +64,22 @@ def prepare_weather_data(
 
     logging.info("Starting weather data preparation pipeline v2.")
     
-    # 1. Initial DataFrame Setup (Copy, Standardize Names, Sort by Time)
-    df, standardized_target_col_name, column_rename_map = _initial_df_setup(df_input.copy(), input_cfg)
+    # Set chained assignment to None for in-place operations optimization
+    with pd.option_context('mode.chained_assignment', None):
+        # 1. Initial DataFrame Setup (with in-place operations optimization)
+        df, standardized_target_col_name, column_rename_map = _initial_df_setup(df_input, input_cfg)
     
-    # 2. Engineer Time-Based Features
-    df = _engineer_time_features(df, feature_cfg, input_cfg) # Pass input_cfg for raw time col names
+        # 2. Engineer Time-Based Features
+        df = _engineer_time_features(df, feature_cfg, input_cfg) # Pass input_cfg for raw time col names
 
-    # 3. Apply Target Variable Transformations
-    # target_col_after_transforms is the name of the column that holds the target values
-    # after all structural transformations (log, power, piecewise) but BEFORE scaling.
-    df, target_col_after_transforms, applied_target_transforms_info = _apply_target_transformations(
-        df.copy(), # Pass a copy to avoid SettingWithCopyWarning if df is modified inside
-        standardized_target_col_name, 
-        transform_cfg
-    )
+        # 3. Apply Target Variable Transformations (optimized - no copy needed with chained assignment None)
+        # target_col_after_transforms is the name of the column that holds the target values
+        # after all structural transformations (log, power, piecewise) but BEFORE scaling.
+        df, target_col_after_transforms, applied_target_transforms_info = _apply_target_transformations(
+            df, # No copy needed with chained assignment guard
+            standardized_target_col_name, 
+            transform_cfg
+        )
 
     # 4. Engineer Other Features (e.g., low target indicator)
     df = _engineer_other_domain_features(df, target_col_after_transforms, feature_cfg, standardized_target_col_name)
@@ -111,9 +116,13 @@ def prepare_weather_data(
 
 # --- Helper Functions for `prepare_weather_data_v2` ---
 
+@benchmark(stage_name="initial_df_setup")
 def _initial_df_setup(df: pd.DataFrame, cfg: DataInputConfig) -> Tuple[pd.DataFrame, str, Dict[str,str]]:
-    """Copies df, standardizes key column names, and sorts by time."""
+    """Standardizes key column names, and sorts by time (optimized with in-place operations)."""
     logging.debug("Performing initial DataFrame setup.")
+    
+    # Work with a copy to avoid modifying the original
+    df = df.copy()
     
     # Define the mapping from common input names to standardized internal names
     # This map should be comprehensive for columns used in feature engineering or as target
@@ -153,10 +162,11 @@ def _initial_df_setup(df: pd.DataFrame, cfg: DataInputConfig) -> Tuple[pd.DataFr
     if final_target_col_name not in df.columns: # Should not happen if logic is correct
         raise ValueError(f"Target column '{final_target_col_name}' (from '{cfg.target_col_original_name}') not found after renaming.")
 
-    # Time sorting
+    # Time sorting with optimized datetime parsing
     if STD_TIME_COL in df.columns:
         try:
-            df[STD_TIME_COL] = pd.to_datetime(df[STD_TIME_COL])
+            # Optimized datetime parsing with caching
+            df[STD_TIME_COL] = pd.to_datetime(df[STD_TIME_COL], cache=True)
             df.sort_values(STD_TIME_COL, inplace=True)
             df.reset_index(drop=True, inplace=True)
             logging.info(f"Sorted DataFrame by '{STD_TIME_COL}'.")
@@ -177,31 +187,70 @@ def _initial_df_setup(df: pd.DataFrame, cfg: DataInputConfig) -> Tuple[pd.DataFr
         
     return df, final_target_col_name, actual_rename_map
 
+def _parse_time_to_minutes_vectorized(time_series: pd.Series) -> np.ndarray:
+    """Vectorized time parsing to minutes from midnight."""
+    result = np.full(len(time_series), np.nan)
+    
+    # Handle NaN values
+    valid_mask = time_series.notna()
+    if not valid_mask.any():
+        return result
+    
+    valid_times = time_series[valid_mask]
+    
+    # Try to parse as datetime first (most efficient)
+    try:
+        # Try common datetime formats first to avoid the warning
+        parsed_times = pd.to_datetime(valid_times, format='mixed', cache=True, errors='coerce')
+        datetime_mask = parsed_times.notna()
+        if datetime_mask.any():
+            dt_values = parsed_times[datetime_mask]
+            minutes = dt_values.dt.hour * 60 + dt_values.dt.minute + dt_values.dt.second / 60.0
+            result[valid_mask] = minutes.reindex(valid_times.index, fill_value=np.nan)
+            return result
+    except:
+        pass
+    
+    # Fallback to individual parsing for remaining values
+    for idx, time_val in valid_times.items():
+        if isinstance(time_val, (pd.Timestamp, pd.Timedelta)):
+            result[idx] = time_val.hour * 60 + time_val.minute + time_val.second / 60.0
+        elif isinstance(time_val, str) and ':' in time_val:
+            try:
+                parts = time_val.split(':')
+                h = int(parts[0])
+                m = int(parts[1])
+                s = float(parts[2]) if len(parts) > 2 else 0.0
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    result[idx] = h * 60 + m + s / 60.0
+            except ValueError:
+                continue
+    
+    return result
+
 def _parse_time_to_minutes(time_val: Any) -> Optional[float]:
-    """Parses various time representations to minutes from midnight."""
+    """Legacy single-value time parsing (kept for compatibility)."""
     if pd.isna(time_val): return np.nan
-    if isinstance(time_val, (pd.Timestamp, pd.Timedelta)): # Handle Timedelta if it represents time of day
+    if isinstance(time_val, (pd.Timestamp, pd.Timedelta)):
         return time_val.hour * 60 + time_val.minute + time_val.second / 60.0
     if isinstance(time_val, str):
         try:
-            if ':' in time_val: # HH:MM or HH:MM:SS
+            if ':' in time_val:
                 parts = time_val.split(':')
                 h = int(parts[0])
                 m = int(parts[1])
                 s = float(parts[2]) if len(parts) > 2 else 0.0
                 if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
-                    logging.warning(f"Invalid time string components: {time_val}")
                     return np.nan
                 return h * 60 + m + s / 60.0
         except ValueError:
-            logging.warning(f"Could not parse time string: {time_val}")
             return np.nan
-    logging.debug(f"Unhandled time format for parsing: {time_val} (type: {type(time_val)})")
     return np.nan
 
 
+@benchmark(stage_name="engineer_time_features")
 def _engineer_time_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, input_cfg: DataInputConfig) -> pd.DataFrame:
-    """Engineers time-based features like cyclical hour/month, daylight, solar elevation."""
+    """Engineers time-based features like cyclical hour/month, daylight, solar elevation (vectorized)."""
     logging.debug("Engineering time features.")
     if STD_TIME_COL not in df.columns or not pd.api.types.is_datetime64_any_dtype(df[STD_TIME_COL]):
         logging.warning(f"'{STD_TIME_COL}' not found or not datetime. Skipping detailed time feature engineering.")
@@ -214,14 +263,23 @@ def _engineer_time_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringCon
     # Use centralized configuration for time constants
     config = get_config()
     minutes_in_day = config.features.minutes_in_day
-    current_time_minutes = df[STD_TIME_COL].dt.hour * 60 + df[STD_TIME_COL].dt.minute + df[STD_TIME_COL].dt.second / 60.0
-    df[STD_TIME_MINUTES_SIN] = np.sin(2 * np.pi * current_time_minutes / minutes_in_day)
-    df[STD_TIME_MINUTES_COS] = np.cos(2 * np.pi * current_time_minutes / minutes_in_day)
+    
+    # Vectorized time feature engineering using NumPy operations
+    time_values = df[STD_TIME_COL].dt
+    current_time_minutes = time_values.hour * 60 + time_values.minute + time_values.second / 60.0
+    
+    # Pre-compute the scaling factor for efficiency
+    time_scale_factor = 2 * np.pi / minutes_in_day
+    scaled_minutes = current_time_minutes * time_scale_factor
+    
+    df[STD_TIME_MINUTES_SIN] = np.sin(scaled_minutes)
+    df[STD_TIME_MINUTES_COS] = np.cos(scaled_minutes)
 
-    # Sunrise/Sunset and Daylight Features
+    # Sunrise/Sunset and Daylight Features (vectorized)
     if input_cfg.sunrise_col in df.columns and input_cfg.sunset_col in df.columns:
-        sunrise_minutes = df[input_cfg.sunrise_col].apply(_parse_time_to_minutes)
-        sunset_minutes = df[input_cfg.sunset_col].apply(_parse_time_to_minutes)
+        # Use vectorized time parsing for better performance
+        sunrise_minutes = pd.Series(_parse_time_to_minutes_vectorized(df[input_cfg.sunrise_col]), index=df.index)
+        sunset_minutes = pd.Series(_parse_time_to_minutes_vectorized(df[input_cfg.sunset_col]), index=df.index)
 
         # Handle cases where parsing might fail or times are missing
         if sunrise_minutes.notna().all() and sunset_minutes.notna().all():
@@ -231,19 +289,27 @@ def _engineer_time_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringCon
             
             df[STD_IS_DAYLIGHT] = ((current_time_minutes >= sunrise_minutes) & (current_time_minutes <= sunset_minutes)).astype(float)
             
-            # DaylightPosition: 0 at sunrise, 1 at sunset, normalized
+            # DaylightPosition: 0 at sunrise, 1 at sunset, normalized (vectorized)
             # Avoid division by zero or by very small daylight duration
-            daylight_duration_safe = df[STD_DAYLIGHT_MINUTES].replace(0, np.nan) # Avoid division by zero
+            daylight_duration_safe = df[STD_DAYLIGHT_MINUTES].replace(0, np.nan)
             time_since_sunrise = current_time_minutes - sunrise_minutes
-            # Adjust for time_since_sunrise being negative (before sunrise on that day but after midnight)
-            time_since_sunrise[time_since_sunrise < 0] += minutes_in_day 
             
-            df[STD_DAYLIGHT_POSITION] = (time_since_sunrise / daylight_duration_safe).clip(0, 1)
-            df[STD_DAYLIGHT_POSITION].fillna(0, inplace=True) # Fill NaNs (e.g. night) with 0
+            # Vectorized adjustment for negative time_since_sunrise
+            negative_mask = time_since_sunrise < 0
+            time_since_sunrise = np.where(negative_mask, 
+                                        time_since_sunrise + minutes_in_day, 
+                                        time_since_sunrise)
+            
+            # Vectorized daylight position calculation
+            df[STD_DAYLIGHT_POSITION] = np.clip(time_since_sunrise / daylight_duration_safe, 0, 1)
+            df[STD_DAYLIGHT_POSITION].fillna(0, inplace=True)
 
             df[STD_TIME_SINCE_SUNRISE] = time_since_sunrise
-            df[STD_TIME_UNTIL_SUNSET] = sunset_minutes - current_time_minutes
-            df.loc[df[STD_TIME_UNTIL_SUNSET] < 0, STD_TIME_UNTIL_SUNSET] += minutes_in_day
+            time_until_sunset = sunset_minutes - current_time_minutes
+            # Vectorized adjustment for negative time_until_sunset
+            df[STD_TIME_UNTIL_SUNSET] = np.where(time_until_sunset < 0, 
+                                               time_until_sunset + minutes_in_day, 
+                                               time_until_sunset)
 
 
         else:
@@ -259,23 +325,29 @@ def _engineer_time_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringCon
          df[STD_DAYLIGHT_POSITION] = pd.to_numeric(df[input_cfg.sunlight_time_daylength_ratio_raw], errors='coerce').clip(0,1)
 
 
-    # Solar Elevation Proxy
+    # Solar Elevation Proxy (vectorized)
     if feature_cfg.use_solar_elevation_proxy and STD_DAYLIGHT_POSITION in df.columns:
-        # Solar elevation proxy peaks at 1 at solar noon, 0 at sunrise/sunset
-        # Uses sine curve based on normalized daylight position
-        df[STD_SOLAR_ELEVATION] = df[STD_DAYLIGHT_POSITION].apply(lambda x: math.sin(x * math.pi) if pd.notna(x) and 0 <= x <= 1 else 0.0)
+        # Vectorized solar elevation proxy calculation
+        daylight_pos = df[STD_DAYLIGHT_POSITION].values
+        valid_mask = (pd.notna(daylight_pos)) & (daylight_pos >= 0) & (daylight_pos <= 1)
+        
+        solar_elevation = np.zeros_like(daylight_pos)
+        solar_elevation[valid_mask] = np.sin(daylight_pos[valid_mask] * np.pi)
+        
+        df[STD_SOLAR_ELEVATION] = solar_elevation
         logging.info(f"Engineered '{STD_SOLAR_ELEVATION}' feature.")
     elif feature_cfg.use_solar_elevation_proxy:
         logging.warning(f"Cannot create '{STD_SOLAR_ELEVATION}' as '{STD_DAYLIGHT_POSITION}' is missing.")
         
     return df
 
+@benchmark(stage_name="apply_target_transformations")
 def _apply_target_transformations(
     df: pd.DataFrame, 
     target_col: str, 
     cfg: TransformationConfig
 ) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]]]:
-    """Applies configured transformations to the target column."""
+    """Applies configured transformations to the target column (optimized)."""
     logging.debug(f"Applying target transformations to '{target_col}'. Config: {cfg}")
     
     current_target_col = target_col
@@ -392,6 +464,7 @@ def _apply_target_transformations(
     return df, current_target_col, applied_transforms_log
 
 
+@benchmark(stage_name="engineer_other_domain_features")
 def _engineer_other_domain_features(df: pd.DataFrame, target_col_after_transforms: str, 
                                     feature_cfg: FeatureEngineeringConfig, 
                                     standardized_target_col_name: str) -> pd.DataFrame:
@@ -461,6 +534,7 @@ def _get_base_feature_set(df_columns: pd.Index, feature_cfg: FeatureEngineeringC
     return available_features
 
 
+@benchmark(stage_name="select_final_features")
 def _select_final_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, 
                            target_col_after_transforms: str) -> List[str]:
     """Selects the final list of feature columns to be used for modeling."""
@@ -490,6 +564,7 @@ def _select_final_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringConf
     return final_feature_list
 
 
+@benchmark(stage_name="scale_data")
 def _scale_data(
     df: pd.DataFrame, 
     feature_cols: List[str], 
@@ -567,13 +642,14 @@ def _scale_data(
     return final_scaled_df, scalers, scaled_target_col_name
 
 
+@benchmark(stage_name="create_sequences_and_split")
 def _create_sequences_and_split(
     scaled_df: pd.DataFrame, 
     feature_cols: List[str], 
     target_col_scaled: str, 
     sequence_cfg: SequenceConfig
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Creates sequences from scaled data and splits into train, validation, and test sets."""
+    """Creates sequences from scaled data and splits into train, validation, and test sets (optimized)."""
     logging.debug("Creating sequences and splitting data.")
     
     if not (feature_cols and target_col_scaled in scaled_df.columns):
@@ -589,22 +665,45 @@ def _create_sequences_and_split(
     if len(data_for_sequences) <= sequence_cfg.window_size:
         raise ValueError(f"Data length ({len(data_for_sequences)}) after NaN handling is <= window_size ({sequence_cfg.window_size}). Cannot create sequences.")
 
-    X_list, y_list = [], []
-    for i in range(len(data_for_sequences) - sequence_cfg.window_size):
-        X_list.append(data_for_sequences.iloc[i : i + sequence_cfg.window_size][feature_cols].values)
-        y_list.append(data_for_sequences[target_col_scaled].iloc[i + sequence_cfg.window_size])
-
-    if not X_list:
-        logging.warning("No sequences were created. Check data length and window size.")
-        # Return empty arrays with correct number of dimensions for downstream compatibility
-        num_features = len(feature_cols)
+    # Optimized sequence generation using pre-allocated arrays and stride tricks
+    num_features = len(feature_cols)
+    sequence_length = len(data_for_sequences) - sequence_cfg.window_size
+    
+    if sequence_length <= 0:
+        # Handle edge case where not enough data for sequences
         empty_X_shape = (0, sequence_cfg.window_size, num_features)
-        empty_y_shape = (0, 1) # Assuming target is scalar
+        empty_y_shape = (0, 1)
         return (np.empty(empty_X_shape), np.empty(empty_X_shape), np.empty(empty_X_shape),
                 np.empty(empty_y_shape), np.empty(empty_y_shape), np.empty(empty_y_shape))
+    
+    # Pre-allocate arrays for better memory efficiency
+    X_all = np.empty((sequence_length, sequence_cfg.window_size, num_features), dtype=np.float32)
+    y_all = np.empty(sequence_length, dtype=np.float32)
+    
+    # Convert feature data to numpy array once
+    feature_data = data_for_sequences[feature_cols].values.astype(np.float32)
+    target_data = data_for_sequences[target_col_scaled].values.astype(np.float32)
+    
+    # Use sliding window view for efficient sequence creation
+    try:
+        # Create sliding windows using stride tricks for X data
+        X_windows = sliding_window_view(feature_data, 
+                                      window_shape=(sequence_cfg.window_size, num_features),
+                                      axis=(0, 1))
+        X_all = X_windows.squeeze(axis=-1)  # Remove extra dimension
+        
+        # Extract target values efficiently
+        y_all = target_data[sequence_cfg.window_size:sequence_cfg.window_size + sequence_length]
+        
+    except Exception as e:
+        logging.warning(f"Sliding window optimization failed, falling back to loop: {e}")
+        # Fallback to the original method if stride tricks fail
+        for i in range(sequence_length):
+            X_all[i] = feature_data[i:i + sequence_cfg.window_size]
+            y_all[i] = target_data[i + sequence_cfg.window_size]
 
-    X_all = np.array(X_list)
-    y_all = np.array(y_list).reshape(-1, 1) # Ensure y is a column vector
+    # Reshape y to column vector
+    y_all = y_all.reshape(-1, 1)
 
     # Split: Test set first
     X_train_val, X_test, y_train_val, y_test = train_test_split(
