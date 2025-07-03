@@ -14,16 +14,36 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Union
 
+# Import centralized configuration
+from .config import get_config
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Configuration for data processing and model constraints
-class DataProcessingConfig:
-    MAX_EXP_INPUT: float = 700.0  # Max input to np.exp to avoid overflow
-    MIN_RADIATION_CLIP: float = 0.0
-    MAX_RADIATION_CLIP: float = 2000.0 
+# Use centralized configuration for data processing constants
+# Legacy DataProcessingConfig class is deprecated - use get_config().data instead
+
+# Use centralized configuration for model hyperparameters
+# ModelHyperparameters dataclass is deprecated - create from config instead
+def create_model_hyperparameters_from_config(input_dim: int, config_override: Optional[dict] = None) -> 'ModelHyperparameters':
+    """Create ModelHyperparameters from centralized config with optional overrides."""
+    config = get_config()
+    lstm_config = config.models.lstm
+    
+    params = {
+        'input_dim': input_dim,
+        'hidden_dim': lstm_config.hidden_dim,
+        'num_layers': lstm_config.num_layers,
+        'output_dim': lstm_config.output_dim,
+        'dropout_prob': lstm_config.dropout_prob
+    }
+    
+    if config_override:
+        params.update(config_override)
+    
+    return ModelHyperparameters(**params)
 
 @dataclass
 class ModelHyperparameters:
@@ -36,6 +56,35 @@ class ModelHyperparameters:
     def __post_init__(self):
         if not (0 <= self.dropout_prob <= 1):
             raise ValueError("dropout_prob must be between 0 and 1")
+
+# Use centralized configuration for training parameters
+# TrainingConfig dataclass is deprecated - create from config instead
+def create_training_config_from_config(config_override: Optional[dict] = None) -> 'TrainingConfig':
+    """Create TrainingConfig from centralized config with optional overrides."""
+    config = get_config()
+    lstm_config = config.models.lstm
+    
+    params = {
+        'epochs': lstm_config.epochs,
+        'batch_size': lstm_config.batch_size,
+        'learning_rate': lstm_config.learning_rate,
+        'patience': lstm_config.patience,
+        'factor': lstm_config.lr_scheduler_factor,
+        'min_lr': lstm_config.min_lr,
+        'weight_decay': lstm_config.weight_decay,
+        'clip_grad_norm': lstm_config.clip_grad_norm,
+        'scheduler_type': lstm_config.scheduler_type,
+        'T_max_cosine': lstm_config.t_max_cosine,
+        'loss_type': lstm_config.loss_type,
+        'mse_weight': lstm_config.mse_weight,
+        'mape_weight': lstm_config.mape_weight,
+        'value_multiplier': lstm_config.value_multiplier
+    }
+    
+    if config_override:
+        params.update(config_override)
+    
+    return TrainingConfig(**params)
 
 @dataclass
 class TrainingConfig:
@@ -62,13 +111,18 @@ class CombinedLoss(nn.Module):
     Can operate in 'standard' or 'value_aware' mode.
     """
     def __init__(self, mse_weight: float = 0.7, mape_weight: float = 0.3, 
-                 epsilon: float = 1e-8, clip_mape_percentage: float = 100.0,
+                 epsilon: Optional[float] = None, clip_mape_percentage: Optional[float] = None,
                  loss_mode: str = "standard"): # Added loss_mode
         super(CombinedLoss, self).__init__()
+        
+        # Use centralized config for default values
+        config = get_config()
+        lstm_config = config.models.lstm
+        
         self.mse_weight = mse_weight
         self.mape_weight = mape_weight
-        self.epsilon = epsilon
-        self.clip_mape_fraction = clip_mape_percentage / 100.0
+        self.epsilon = epsilon if epsilon is not None else lstm_config.mape_epsilon
+        self.clip_mape_fraction = (clip_mape_percentage if clip_mape_percentage is not None else lstm_config.mape_clip_percentage) / 100.0
         self.mse_loss = nn.MSELoss()
         self.loss_mode = loss_mode
         if self.loss_mode not in ["standard", "value_aware"]:
@@ -251,8 +305,9 @@ class WeatherLSTM(nn.Module):
             val_rmse = np.sqrt(mean_squared_error(val_actuals, val_predictions))
             val_r2 = r2_score(val_actuals, val_predictions)
             val_mae = mean_absolute_error(val_actuals, val_predictions)
-            epsilon_mape = 1e-8 
-            val_mape_capped = np.mean(np.clip(np.abs((val_actuals - val_predictions) / (np.abs(val_actuals) + epsilon_mape)), 0, 1.0)) * 100 
+            config = get_config()
+            epsilon_mape = config.evaluation.mape_epsilon
+            val_mape_capped = np.mean(np.clip(np.abs((val_actuals - val_predictions) / (np.abs(val_actuals) + epsilon_mape)), 0, config.evaluation.mape_clip_value)) * 100
 
             self.history['epochs'].append(epoch + 1); self.history['train_loss'].append(train_loss_epoch)
             self.history['val_loss'].append(val_loss_epoch); self.history['val_rmse'].append(val_rmse)
@@ -310,8 +365,9 @@ class WeatherLSTM(nn.Module):
                 t_type = t_details.get('type')
                 logging.info(f"Applying inverse structural transform: {t_type} for {target_col_orig_name}")
                 if t_type == 'log':
+                    config = get_config()
                     offset = t_details.get('offset', 0)
-                    exp_input = np.clip(y_processed, -DataProcessingConfig.MAX_EXP_INPUT, DataProcessingConfig.MAX_EXP_INPUT)
+                    exp_input = np.clip(y_processed, -config.data.max_exp_input, config.data.max_exp_input)
                     y_processed = np.exp(exp_input)
                     if offset > 0: y_processed -= offset
                 elif t_type == 'yeo-johnson':
@@ -331,7 +387,8 @@ class WeatherLSTM(nn.Module):
         """Applies domain-specific clipping, e.g., for GHI."""
         y_processed = y
         if transform_info and transform_info.get('target_col_original') == 'Radiation':
-            y_processed = np.clip(y, DataProcessingConfig.MIN_RADIATION_CLIP, DataProcessingConfig.MAX_RADIATION_CLIP)
+            config = get_config()
+            y_processed = np.clip(y, config.data.min_radiation_clip, config.data.max_radiation_clip)
         return y_processed
 
     def _inverse_transform_target(self, y: np.ndarray, target_scaler: Any, 
@@ -354,8 +411,8 @@ class WeatherLSTM(nn.Module):
                 target_scaler_object: Optional[Any] = None, 
                 transform_info_dict: Optional[Dict] = None, 
                 scalers_dict: Optional[Dict] = None,
-                batch_size: int = 256,  # Added batch_size parameter
-                return_predictions: bool = True,  # Control whether to return full predictions
+                batch_size: int = 256,
+                return_predictions: bool = True,
                 plot_results: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
         """
         Evaluate model with improved memory efficiency.
@@ -421,8 +478,9 @@ class WeatherLSTM(nn.Module):
                 sum_pred_actual += np.sum(pred_batch * actual_batch)
                 
                 # For MAPE
-                abs_percentage_error = np.abs((actual_batch - pred_batch) / (np.abs(actual_batch) + epsilon_mape))
-                sum_percentage_error += np.sum(np.clip(abs_percentage_error, 0, 1.0))
+                config = get_config()
+                abs_percentage_error = np.abs((actual_batch - pred_batch) / (np.abs(actual_batch) + config.evaluation.mape_epsilon))
+                sum_percentage_error += np.sum(np.clip(abs_percentage_error, 0, config.evaluation.mape_clip_value))
                 
                 # Collect predictions if requested
                 if return_predictions:
@@ -487,9 +545,10 @@ class WeatherLSTM(nn.Module):
                     rmse_orig = np.sqrt(mean_squared_error(actuals_original_scale, predictions_original_scale))
                     r2_orig = r2_score(actuals_original_scale, predictions_original_scale)
                     mae_orig = mean_absolute_error(actuals_original_scale, predictions_original_scale)
+                    config = get_config()
                     mape_orig_capped = np.mean(np.clip(
                         np.abs((actuals_original_scale - predictions_original_scale) / 
-                            (np.abs(actuals_original_scale) + epsilon_mape)), 0, 1.0)) * 100
+                            (np.abs(actuals_original_scale) + config.evaluation.mape_epsilon)), 0, config.evaluation.mape_clip_value)) * 100
                     
                     logging.info(f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, "
                                 f"MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%")
@@ -656,8 +715,8 @@ class WeatherLSTM(nn.Module):
             ('Loss', ['train_loss', 'val_loss'], log_scale_loss, ['b-', 'r-']),
             ('RMSE (Scaled)', ['val_rmse'], False, ['g-']),
             ('R² (Scaled)', ['val_r2'], False, ['m-']),
-            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['darkorange-']), # Problematic
-            ('MAE (Scaled)', ['val_mae'], False, ['darkcyan-']),       # Problematic
+            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['orange']),
+            ('MAE (Scaled)', ['val_mae'], False, ['cyan']),
             ('Learning Rate', ['lr'], True, ['c-'])
         ]
 
@@ -671,43 +730,22 @@ class WeatherLSTM(nn.Module):
                     plot_args = [self.history['epochs'], self.history[key]]
                     plot_kwargs = {'label': label}
 
-                    parsed_color = None
-                    parsed_linestyle = None
-                    parsed_marker = None
-                    is_complex_spec = False
-
-                    # Define common linestyles and markers
-                    # Sorted by length (desc) to match '--' before '-' if applicable, though simple iteration works for distinct endings
-                    possible_styles_markers = ['--', '-.', '-', ':', '.', ',', 'o', 'v', '^', '<', '>', 's', 'p', '*', 'h', 'H', '+', 'x', 'D', 'd']
-
-                    if style_spec: # Ensure style_spec is not empty
-                        for sm_suffix in sorted(possible_styles_markers, key=len, reverse=True):
-                            if style_spec.endswith(sm_suffix):
-                                color_candidate = style_spec[:-len(sm_suffix)]
-                                if color_candidate and is_color_like(color_candidate):
-                                    # If the color_candidate is a single char color (e.g., 'r' in 'r-'),
-                                    # it's a standard fmt string. We only parse if it's a named color.
-                                    if len(color_candidate) > 1 or color_candidate.lower() not in 'bgrcmykw':
-                                        parsed_color = color_candidate
-                                        if sm_suffix in ['-', '--', '-.', ':']:
-                                            parsed_linestyle = sm_suffix
-                                        else:
-                                            parsed_marker = sm_suffix
-                                        is_complex_spec = True
-                                        break 
-                        if not is_complex_spec and is_color_like(style_spec) and (len(style_spec) > 1 or style_spec.lower() not in 'bgrcmykw.'):
-
-                            pass # Let it be handled by the else block for direct fmt string.
-
-                    if is_complex_spec:
-                        if parsed_color: plot_kwargs['color'] = parsed_color
-                        if parsed_linestyle: plot_kwargs['linestyle'] = parsed_linestyle
-                        if parsed_marker: plot_kwargs['marker'] = parsed_marker
-                        ax.plot(*plot_args, **plot_kwargs)
-                    else:
-                        # Pass style_spec as is (e.g., 'b-', 'g-', 'red', 'o').
-                        # Matplotlib handles valid format strings or color names here.
+                    # Validate with is_color_like only for plain color names (no format chars)
+                    # Format chars are: linestyles (-:.) and markers (ovs^<>ph*H+xDd,)
+                    has_linestyle = any(style_spec.endswith(ls) for ls in ['-', '--', '-.', ':'])
+                    has_marker = len(style_spec) <= 2 and any(c in style_spec for c in 'ovs^<>ph*H+xDd,.')
+                    
+                    if style_spec and not has_linestyle and not has_marker:
+                        # Plain color name validation
+                        if not is_color_like(style_spec):
+                            logging.warning(f"Invalid color specification '{style_spec}', using default")
+                            style_spec = None
+                    
+                    # Pass directly to matplotlib's native format string handling
+                    if style_spec:
                         ax.plot(*plot_args, style_spec, **plot_kwargs)
+                    else:
+                        ax.plot(*plot_args, **plot_kwargs)
 
                     if 'val' in key and self.history[key]: # Ensure list is not empty
                         current_metric_values = np.array(self.history[key])
@@ -765,11 +803,19 @@ class WeatherLSTM(nn.Module):
 
 
     def save(self, path: str):
-        # ... (save logic as in previous version, using self.params) ...
         try:
+            # Convert dataclass to dict to avoid module path serialization issues
+            model_params_dict = {
+                'input_dim': self.params.input_dim,
+                'hidden_dim': self.params.hidden_dim,
+                'num_layers': self.params.num_layers,
+                'output_dim': self.params.output_dim,
+                'dropout_prob': self.params.dropout_prob
+            }
+            
             save_content = {
                 'model_state_dict': self.state_dict(),
-                'model_params': self.params, 
+                'model_params': model_params_dict, 
                 'history': self.history, 
                 'transform_info': self.transform_info
             }
@@ -782,34 +828,67 @@ class WeatherLSTM(nn.Module):
     @classmethod
     def load(cls, path: str, device: str = "cpu") -> 'WeatherLSTM':
         try:
-            # MODIFIED LINE: Added weights_only=False
-            checkpoint = torch.load(path, map_location=device, weights_only=False) 
+            # Try loading with weights_only=False first (for backward compatibility)
+            try:
+                checkpoint = torch.load(path, map_location=device, weights_only=False)
+            except Exception as e:
+                # If that fails, try with weights_only=True and add safe globals
+                import torch.serialization
+                import numpy as np
+                # Add comprehensive list of NumPy types that might be in the saved model
+                safe_globals = [
+                    ModelHyperparameters, 
+                    np.core.multiarray.scalar,
+                    np.dtype,
+                    np.ndarray,
+                    np.core.multiarray._reconstruct
+                ]
+                
+
+                
+                # Add specific dtype classes for newer NumPy versions
+                try:
+                    safe_globals.extend([
+                        np.dtypes.Float64DType,
+                        np.dtypes.Float32DType,
+                        np.dtypes.Int64DType,
+                        np.dtypes.Int32DType,
+                        np.dtypes.BoolDType
+                    ])
+                except AttributeError:
+                    # Older NumPy versions don't have these specific classes
+                    pass
+                
+                # Add scikit-learn transformers that might be in the saved model
+                try:
+                    from sklearn.preprocessing import PowerTransformer, StandardScaler, MinMaxScaler
+                    safe_globals.extend([
+                        PowerTransformer,
+                        StandardScaler,
+                        MinMaxScaler
+                    ])
+                except ImportError:
+                    # scikit-learn might not be available
+                    pass
+                
+                torch.serialization.add_safe_globals(safe_globals)
+                checkpoint = torch.load(path, map_location=device, weights_only=True)
             
             model_params = checkpoint['model_params']
-            if not isinstance(model_params, ModelHyperparameters):
-                 # If it was saved as dict from an older version, recreate dataclass
-                 model_params = ModelHyperparameters(**model_params) 
+            if not isinstance(model_params, ModelHyperparameters): 
+                model_params = ModelHyperparameters(**model_params) 
             
             model = cls(model_params=model_params)
             model.load_state_dict(checkpoint['model_state_dict'])
             # Ensure history keys exist if loading older models; provide default empty lists
-            default_history = {key: [] for key in model.history_template_keys} # Assuming you add a class attr like history_template_keys = ['epochs', 'train_loss', ...]
+            default_history = {key: [] for key in model.history_template_keys}
             model.history = checkpoint.get('history', default_history) 
             model.transform_info = checkpoint.get('transform_info')
             model.to(device)
-            logging.info(f"LSTM Model loaded from {path} with weights_only=False.")
+            logging.info(f"LSTM Model loaded from {path}")
             return model
-        except Exception as e:
-            logging.error(f"Failed to load LSTM model from {path}: {e}", exc_info=True)
-            # Add the specific error message for unsupported globals if that's the case
-            if "Unsupported global" in str(e):
-                logging.error(
-                    "This might be due to custom classes (like ModelHyperparameters) in the checkpoint. "
-                    "Ensure these classes are defined in the scope where load is called. "
-                    "If using PyTorch 1.13+ and weights_only=True is implicitly active, "
-                    "consider using weights_only=False (if you trust the source) "
-                    "or torch.serialization.add_safe_globals."
-                )
+        except Exception as e: 
+            logging.error(f"Failed to load LSTM model: {e}")
             raise
     
     def enable_mc_dropout(self):
@@ -930,8 +1009,9 @@ class WeatherLSTM(nn.Module):
             plot_max_y_vals = [upper_val] + ([y_true_original_np[sample_idx_in_batch]] if y_true_original_np is not None and sample_idx_in_batch < len(y_true_original_np) else [])
             plot_min_y = min(plot_min_y_vals) if plot_min_y_vals else 0
             plot_max_y = max(plot_max_y_vals) if plot_max_y_vals else 1 # Default if empty
+            config = get_config()
             padding = 0.2*(plot_max_y-plot_min_y) if (plot_max_y-plot_min_y)>1e-6 else 1.0
-            ax.set_ylim([max(DataProcessingConfig.MIN_RADIATION_CLIP, plot_min_y - padding), plot_max_y + padding]) 
+            ax.set_ylim([max(config.data.min_radiation_clip, plot_min_y - padding), plot_max_y + padding])
             ax.set_xticks([]); ax.set_ylabel("GHI (Original Scale)",fontsize=9)
             if i==0: ax.legend(fontsize=8,loc='best')
         

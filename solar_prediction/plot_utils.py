@@ -1,5 +1,5 @@
 def create_evaluation_dashboard(predictions, actuals, scalers, target_col, 
-                           timestamps, figsize=(15, 15), resample_freq='1min'):
+                           timestamps, figsize=None, resample_freq=None, outlier_threshold=None, mape_epsilon=None):
     """
     Create a comprehensive evaluation dashboard for time series predictions
     
@@ -9,9 +9,10 @@ def create_evaluation_dashboard(predictions, actuals, scalers, target_col,
         scalers: Dictionary of scalers used to normalize each feature (optional)
         target_col: Name of the target column for inverse scaling (optional)
         timestamps: Array of timestamps for x-axis if available (optional)
-        figsize: Size of the figure (width, height)
-        resample_freq: Frequency for resampling time series data (e.g., '1min', '1H', '1D')
-                      Set to None to disable resampling
+        figsize: Size of the figure (width, height). If None, uses config default.
+        resample_freq: Frequency for resampling time series data. If None, uses config default.
+        outlier_threshold: Threshold for outlier detection. If None, uses config default.
+        mape_epsilon: Epsilon for MAPE calculation. If None, uses config default.
     
     Returns:
         matplotlib.figure.Figure: The dashboard figure
@@ -21,6 +22,24 @@ def create_evaluation_dashboard(predictions, actuals, scalers, target_col,
     import pandas as pd
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     from datetime import datetime
+    
+    # Import centralized configuration
+    from .config import get_config
+    
+    # Use centralized configuration for defaults
+    config = get_config()
+    plot_config = config.plotting
+    eval_config = config.evaluation
+    
+    # Apply defaults from config if not provided
+    if figsize is None:
+        figsize = (plot_config.dashboard_width, plot_config.dashboard_height)
+    if resample_freq is None:
+        resample_freq = plot_config.resample_frequency
+    if outlier_threshold is None:
+        outlier_threshold = eval_config.outlier_std_threshold
+    if mape_epsilon is None:
+        mape_epsilon = eval_config.mape_epsilon
     
     # Ensure predictions and actuals are flattened
     predictions = predictions.flatten()
@@ -36,9 +55,13 @@ def create_evaluation_dashboard(predictions, actuals, scalers, target_col,
     errors = actuals - predictions
     rmse = np.sqrt(mean_squared_error(actuals, predictions))
     mae = mean_absolute_error(actuals, predictions)
-    # Handle potential division by zero in MAPE calculation
+    # Handle potential division by zero in MAPE calculation using config epsilon
     with np.errstate(divide='ignore', invalid='ignore'):
-        mape = np.mean(np.abs(errors / actuals)) * 100  # Mean Absolute Percentage Error
+        mape_errors = np.abs(errors / np.maximum(np.abs(actuals), mape_epsilon)) * 100
+        # Apply MAPE clipping if configured
+        if eval_config.mape_clip_value > 0:
+            mape_errors = np.clip(mape_errors, 0, eval_config.mape_clip_value * 100)
+        mape = np.mean(mape_errors)
         mape = np.nan_to_num(mape)  # Replace NaN with 0
     r2 = r2_score(actuals, predictions)
     
@@ -170,7 +193,6 @@ def create_evaluation_dashboard(predictions, actuals, scalers, target_col,
     # Calculate z-scores for coloring
     from scipy import stats
     z_scores = np.abs(stats.zscore(errors_resampled))
-    outlier_threshold = 2
     
     # Create a colormap
     cm = plt.cm.RdYlGn_r

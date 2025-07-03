@@ -1,8 +1,8 @@
 
 __pycache__/
-
+*.env
 *.csv
-
+*venv
 *.png
 
 .ipynb_checkpoints
@@ -15,5 +15,10 @@ n.md
 
 .vscode
 
+*.log
+*venv_test/
 
 
+.github/
+.vscode/
+.pytest_cache/

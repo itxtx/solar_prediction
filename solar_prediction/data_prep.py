@@ -7,85 +7,14 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import List, Dict, Tuple, Optional, Any
 
+# Import centralized configuration
+from .config import get_config, DataInputConfig, DataTransformationConfig as TransformationConfig, FeatureEngineeringConfig, ScalingConfig, SequenceConfig
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Configuration Dataclasses ---
-@dataclass
-class DataInputConfig:
-    """Configuration for input data properties."""
-    target_col_original_name: str # Original name of the target column in the input df
-    # Common column names that might be present in input dataframes
-    common_temp_col: str = 'temp'
-    common_pressure_col: str = 'pressure'
-    common_humidity_col: str = 'humidity'
-    common_wind_speed_col: str = 'wind_speed'
-    common_ghi_col: str = 'GHI'
-    time_col: str = 'Time' # Expected primary timestamp column
-    unix_time_col: str = 'UNIXTime' # Fallback timestamp column
-    sunrise_col: str = 'TimeSunRise'
-    sunset_col: str = 'TimeSunSet'
-    hour_col_raw: str = 'hour' # Raw hour column from input if available
-    month_col_raw: str = 'month' # Raw month column from input if available
-    daylength_col_raw: str = 'dayLength'
-    is_sun_col_raw: str = 'isSun'
-    sunlight_time_daylength_ratio_raw: str = 'SunlightTime/daylength'
-    # Add other potential raw column names here
-
-@dataclass
-class TransformationConfig:
-    """Configuration for data transformations."""
-    use_log_transform: bool = False
-    use_power_transform: bool = False # Yeo-Johnson
-    use_piecewise_transform_target: bool = False # For GHI/Radiation target
-    
-    min_target_threshold_initial: Optional[float] = None # Initial floor for original target
-    clip_original_target_before_power_transform: bool = False
-    original_target_clip_lower_percentile: float = 5.0
-    original_target_clip_upper_percentile: float = 95.0
-    
-    # Floor for radiation before power transform (applied if target is radiation-like)
-    min_radiation_floor_before_power_transform: float = 0.0 
-    
-    # For log transform specifically (often for GHI/Radiation)
-    min_radiation_for_log: float = 0.1 # Floor before log(GHI)
-    log_transform_offset: float = 1e-6 # Epsilon for log(x + epsilon)
-    clip_log_transformed_target: bool = False
-    log_clip_lower_percentile: float = 1.0
-    log_clip_upper_percentile: float = 99.0
-
-    # Piecewise transform constants (if use_piecewise_transform_target is True)
-    PIECEWISE_NIGHT_THRESHOLD: float = 10.0
-    PIECEWISE_MODERATE_THRESHOLD: float = 200.0
-    # Coefficients for piecewise, can be tuned or made configurable
-    PIECEWISE_MODERATE_SLOPE: float = 0.05
-    PIECEWISE_HIGH_SLOPE: float = 0.002
-
-
-@dataclass
-class FeatureEngineeringConfig:
-    """Configuration for feature engineering."""
-    use_solar_elevation_proxy: bool = True
-    create_low_target_indicator: bool = True # e.g., GHI_is_low
-    low_target_indicator_quantile: float = 0.1
-    feature_selection_mode: str = 'all'  # 'all', 'basic', 'minimal'
-    # Define explicit feature sets for different modes (using standardized names)
-    minimal_features: List[str] = field(default_factory=lambda: ['Radiation', 'Temperature', 'Humidity', 'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover'])
-    basic_features: List[str] = field(default_factory=lambda: ['Radiation', 'Temperature', 'Pressure', 'Humidity', 'WindSpeed', 'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover', 'Rain'])
-    # 'all' mode will try to use all available standardized + engineered features.
-
-@dataclass
-class ScalingConfig:
-    """Configuration for data scaling."""
-    standardize_features: bool = True # True for StandardScaler, False for MinMaxScaler
-    # Target scaler choice might depend on transformations (e.g., PowerTransform often followed by StandardScaler)
-
-@dataclass
-class SequenceConfig:
-    """Configuration for creating sequences."""
-    window_size: int = 12
-    test_size: float = 0.2
-    val_size_from_train_val: float = 0.25 # Validation size as a fraction of (train+val) data
+# Configuration classes are now imported from centralized config module
+# Legacy dataclasses are deprecated - use centralized config instead
 
 # --- Standardized Column Names (Internal) ---
 # These are the names the rest of the functions will expect after initial mapping.
@@ -282,7 +211,9 @@ def _engineer_time_features(df: pd.DataFrame, feature_cfg: FeatureEngineeringCon
     df[STD_HOUR_OF_DAY] = df[STD_TIME_COL].dt.hour
     df[STD_MONTH] = df[STD_TIME_COL].dt.month
     
-    minutes_in_day = 24 * 60
+    # Use centralized configuration for time constants
+    config = get_config()
+    minutes_in_day = config.features.minutes_in_day
     current_time_minutes = df[STD_TIME_COL].dt.hour * 60 + df[STD_TIME_COL].dt.minute + df[STD_TIME_COL].dt.second / 60.0
     df[STD_TIME_MINUTES_SIN] = np.sin(2 * np.pi * current_time_minutes / minutes_in_day)
     df[STD_TIME_MINUTES_COS] = np.cos(2 * np.pi * current_time_minutes / minutes_in_day)
@@ -367,27 +298,27 @@ def _apply_target_transformations(
         radiation_values = df[current_target_col].values.astype(float)
         transformed = np.zeros_like(radiation_values)
         
-        night_mask = radiation_values < cfg.PIECEWISE_NIGHT_THRESHOLD
+        night_mask = radiation_values < cfg.piecewise_night_threshold
         transformed[night_mask] = np.log1p(radiation_values[night_mask]) 
         
-        moderate_mask = (radiation_values >= cfg.PIECEWISE_NIGHT_THRESHOLD) & \
-                        (radiation_values < cfg.PIECEWISE_MODERATE_THRESHOLD)
-        # Value at the end of night_mask (just before PIECEWISE_NIGHT_THRESHOLD)
-        val_at_night_thresh_end = np.log1p(cfg.PIECEWISE_NIGHT_THRESHOLD - 1e-6) # Approx
+        moderate_mask = (radiation_values >= cfg.piecewise_night_threshold) & \
+                        (radiation_values < cfg.piecewise_moderate_threshold)
+        # Value at the end of night_mask (just before piecewise_night_threshold)
+        val_at_night_thresh_end = np.log1p(cfg.piecewise_night_threshold - 1e-6) # Approx
         transformed[moderate_mask] = val_at_night_thresh_end + \
-                                     cfg.PIECEWISE_MODERATE_SLOPE * (radiation_values[moderate_mask] - cfg.PIECEWISE_NIGHT_THRESHOLD)
+                                     cfg.piecewise_moderate_slope * (radiation_values[moderate_mask] - cfg.piecewise_night_threshold)
         
-        high_mask = radiation_values >= cfg.PIECEWISE_MODERATE_THRESHOLD
+        high_mask = radiation_values >= cfg.piecewise_moderate_threshold
         # Value at the end of moderate_mask
         val_at_moderate_thresh_end = val_at_night_thresh_end + \
-                                     cfg.PIECEWISE_MODERATE_SLOPE * (cfg.PIECEWISE_MODERATE_THRESHOLD - cfg.PIECEWISE_NIGHT_THRESHOLD -1e-6)
+                                     cfg.piecewise_moderate_slope * (cfg.piecewise_moderate_threshold - cfg.piecewise_night_threshold -1e-6)
         transformed[high_mask] = val_at_moderate_thresh_end + \
-                                 cfg.PIECEWISE_HIGH_SLOPE * (radiation_values[high_mask] - cfg.PIECEWISE_MODERATE_THRESHOLD)
+                                 cfg.piecewise_high_slope * (radiation_values[high_mask] - cfg.piecewise_moderate_threshold)
 
         df[new_col_name] = transformed
         applied_transforms_log.append({'type': 'piecewise', 'original_col': current_target_col, 'new_col': new_col_name, 'applied': True,
-                                       'params': {'night_thresh': cfg.PIECEWISE_NIGHT_THRESHOLD, 
-                                                  'moderate_thresh': cfg.PIECEWISE_MODERATE_THRESHOLD}})
+                                       'params': {'night_thresh': cfg.piecewise_night_threshold, 
+                                                  'moderate_thresh': cfg.piecewise_moderate_threshold}})
         current_target_col = new_col_name
 
     # 2. Power Transform (Yeo-Johnson) OR Log Transform (mutually exclusive)

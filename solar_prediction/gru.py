@@ -14,16 +14,37 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Union
 
+# Import centralized configuration
+from .config import get_config
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Configuration for data processing (shared with LSTM or can be defined here if specific)
-class DataProcessingConfig:
-    MAX_EXP_INPUT: float = 700.0
-    MIN_RADIATION_CLIP: float = 0.0
-    MAX_RADIATION_CLIP: float = 2000.0
+# Use centralized configuration for data processing constants
+# Legacy DataProcessingConfig class is deprecated - use get_config().data instead
+
+# Use centralized configuration for GRU model hyperparameters
+# GRUModelHyperparameters dataclass is deprecated - create from config instead
+def create_gru_model_hyperparameters_from_config(input_dim: int, config_override: Optional[dict] = None) -> 'GRUModelHyperparameters':
+    """Create GRUModelHyperparameters from centralized config with optional overrides."""
+    config = get_config()
+    gru_config = config.models.gru
+    
+    params = {
+        'input_dim': input_dim,
+        'hidden_dim': gru_config.hidden_dim,
+        'num_layers': gru_config.num_layers,
+        'output_dim': gru_config.output_dim,
+        'dropout_prob': gru_config.dropout_prob,
+        'bidirectional': gru_config.bidirectional
+    }
+    
+    if config_override:
+        params.update(config_override)
+    
+    return GRUModelHyperparameters(**params)
 
 @dataclass
 class GRUModelHyperparameters: # Specific to GRU
@@ -37,6 +58,32 @@ class GRUModelHyperparameters: # Specific to GRU
     def __post_init__(self):
         if not (0 <= self.dropout_prob <= 1):
             raise ValueError("dropout_prob must be between 0 and 1")
+
+# Use centralized configuration for GRU training parameters
+# TrainingConfig dataclass is deprecated - create from config instead
+def create_gru_training_config_from_config(config_override: Optional[dict] = None) -> 'TrainingConfig':
+    """Create TrainingConfig from centralized config with optional overrides."""
+    config = get_config()
+    gru_config = config.models.gru
+    
+    params = {
+        'epochs': gru_config.epochs,
+        'batch_size': gru_config.batch_size,
+        'learning_rate': gru_config.learning_rate,
+        'patience': gru_config.patience,
+        'factor': gru_config.lr_scheduler_factor,
+        'min_lr': gru_config.min_lr,
+        'weight_decay': gru_config.weight_decay,
+        'clip_grad_norm': gru_config.clip_grad_norm,
+        'scheduler_type': gru_config.scheduler_type,
+        'T_max_cosine': gru_config.t_max_cosine,
+        'loss_type': gru_config.loss_type
+    }
+    
+    if config_override:
+        params.update(config_override)
+    
+    return TrainingConfig(**params)
 
 @dataclass
 class TrainingConfig: 
@@ -163,8 +210,10 @@ class WeatherGRU(nn.Module):
             
             val_preds = np.vstack(val_outputs_all); val_acts = np.vstack(val_targets_all)
             val_rmse = np.sqrt(mean_squared_error(val_acts, val_preds)); val_r2 = r2_score(val_acts, val_preds)
-            val_mae = mean_absolute_error(val_acts, val_preds); epsilon_mape = 1e-8 
-            val_mape_cap = np.mean(np.clip(np.abs((val_acts - val_preds) / (np.abs(val_acts) + epsilon_mape)), 0, 1.0)) * 100 
+            val_mae = mean_absolute_error(val_acts, val_preds)
+            config = get_config()
+            epsilon_mape = config.evaluation.mape_epsilon
+            val_mape_cap = np.mean(np.clip(np.abs((val_acts - val_preds) / (np.abs(val_acts) + epsilon_mape)), 0, config.evaluation.mape_clip_value)) * 100
 
             self.history['epochs'].append(epoch + 1); self.history['train_loss'].append(train_loss_epoch)
             self.history['val_loss'].append(val_loss_epoch); self.history['val_rmse'].append(val_rmse)
@@ -220,8 +269,9 @@ class WeatherGRU(nn.Module):
                 t_type = t_details.get('type')
                 logging.info(f"GRU Applying inverse structural transform: {t_type} for {target_col_orig_name}")
                 if t_type == 'log':
+                    config = get_config()
                     offset = t_details.get('offset', 0)
-                    exp_input = np.clip(y_proc, -DataProcessingConfig.MAX_EXP_INPUT, DataProcessingConfig.MAX_EXP_INPUT)
+                    exp_input = np.clip(y_proc, -config.data.max_exp_input, config.data.max_exp_input)
                     y_proc = np.exp(exp_input)
                     if offset > 0: y_proc -= offset
                 elif t_type == 'yeo-johnson':
@@ -238,7 +288,8 @@ class WeatherGRU(nn.Module):
     def _apply_domain_clipping(self, y: np.ndarray, transform_info: Dict) -> np.ndarray:
         y_proc = y
         if transform_info and transform_info.get('target_col_original') == 'Radiation':
-            y_proc = np.clip(y, DataProcessingConfig.MIN_RADIATION_CLIP, DataProcessingConfig.MAX_RADIATION_CLIP)
+            config = get_config()
+            y_proc = np.clip(y, config.data.min_radiation_clip, config.data.max_radiation_clip)
         return y_proc
 
     def _inverse_transform_target(self, y: np.ndarray, target_scaler: Any, 
@@ -250,43 +301,247 @@ class WeatherGRU(nn.Module):
         return y_final_1d
         
     def evaluate(self, X_test_data: np.ndarray, y_test_data: np.ndarray, device: str = "cpu", 
-                 target_scaler_object: Optional[Any] = None, 
-                 transform_info_dict: Optional[Dict] = None, 
-                 scalers_dict: Optional[Dict] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
-        self.eval(); self.to(device)
-        actuals_s_np = np.asarray(y_test_data).flatten()
-        inputs_t = torch.FloatTensor(X_test_data).to(device)
-        preds_s_np: Optional[np.ndarray] = None
-        with torch.no_grad(): preds_s_np = self(inputs_t).cpu().numpy().flatten()
+                target_scaler_object: Optional[Any] = None, 
+                transform_info_dict: Optional[Dict] = None, 
+                scalers_dict: Optional[Dict] = None,
+                batch_size: int = 256,
+                return_predictions: bool = True,
+                plot_results: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict]:
+        """
+        Evaluate model with improved memory efficiency.
+        
+        Args:
+            X_test_data: Test data features
+            y_test_data: Test data targets
+            device: Device to run on
+            target_scaler_object: Scaler object for target variable
+            transform_info_dict: Dictionary containing transformation information
+            scalers_dict: Dictionary containing scaler objects
+            batch_size: Process data in batches to reduce memory usage
+            return_predictions: If False, only return metrics (saves memory)
+            plot_results: If True, generate residual and prediction plots
+        """
+        self.eval()
+        self.to(device)
+        
+        # Create data loader for batch processing
+        test_dataset = TensorDataset(torch.FloatTensor(X_test_data), torch.FloatTensor(y_test_data))
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        
+        # Initialize accumulators for metrics computation
+        n_samples = 0
+        sum_squared_error = 0.0
+        sum_absolute_error = 0.0
+        sum_actuals = 0.0
+        sum_actuals_squared = 0.0
+        sum_predictions = 0.0
+        sum_pred_actual = 0.0
+        
+        # For MAPE calculation
+        sum_percentage_error = 0.0
+        epsilon_mape = 1e-8
+        
+        # Optional: collect predictions if needed
+        if return_predictions:
+            all_predictions_scaled = []
+            all_actuals_scaled = []
+        
+        # Process in batches
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                predictions = self(inputs)
+                
+                # Move to CPU and convert to numpy
+                pred_batch = predictions.cpu().numpy()
+                actual_batch = targets.cpu().numpy()
+                
+                # Update running statistics for scaled metrics
+                batch_size_actual = pred_batch.shape[0]
+                n_samples += batch_size_actual
+                
+                # For MSE and MAE
+                sum_squared_error += np.sum((actual_batch - pred_batch) ** 2)
+                sum_absolute_error += np.sum(np.abs(actual_batch - pred_batch))
+                
+                # For R²
+                sum_actuals += np.sum(actual_batch)
+                sum_actuals_squared += np.sum(actual_batch ** 2)
+                sum_predictions += np.sum(pred_batch)
+                sum_pred_actual += np.sum(pred_batch * actual_batch)
+                
+                # For MAPE
+                config = get_config()
+                abs_percentage_error = np.abs((actual_batch - pred_batch) / (np.abs(actual_batch) + config.evaluation.mape_epsilon))
+                sum_percentage_error += np.sum(np.clip(abs_percentage_error, 0, config.evaluation.mape_clip_value))
+                
+                # Collect predictions if requested
+                if return_predictions:
+                    all_predictions_scaled.append(pred_batch)
+                    all_actuals_scaled.append(actual_batch)
+        
+        # Calculate scaled metrics from accumulated statistics
+        mse_scaled = sum_squared_error / n_samples
+        rmse_scaled = np.sqrt(mse_scaled)
+        mae_scaled = sum_absolute_error / n_samples
+        mape_scaled_capped = (sum_percentage_error / n_samples) * 100
+        
+        # Calculate R² using accumulated statistics
+        mean_actual = sum_actuals / n_samples
+        ss_tot = sum_actuals_squared - n_samples * mean_actual ** 2
+        ss_res = sum_squared_error
+        r2_scaled = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
         
         logging.info("\n--- GRU Scaled Metrics ---")
-        # ... (scaled metrics calculation as before) ...
-        mse_s = mean_squared_error(actuals_s_np, preds_s_np)
-        rmse_s = np.sqrt(mse_s); r2_s = r2_score(actuals_s_np, preds_s_np)
-        mae_s = mean_absolute_error(actuals_s_np, preds_s_np); eps_mape = 1e-8
-        mape_s_cap = np.mean(np.clip(np.abs((actuals_s_np - preds_s_np) / (np.abs(actuals_s_np) + eps_mape)), 0, 1.0)) * 100
-        logging.info(f"RMSE (scaled): {rmse_s:.4f}, R² (scaled): {r2_s:.4f}, MAE (scaled): {mae_s:.4f}, Capped MAPE (scaled): {mape_s_cap:.2f}%")
-
-        preds_orig, actuals_orig = None, None
-        orig_metrics: Dict[str, float] = {'rmse': np.nan, 'r2': np.nan, 'mae': np.nan, 'mape_capped': np.nan}
-        if target_scaler_object and transform_info_dict:
+        logging.info(f"RMSE (scaled): {rmse_scaled:.4f}, R² (scaled): {r2_scaled:.4f}, "
+                    f"MAE (scaled): {mae_scaled:.4f}, Capped MAPE (scaled): {mape_scaled_capped:.2f}%")
+        
+        # Process original scale metrics if scaler provided
+        predictions_original_scale, actuals_original_scale = None, None
+        original_metrics: Dict[str, float] = {'rmse': np.nan, 'r2': np.nan, 'mae': np.nan, 'mape_capped': np.nan}
+        
+        if target_scaler_object and transform_info_dict and return_predictions:
             logging.info("\n--- GRU Original Scale Metrics ---")
             try:
-                preds_s_2d = preds_s_np.reshape(-1, 1); actuals_s_2d = actuals_s_np.reshape(-1, 1)
-                preds_orig = self._inverse_transform_target(preds_s_2d, target_scaler_object, transform_info_dict, scalers_dict).flatten()
-                actuals_orig = self._inverse_transform_target(actuals_s_2d, target_scaler_object, transform_info_dict, scalers_dict).flatten()
-                # ... (original metrics calculation as before) ...
-                if not (np.isnan(preds_orig).any() or np.isnan(actuals_orig).any()):
-                    if len(preds_orig) > 0 and len(actuals_orig) > 0 and len(preds_orig) == len(actuals_orig):
-                        rmse_o = np.sqrt(mean_squared_error(actuals_orig, preds_orig)); r2_o = r2_score(actuals_orig, preds_orig)
-                        mae_o = mean_absolute_error(actuals_orig, preds_orig)
-                        mape_o_cap = np.mean(np.clip(np.abs((actuals_orig - preds_orig) / (np.abs(actuals_orig) + eps_mape)), 0, 1.0)) * 100
-                        logging.info(f"RMSE (original): {rmse_o:.4f}, R² (original): {r2_o:.4f}, MAE (original): {mae_o:.4f}, Capped MAPE (original): {mape_o_cap:.2f}%")
-                        orig_metrics = {'rmse': rmse_o, 'r2': r2_o, 'mae': mae_o, 'mape_capped': mape_o_cap}
-            except Exception as e: logging.error(f"Error in GRU original scale metrics: {e}")
+                # Concatenate all predictions and actuals
+                model_predictions_scaled_np = np.vstack(all_predictions_scaled)
+                actuals_scaled_np = np.vstack(all_actuals_scaled)
+                
+                # Process in batches for inverse transform to save memory
+                predictions_original_list = []
+                actuals_original_list = []
+                
+                inverse_batch_size = min(1000, n_samples)  # Process inverse transform in smaller batches
+                
+                for i in range(0, n_samples, inverse_batch_size):
+                    end_idx = min(i + inverse_batch_size, n_samples)
+                    
+                    # Inverse transform predictions batch
+                    pred_batch = model_predictions_scaled_np[i:end_idx]
+                    pred_original_batch = self._inverse_transform_target(
+                        pred_batch, target_scaler_object, transform_info_dict, scalers_dict
+                    ).flatten()
+                    predictions_original_list.append(pred_original_batch)
+                    
+                    # Inverse transform actuals batch
+                    actual_batch = actuals_scaled_np[i:end_idx]
+                    actual_original_batch = self._inverse_transform_target(
+                        actual_batch, target_scaler_object, transform_info_dict, scalers_dict
+                    ).flatten()
+                    actuals_original_list.append(actual_original_batch)
+                
+                predictions_original_scale = np.concatenate(predictions_original_list)
+                actuals_original_scale = np.concatenate(actuals_original_list)
+                
+                # Calculate original scale metrics
+                if not (np.isnan(predictions_original_scale).any() or np.isnan(actuals_original_scale).any()):
+                    rmse_orig = np.sqrt(mean_squared_error(actuals_original_scale, predictions_original_scale))
+                    r2_orig = r2_score(actuals_original_scale, predictions_original_scale)
+                    mae_orig = mean_absolute_error(actuals_original_scale, predictions_original_scale)
+                    config = get_config()
+                    mape_orig_capped = np.mean(np.clip(
+                        np.abs((actuals_original_scale - predictions_original_scale) / 
+                            (np.abs(actuals_original_scale) + config.evaluation.mape_epsilon)), 0, config.evaluation.mape_clip_value)) * 100
+                    
+                    logging.info(f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, "
+                                f"MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%")
+                    
+                    original_metrics = {
+                        'rmse': rmse_orig, 
+                        'r2': r2_orig, 
+                        'mae': mae_orig, 
+                        'mape_capped': mape_orig_capped
+                    }
+                    
+                    # Generate plots if requested
+                    if plot_results:
+                        self._generate_evaluation_plots(predictions_original_scale, actuals_original_scale)
+                        
+            except Exception as e:
+                logging.error(f"Error in original scale metrics calculation: {e}")
         
-        all_metrics = {'scaled_rmse': rmse_s, 'scaled_r2': r2_s, 'scaled_mae': mae_s, 'scaled_mape_capped': mape_s_cap, **orig_metrics}
-        return (preds_s_np, actuals_s_np, preds_orig, actuals_orig, all_metrics)
+        # Prepare return values
+        all_metrics = {
+            'scaled_rmse': rmse_scaled,
+            'scaled_r2': r2_scaled,
+            'scaled_mae': mae_scaled,
+            'scaled_mape_capped': mape_scaled_capped,
+            **original_metrics
+        }
+        
+        if return_predictions:
+            model_predictions_scaled_np = np.vstack(all_predictions_scaled).flatten()
+            actuals_scaled_np = np.vstack(all_actuals_scaled).flatten()
+        else:
+            model_predictions_scaled_np = None
+            actuals_scaled_np = None
+        
+        return (model_predictions_scaled_np, actuals_scaled_np, 
+                predictions_original_scale, actuals_original_scale, all_metrics)
+
+    def _generate_evaluation_plots(self, original_preds: np.ndarray, original_actuals: np.ndarray):
+        """Generate residual and prediction vs actual plots."""
+        logging.info("Generating residual and prediction vs. actual plots for original scale data...")
+        
+        # Calculate residuals in the original scale
+        residuals_original = original_actuals.flatten() - original_preds.flatten()
+        mean_residuals_original = np.mean(residuals_original)
+        std_residuals_original = np.std(residuals_original)
+        
+        # --- 1. Frequency of Residuals (Histogram) in Original Scale ---
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals_original, bins=50, alpha=0.7, color='skyblue', 
+                edgecolor='black', density=True)
+        plt.axvline(mean_residuals_original, color='red', linestyle='dashed', 
+                    linewidth=2, label=f'Mean Residual: {mean_residuals_original:.2f}')
+        plt.title('Frequency of Residuals (Original Scale)', fontsize=16)
+        plt.xlabel(f'Residual (Actual Value - Predicted Value) in original units', fontsize=12)
+        plt.ylabel('Density', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(axis='y', alpha=0.75)
+        plt.text(0.95, 0.90, f'Std Dev of Residuals: {std_residuals_original:.2f}', 
+                horizontalalignment='right', verticalalignment='top', 
+                transform=plt.gca().transAxes, fontsize=10)
+        plt.tight_layout()
+        plt.show()
+        
+        # --- 2. Predictions vs. Actuals in Original Scale ---
+        plt.figure(figsize=(10, 8))
+        
+        # Sample points if dataset is too large to plot efficiently
+        if len(original_actuals) > 10000:
+            sample_indices = np.random.choice(len(original_actuals), 10000, replace=False)
+            plot_actuals = original_actuals[sample_indices]
+            plot_preds = original_preds[sample_indices]
+            logging.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
+        else:
+            plot_actuals = original_actuals
+            plot_preds = original_preds
+        
+        plt.scatter(plot_actuals, plot_preds, alpha=0.5, color='cornflowerblue', 
+                    label='Predicted vs. Actual', s=10)
+        
+        # Determine plot limits for y=x line and observed trend
+        min_val = min(np.min(plot_actuals), np.min(plot_preds))
+        max_val = max(np.max(plot_actuals), np.max(plot_preds))
+        
+        # Ideal line (y=x)
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Ideal (y=x)')
+        
+        # Observed trend line
+        plt.plot([min_val, max_val], 
+                [min_val - mean_residuals_original, max_val - mean_residuals_original], 
+                'g:', lw=2, 
+                label=f'Observed Trend (y = x - {mean_residuals_original:.2f})')
+        
+        plt.title('Predictions vs. Actuals (Original Scale)', fontsize=16)
+        plt.xlabel('Actual Values (Original Units)', fontsize=12)
+        plt.ylabel('Predicted Values (Original Units)', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.5)
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.show()
 
     def _ensure_batched_input(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         if isinstance(X, np.ndarray): X_t = torch.FloatTensor(X)
@@ -320,17 +575,19 @@ class WeatherGRU(nn.Module):
         # ... (Plotting logic similar to LSTM, using self.history) ...
         fig, axes = plt.subplots(4, 2, figsize=figsize); axes = axes.flatten()
         metrics_cfg = [
-            ('Loss', ['train_loss', 'val_loss'], log_scale_loss, ['b-', 'r-']),
-            ('RMSE (Scaled)', ['val_rmse'], False, ['g-']), ('R² (Scaled)', ['val_r2'], False, ['m-']),
-            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['darkorange-']),
-            ('MAE (Scaled)', ['val_mae'], False, ['darkcyan-']), ('Learning Rate', ['lr'], True, ['c-'])
+            ('Loss', ['train_loss', 'val_loss'], log_scale_loss, ['b', 'r']),
+            ('RMSE (Scaled)', ['val_rmse'], False, ['g']), 
+            ('R² (Scaled)', ['val_r2'], False, ['m']),
+            ('Capped MAPE (Scaled, %)', ['val_mape'], False, ['tab:orange']), 
+            ('MAE (Scaled)', ['val_mae'], False, ['tab:cyan']), 
+            ('Learning Rate', ['lr'], True, ['c'])
         ]
         for i, (title, keys, ylog, l_colors) in enumerate(metrics_cfg):
             ax = axes[i]
             for k_idx, key in enumerate(keys):
                 if key in self.history and self.history[key]:
                     lbl = key.replace('_', ' ').title()
-                    ax.plot(self.history['epochs'], self.history[key], l_colors[k_idx], label=lbl)
+                    ax.plot(self.history['epochs'], self.history[key], color=l_colors[k_idx], label=lbl)
                     #if 'val' in key and self.history[key]:
                         #best_idx = np.argmin(self.history[key]) if any(s in key for s in ['loss','rmse','mape','mae']) else np.argmax(self.history[key])
                         #if best_idx < len(self.history['epochs']):
@@ -351,7 +608,17 @@ class WeatherGRU(nn.Module):
 
     def save(self, path: str):
         try:
-            torch.save({'model_state_dict': self.state_dict(), 'model_params': self.params, 
+            # Convert dataclass to dict to avoid module path serialization issues
+            model_params_dict = {
+                'input_dim': self.params.input_dim,
+                'hidden_dim': self.params.hidden_dim,
+                'num_layers': self.params.num_layers,
+                'output_dim': self.params.output_dim,
+                'dropout_prob': self.params.dropout_prob,
+                'bidirectional': self.params.bidirectional
+            }
+            
+            torch.save({'model_state_dict': self.state_dict(), 'model_params': model_params_dict, 
                         'history': self.history, 'transform_info': self.transform_info}, path)
             logging.info(f"GRU Model saved to {path}")
         except Exception as e: logging.error(f"Failed to save GRU model: {e}"); raise
@@ -359,14 +626,64 @@ class WeatherGRU(nn.Module):
     @classmethod
     def load(cls, path: str, device: str = "cpu") -> 'WeatherGRU':
         try:
-            ckpt = torch.load(path, map_location=device); params = ckpt['model_params']
-            if not isinstance(params, GRUModelHyperparameters): params = GRUModelHyperparameters(**params)
+            # Try loading with weights_only=False first (for backward compatibility)
+            try:
+                ckpt = torch.load(path, map_location=device, weights_only=False)
+            except Exception as e:
+                # If that fails, try with weights_only=True and add safe globals
+                import torch.serialization
+                import numpy as np
+                # Add comprehensive list of NumPy types that might be in the saved model
+                safe_globals = [
+                    GRUModelHyperparameters, 
+                    np.core.multiarray.scalar,
+                    np.dtype,
+                    np.ndarray,
+                    np.core.multiarray._reconstruct
+                ]
+                
+                # Add specific dtype classes for newer NumPy versions
+                try:
+                    safe_globals.extend([
+                        np.dtypes.Float64DType,
+                        np.dtypes.Float32DType,
+                        np.dtypes.Int64DType,
+                        np.dtypes.Int32DType,
+                        np.dtypes.BoolDType
+                    ])
+                except AttributeError:
+                    # Older NumPy versions don't have these specific classes
+                    pass
+                
+                # Add scikit-learn transformers that might be in the saved model
+                try:
+                    from sklearn.preprocessing import PowerTransformer, StandardScaler, MinMaxScaler
+                    safe_globals.extend([
+                        PowerTransformer,
+                        StandardScaler,
+                        MinMaxScaler
+                    ])
+                except ImportError:
+                    # scikit-learn might not be available
+                    pass
+                
+                torch.serialization.add_safe_globals(safe_globals)
+                ckpt = torch.load(path, map_location=device, weights_only=True)
+            
+            params = ckpt['model_params']
+            if not isinstance(params, GRUModelHyperparameters): 
+                params = GRUModelHyperparameters(**params)
+            
             model = cls(model_params=params)
             model.load_state_dict(ckpt['model_state_dict'])
             model.history = ckpt.get('history', {key:[] for key in model.history})
             model.transform_info = ckpt.get('transform_info')
-            model.to(device); logging.info(f"GRU Model loaded from {path}"); return model
-        except Exception as e: logging.error(f"Failed to load GRU model: {e}"); raise
+            model.to(device)
+            logging.info(f"GRU Model loaded from {path}")
+            return model
+        except Exception as e: 
+            logging.error(f"Failed to load GRU model: {e}")
+            raise
     
     def enable_mc_dropout(self):
         self._mc_dropout_enabled = True
@@ -428,13 +745,14 @@ class WeatherGRU(nn.Module):
                 y_true_orig = self._inverse_transform_target(y_true_arr.reshape(-1, self.params.output_dim), target_scaler, curr_tf_info, scalers_dict).flatten()
             else: y_true_orig = y_true_arr.flatten()
 
-        if not plot_idxs: logging.info("No valid samples for GRU uncertainty plot."); return plt.figure(figsize=figsize)
+        if len(plot_idxs) == 0:
+            logging.info("No valid samples for GRU uncertainty plot."); return plt.figure(figsize=figsize)
         fig, axs = plt.subplots(len(plot_idxs),1,figsize=figsize,squeeze=False)
         for i, s_idx_batch in enumerate(plot_idxs):
             ax=axs[i,0]; mean=uncertainty_res['mean'][s_idx_batch,0]; low=uncertainty_res['lower_ci'][s_idx_batch,0]; upp=uncertainty_res['upper_ci'][s_idx_batch,0]
             mc_samps_item = uncertainty_res['samples'][:,s_idx_batch,0]
             for j in range(min(10,mc_samples)): ax.plot([0],[mc_samps_item[j]],'o',alpha=0.15,c='gray',ms=3)
-            ax.errorbar([0],[mean],yerr=[[mean-low],[upp-mean]],fmt='o',c='darkorange',ecolor='sandybrown',capsize=5,label=f'{int((1-alpha)*100)}% CI')
+            ax.errorbar([0],[mean],yerr=[[mean-low],[upp-mean]],fmt='o',c='orange',ecolor='sandybrown',capsize=5,label=f'{int((1-alpha)*100)}% CI')
             if y_true_orig is not None and s_idx_batch < len(y_true_orig):
                 act=y_true_orig[s_idx_batch]; ax.plot([0],[act],'ro',label='Actual')
                 err=abs(mean-act); in_ci = low <= act <= upp
@@ -445,7 +763,8 @@ class WeatherGRU(nn.Module):
             min_y_p = min([low] + ([y_true_orig[s_idx_batch]] if y_true_orig is not None and s_idx_batch < len(y_true_orig) else [])); min_y_p = min_y_p if min_y_p is not None else 0
             max_y_p = max([upp] + ([y_true_orig[s_idx_batch]] if y_true_orig is not None and s_idx_batch < len(y_true_orig) else [])); max_y_p = max_y_p if max_y_p is not None else 1
             pad=0.2*(max_y_p-min_y_p) if (max_y_p-min_y_p)>1e-6 else 1.0
-            ax.set_ylim([max(DataProcessingConfig.MIN_RADIATION_CLIP,min_y_p-pad),max_y_p+pad]); ax.set_xticks([]); ax.set_ylabel("GHI (Original)",fontsize=9)
+            config = get_config()
+            ax.set_ylim([max(config.data.min_radiation_clip,min_y_p-pad),max_y_p+pad]); ax.set_xticks([]); ax.set_ylabel("GHI (Original)",fontsize=9)
             if i==0: ax.legend(fontsize=8,loc='best')
         plt.suptitle(f'GRU Preds w {int((1-alpha)*100)}% CI (Original Scale)',fontsize=14,fontweight='bold'); plt.tight_layout(rect=[0,0.03,1,0.95]); return fig
 
