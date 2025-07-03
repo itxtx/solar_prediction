@@ -2,6 +2,7 @@
 
 ### Transition Probability
 The probability of transitioning from state $i$ to state $j$ at a time $t$ that falls into time slice $k$.
+
 $$
 A_{ij}(k) = P(q_{t+1} = j \mid q_t = i, \text{ and time } t \text{ belongs to slice } k)
 $$
