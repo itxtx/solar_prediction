@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+import logging
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -10,6 +11,145 @@ from typing import List, Tuple, Optional, Dict, Any, Union
 
 # Import centralized configuration
 from .config import get_config
+
+
+# =============================================================================
+# Numerical Stability and Logging Helper Functions
+# =============================================================================
+
+def safe_normalise(arr: np.ndarray, axis: int = -1, min_val: float = 1e-300) -> np.ndarray:
+    """
+    Safely normalize an array to ensure probabilities sum to 1.
+    
+    Parameters:
+    -----------
+    arr : np.ndarray
+        Array to normalize
+    axis : int
+        Axis along which to normalize
+    min_val : float
+        Minimum value to use for numerical stability
+        
+    Returns:
+    --------
+    np.ndarray
+        Normalized array
+    """
+    # Ensure minimum values for numerical stability
+    arr_safe = np.maximum(arr, min_val)
+    
+    # Calculate sum along specified axis
+    arr_sum = np.sum(arr_safe, axis=axis, keepdims=True)
+    
+    # Avoid division by zero
+    arr_sum = np.maximum(arr_sum, min_val)
+    
+    # Normalize
+    normalized = arr_safe / arr_sum
+    
+    # Final safety check
+    normalized = np.maximum(normalized, min_val)
+    
+    # Re-normalize to ensure exact sum to 1 after flooring
+    if axis == -1 or axis == arr.ndim - 1:
+        final_sum = np.sum(normalized, axis=axis, keepdims=True)
+        normalized = normalized / np.maximum(final_sum, min_val)
+    
+    return normalized
+
+
+def floor_prob(prob: Union[float, np.ndarray], min_prob: float = 1e-300) -> Union[float, np.ndarray]:
+    """
+    Apply a floor to probabilities to avoid numerical underflow.
+    
+    Parameters:
+    -----------
+    prob : Union[float, np.ndarray]
+        Probability value(s) to floor
+    min_prob : float
+        Minimum probability value
+        
+    Returns:
+    --------
+    Union[float, np.ndarray]
+        Floored probability value(s)
+    """
+    return np.maximum(prob, min_prob)
+
+
+def _get_logger(verbose: bool = False) -> logging.Logger:
+    """
+    Get configured logger for TDMC operations.
+    
+    Parameters:
+    -----------
+    verbose : bool
+        Whether to enable verbose logging
+        
+    Returns:
+    --------
+    logging.Logger
+        Configured logger
+    """
+    logger = logging.getLogger('TDMC')
+    
+    # Only configure if not already configured
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    # Set level based on verbose flag
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    
+    return logger
+
+
+def _fix_eigenvalues(matrix: np.ndarray, min_eigenvalue: float = 1e-9, 
+                     regularization: float = 1e-6, logger: Optional[logging.Logger] = None) -> np.ndarray:
+    """
+    Fix eigenvalues of a matrix to ensure positive definiteness.
+    
+    Parameters:
+    -----------
+    matrix : np.ndarray
+        Matrix to fix (typically covariance matrix)
+    min_eigenvalue : float
+        Minimum eigenvalue threshold
+    regularization : float
+        Regularization to add to diagonal
+    logger : Optional[logging.Logger]
+        Logger for reporting fixes
+        
+    Returns:
+    --------
+    np.ndarray
+        Fixed matrix with positive eigenvalues
+    """
+    try:
+        eigenvals = np.linalg.eigvals(matrix)
+        min_eig = np.min(np.real(eigenvals))
+        
+        if min_eig <= min_eigenvalue:
+            # Add regularization to make positive definite
+            offset = -min_eig + min_eigenvalue + regularization
+            fixed_matrix = matrix + offset * np.eye(matrix.shape[0])
+            
+            if logger:
+                logger.debug(f"Fixed eigenvalues: min_eig={min_eig:.2e}, added offset={offset:.2e}")
+            
+            return fixed_matrix
+        else:
+            # Just add standard regularization
+            return matrix + regularization * np.eye(matrix.shape[0])
+            
+    except Exception as e:
+        if logger:
+            logger.warning(f"Eigenvalue fix failed: {e}, using identity matrix")
+        return np.eye(matrix.shape[0]) * regularization
 
 class SolarTDMC:
     """
@@ -38,19 +178,19 @@ class SolarTDMC:
         self.n_emissions = n_emissions if n_emissions is not None else tdmc_config.n_emissions
         self.time_slices = time_slices if time_slices is not None else tdmc_config.time_slices
 
-        self.transitions = np.zeros((time_slices, n_states, n_states))
-        for t in range(time_slices):
-            self.transitions[t] = np.ones((n_states, n_states)) / n_states
+        self.transitions = np.zeros((self.time_slices, self.n_states, self.n_states))
+        for t in range(self.time_slices):
+            self.transitions[t] = np.ones((self.n_states, self.n_states)) / self.n_states
 
-        self.emission_means = np.zeros((n_states, n_emissions))
-        self.emission_covars = np.zeros((n_states, n_emissions, n_emissions))
-        for s in range(n_states):
-            self.emission_covars[s] = np.eye(n_emissions)
+        self.emission_means = np.zeros((self.n_states, self.n_emissions))
+        self.emission_covars = np.zeros((self.n_states, self.n_emissions, self.n_emissions))
+        for s in range(self.n_states):
+            self.emission_covars[s] = np.eye(self.n_emissions)
 
-        self.initial_probs = np.ones(n_states) / n_states
+        self.initial_probs = np.ones(self.n_states) / self.n_states
         self.scaler = StandardScaler()
         self.trained = False
-        self.state_names: List[str] = [f"State_{i}" for i in range(n_states)]
+        self.state_names: List[str] = [f"State_{i}" for i in range(self.n_states)]
 
     def _preprocess_data(self, X: np.ndarray, 
                          timestamps: Optional[Union[np.ndarray, pd.Series]] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -82,16 +222,43 @@ class SolarTDMC:
         config = get_config()
         tdmc_config = config.models.tdmc
         
+        # Input validation
+        if timestamps is not None and len(X) != len(timestamps):
+            raise ValueError(f"X and timestamps must have the same length. Got X: {len(X)}, timestamps: {len(timestamps)}")
+        if X.shape[1] != self.n_emissions:
+            raise ValueError(f"X has {X.shape[1]} features, but model expects {self.n_emissions} emissions.")
+        
+        # Initialize logger based on config
+        logger = _get_logger(tdmc_config.verbose_logging) if tdmc_config.verbose_logging else None
+        
         # Use centralized config for defaults
         max_iter = max_iter if max_iter is not None else tdmc_config.max_iter
         tol = tol if tol is not None else tdmc_config.tolerance
         
+        if logger:
+            logger.info(f"Starting TDMC fit with {self.n_states} states, {self.n_emissions} emissions")
+            logger.info(f"Training parameters: max_iter={max_iter}, tolerance={tol}")
+        
         X_scaled, time_indices = self._preprocess_data(X, timestamps)
+        
+        if logger:
+            logger.info(f"Data preprocessed: {X_scaled.shape[0]} samples, {X_scaled.shape[1]} features")
+            logger.debug(f"Time indices range: [{np.min(time_indices)}, {np.max(time_indices)}]")
+        
         self._initialize_parameters(X_scaled, time_indices)
-        self._baum_welch_update(X_scaled, time_indices, max_iter, tol)
+        
+        if logger:
+            logger.info("Parameters initialized using K-means clustering")
+        
+        final_log_likelihood = self._baum_welch_update(X_scaled, time_indices, max_iter, tol)
+        
+        if logger:
+            logger.info(f"Training completed with final log-likelihood: {final_log_likelihood:.4f}")
 
         if state_names is not None and len(state_names) == self.n_states:
             self.state_names = state_names
+            if logger:
+                logger.info(f"Updated state names: {self.state_names}")
         
         self.trained = True
         return self
@@ -153,173 +320,203 @@ class SolarTDMC:
 
 
     def _forward_backward(self, X_scaled: np.ndarray, 
-                          time_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                          time_indices: np.ndarray, logger: Optional[logging.Logger] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Perform forward-backward algorithm for the TDMC."""
+        config = get_config()
+        tdmc_config = config.models.tdmc
+        
         n_samples = len(X_scaled)
         emission_probs = np.zeros((n_samples, self.n_states))
 
+        # Calculate emission probabilities with numerical stability
         for s in range(self.n_states):
             try:
-                # Ensure covariance is positive definite before creating mvn
-                cov = self.emission_covars[s]
-                if np.min(np.linalg.eigvalsh(cov)) <= 1e-9: # Check positive definiteness
-                    cov = cov + 1e-6 * np.eye(self.n_emissions) # Add jitter
+                # Fix eigenvalues for numerical stability
+                cov = _fix_eigenvalues(
+                    self.emission_covars[s], 
+                    tdmc_config.min_eigenvalue_threshold,
+                    tdmc_config.covariance_regularization,
+                    logger
+                )
                 
                 mvn = multivariate_normal(mean=self.emission_means[s], cov=cov, allow_singular=False)
                 emission_probs[:, s] = mvn.pdf(X_scaled)
             except Exception as e: # Fallback if mvn fails
-                # print(f"Warning: MVN PDF failed for state {s}: {e}. Using fallback.")
-                # Fallback: simple Gaussian-like calculation (not a true PDF but a proximity measure)
+                if logger:
+                    logger.warning(f"MVN PDF failed for state {s}: {e}. Using fallback.")
+                # Fallback: simple Gaussian-like calculation
                 diff_sq = (X_scaled - self.emission_means[s])**2
-                # Inverse of variance (diagonal) as precision
                 precision = np.diag(1.0 / np.maximum(np.diag(self.emission_covars[s]), 1e-9)) 
                 emission_probs[:, s] = np.exp(-0.5 * np.sum(diff_sq @ precision, axis=1))
 
-        emission_probs = np.maximum(emission_probs, 1e-300) # Avoid zero probabilities
+        # Apply probability floor for numerical stability
+        emission_probs = floor_prob(emission_probs, tdmc_config.probability_floor)
+        
+        if logger:
+            logger.debug(f"Emission probabilities - min: {np.min(emission_probs):.2e}, max: {np.max(emission_probs):.2e}")
 
         alpha = np.zeros((n_samples, self.n_states))
         beta = np.zeros((n_samples, self.n_states))
         scale = np.zeros(n_samples)
 
-        # Forward pass
-        alpha[0] = self.initial_probs * emission_probs[0]
+        # Forward pass with safe normalization
+        alpha[0] = floor_prob(self.initial_probs * emission_probs[0], tdmc_config.min_probability)
         scale[0] = np.sum(alpha[0])
-        if scale[0] > 0: alpha[0] /= scale[0]
+        alpha[0] = safe_normalise(alpha[0].reshape(1, -1), min_val=tdmc_config.min_probability).flatten()
 
         for t in range(1, n_samples):
             current_time_slice_transitions = self.transitions[time_indices[t-1]] # Transitions from t-1 to t
             alpha[t] = (alpha[t-1] @ current_time_slice_transitions) * emission_probs[t]
+            alpha[t] = floor_prob(alpha[t], tdmc_config.min_probability)
             scale[t] = np.sum(alpha[t])
-            if scale[t] > 0: alpha[t] /= scale[t]
+            alpha[t] = safe_normalise(alpha[t].reshape(1, -1), min_val=tdmc_config.min_probability).flatten()
 
-        # Backward pass
+        # Backward pass with safe normalization
         beta[-1] = 1.0
         for t in range(n_samples - 2, -1, -1):
             next_time_slice_transitions = self.transitions[time_indices[t]] # Transitions from t to t+1
             beta[t] = (next_time_slice_transitions @ (emission_probs[t+1] * beta[t+1]).T).T
-            if scale[t+1] > 0: beta[t] /= scale[t+1]
+            beta[t] = floor_prob(beta[t], tdmc_config.min_probability)
+            if scale[t+1] > 0: 
+                beta[t] /= scale[t+1]
+            beta[t] = floor_prob(beta[t], tdmc_config.min_probability)
+            
+        if logger:
+            logger.debug(f"Forward-backward complete - scale range: [{np.min(scale):.2e}, {np.max(scale):.2e}]")
             
         return alpha, beta, scale, emission_probs
 
     def _baum_welch_update(self, X_scaled: np.ndarray, time_indices: np.ndarray, 
                            max_iter: int, tol: float) -> float:
         """Perform Baum-Welch algorithm to update model parameters."""
+        config = get_config()
+        tdmc_config = config.models.tdmc
+        
+        # Initialize logger based on config
+        logger = _get_logger(tdmc_config.verbose_logging) if tdmc_config.verbose_logging else None
+        
         prev_log_likelihood = -np.inf
         log_likelihood = 0.0
+        
+        if logger:
+            logger.info(f"Starting Baum-Welch algorithm - max_iter: {max_iter}, tolerance: {tol}")
 
         for iteration in range(max_iter):
-            alpha, beta, scale, emission_probs = self._forward_backward(X_scaled, time_indices)
+            alpha, beta, scale, emission_probs = self._forward_backward(X_scaled, time_indices, logger)
             
-            current_log_likelihood = np.sum(np.log(np.maximum(scale, 1e-300))) # Avoid log(0)
+            # Safe log-likelihood calculation with floor_prob
+            safe_scale = floor_prob(scale, tdmc_config.min_probability)
+            current_log_likelihood = np.sum(np.log(safe_scale))
+            
+            # Check convergence
             if abs(current_log_likelihood - prev_log_likelihood) < tol and iteration > 0:
                 log_likelihood = current_log_likelihood
-                # print(f"Converged at iteration {iteration+1}, Log-Likelihood: {log_likelihood:.4f}")
+                if logger:
+                    logger.info(f"Converged at iteration {iteration+1}, Log-Likelihood: {log_likelihood:.4f}")
                 break
+                
             prev_log_likelihood = current_log_likelihood
             log_likelihood = current_log_likelihood
-            # if iteration % 10 == 0:
-            #     print(f"Iteration {iteration+1}/{max_iter}, Log-Likelihood: {log_likelihood:.4f}")
+            
+            # Log progress based on configuration
+            if logger and (iteration % tdmc_config.log_likelihood_every_n_iter == 0):
+                logger.info(f"Iteration {iteration+1}/{max_iter}, Log-Likelihood: {log_likelihood:.4f}")
 
             n_samples = len(X_scaled)
             gamma = alpha * beta 
             gamma = gamma / np.maximum(np.sum(gamma, axis=1, keepdims=True), 1e-300) # Normalize gamma
 
-            # Update initial state distribution
-            self.initial_probs = gamma[0] / np.sum(gamma[0])
-            self.initial_probs = np.maximum(self.initial_probs, 1e-300) # Ensure non-zero
-            self.initial_probs /= np.sum(self.initial_probs) # Re-normalize
+            # Update initial state distribution with safe normalization
+            self.initial_probs = safe_normalise(gamma[0].reshape(1, -1), min_val=tdmc_config.min_probability).flatten()
 
-            # Update transition matrices
-            new_transitions = np.zeros_like(self.transitions) + 1e-9 # Add smoothing factor
-            gamma_sum_per_time_slice = np.zeros((self.time_slices, self.n_states)) + (self.n_states * 1e-9)
-
-            for t_idx in range(n_samples - 1):
-                ti = time_indices[t_idx] # Time slice for transition from t_idx to t_idx+1
-                trans_prob_ti_to_ti1 = self.transitions[ti] # A_k for this time slice
-                
-                # Numerator for xi: alpha_i(k) * A_k(i,j) * B_j(O_{k+1}) * beta_j(k+1)
-                # Denominator is sum over i,j of numerator which is P(O|lambda)
-                # We need xi_t(i,j) = P(q_t=i, q_{t+1}=j | O, lambda)
-                # xi_summed is sum over t of xi_t(i,j) for each time slice.
-                
-                # P(q_t=i, q_{t+1}=j | O, lambda) for a specific t_idx
-                # proportional to alpha[t_idx, s1] * trans_prob_ti_to_ti1[s1,s2] * emission_probs[t_idx+1,s2] * beta[t_idx+1,s2]
-                xi_slice = np.zeros((self.n_states, self.n_states))
-                for s1 in range(self.n_states):
-                    for s2 in range(self.n_states):
-                        val = alpha[t_idx, s1] * \
-                              trans_prob_ti_to_ti1[s1, s2] * \
-                              emission_probs[t_idx+1, s2] * \
-                              beta[t_idx+1, s2]
-                        # The scaling factor scale[t_idx+1] is already incorporated in beta definition relative to alpha
-                        # The term needs to be divided by P(O_t+1 | O_t ... O_0) for this specific transition which is complex.
-                        # Standard HMM xi definition:
-                        # xi_t(i,j) = (alpha_t(i) * A(i,j) * B_j(O_{t+1}) * beta_{t+1}(j)) / P(O|lambda)
-                        # We scale P(O|lambda) out by normalizing later.
-                        # Or, using scaled alpha and beta:
-                        # xi_t(i,j) directly from alpha[t,i] * A[i,j] * B_j(O_{t+1}) * beta[t+1,j] / scale[t+1] (for beta)
-                        # Since beta was scaled by scale[t+1], this is effectively:
-                        # alpha[t_idx, s1] * trans_prob_ti_to_ti1[s1, s2] * emission_probs[t_idx+1, s2] * beta[t_idx+1, s2]
-                        # No, the P(O|lambda) term needs care. Let's use sum of gamma.
-                        xi_slice[s1,s2] = val 
-                
-                if np.sum(xi_slice) > 0 : # Avoid division by zero if xi_slice is all zeros
-                    new_transitions[ti] += xi_slice / np.sum(xi_slice) # Normalize xi_slice before adding
-                gamma_sum_per_time_slice[ti] += gamma[t_idx]
-
-
-            for ts in range(self.time_slices):
-                # Denominator for A_ij update is sum_t gamma_t(i) for that time slice
-                # Numerator is sum_t xi_t(i,j) for that time slice
-                # This needs sums not just for one t_idx but over all t_idx belonging to time slice ts
-                # The accumulation above is correct. Now normalize:
-                # Sum of xi over t, for each time slice
-                # Sum of gamma over t, for each time slice
-                # self.transitions[ts] = new_transitions[ts] / np.maximum(gamma_sum_per_time_slice[ts][:, np.newaxis], 1e-300)
-                # A simpler approach:
-                # Sum_t xi_t(i,j) / Sum_t gamma_t(i)
-                # Let's re-evaluate transition update with standard formulas:
-                # ξ_sum_ts[i,j] = sum_{t where time_indices[t]==ts} P(q_t=i, q_{t+1}=j | O, λ)
-                # γ_sum_ts[i]   = sum_{t where time_indices[t]==ts} P(q_t=i | O, λ)
-                # A[ts,i,j] = ξ_sum_ts[i,j] / γ_sum_ts[i]
-                pass # Placeholder for correct accumulation of xi and gamma per time slice
-
-            # Simpler Baum-Welch transition update (summing xi and gamma across relevant time steps for each slice transition matrix)
-            # This part requires careful handling of time-slicing for xi and gamma sums.
-            # Using an approximation for now by re-estimating from gamma, which is not fully correct for TDMC
-            # A robust TDMC Baum-Welch M-step for transitions is more complex.
-            # For now, let's keep the initialization's K-means based transition and allow it to adapt slowly or stick to it.
-            # Or, an EM update where xi is calculated for each t and summed up per (time_slice, s1, s2)
-            # And gamma summed up per (time_slice, s1)
+            # Update transition matrices - Full ξ/γ accumulation per time slice
+            xi_sum = np.zeros((self.time_slices, self.n_states, self.n_states))
+            gamma_sum = np.zeros((self.time_slices, self.n_states))
             
-            # M-step for transitions (corrected logic needed here for true TDMC B-W)
-            # The current _initialize_parameters sets a reasonable starting point.
-            # For a full Baum-Welch, one would accumulate xi sums and gamma sums
-            # specific to each time_slice's transition matrix.
-            # For this iteration, we will focus on emission updates which are more standard.
+            # Compute ξ_t(i,j) using scaled α/β and accumulate per time slice
+            for t_idx in range(n_samples - 1):
+                ti = time_indices[t_idx]  # Time slice for transition from t_idx to t_idx+1
+                trans_prob_ti = self.transitions[ti]  # A_k for this time slice
+                
+                # Calculate ξ_t(i,j) = P(q_t=i, q_{t+1}=j | O, λ)
+                # Using scaled alpha and beta:
+                # ξ_t(i,j) = α_t(i) * A(i,j) * B_j(O_{t+1}) * β_{t+1}(j)
+                xi_t = np.zeros((self.n_states, self.n_states))
+                for i in range(self.n_states):
+                    for j in range(self.n_states):
+                        xi_t[i, j] = (alpha[t_idx, i] * 
+                                     trans_prob_ti[i, j] * 
+                                     emission_probs[t_idx + 1, j] * 
+                                     beta[t_idx + 1, j])
+                
+                # Normalize ξ_t to ensure proper probabilities
+                xi_t_sum = np.sum(xi_t)
+                if xi_t_sum > 0:
+                    xi_t /= xi_t_sum
+                
+                # Accumulate ξ_t(i,j) for this time slice
+                xi_sum[ti] += xi_t
+                
+                # Accumulate γ_t(i) for this time slice
+                gamma_sum[ti] += gamma[t_idx]
+            
+            # Update transition matrices using accumulated ξ and γ
+            for ts in range(self.time_slices):
+                # Get smoothing prior from config
+                config = get_config()
+                tdmc_config = config.models.tdmc
+                prior = tdmc_config.transition_smoothing_prior
+                min_prob = tdmc_config.min_probability
+                
+                for i in range(self.n_states):
+                    # Calculate denominator: sum of γ_t(i) for this time slice + prior
+                    denominator = np.maximum(gamma_sum[ts, i], min_prob) + self.n_states * prior
+                    
+                    # Update each transition probability A[ts, i, j]
+                    for j in range(self.n_states):
+                        # Numerator: sum of ξ_t(i,j) for this time slice + prior
+                        numerator = xi_sum[ts, i, j] + prior
+                        self.transitions[ts, i, j] = numerator / denominator
+                    
+                    # Safe row normalization to ensure probabilities sum to 1
+                    self.transitions[ts, i, :] = safe_normalise(
+                        self.transitions[ts, i, :].reshape(1, -1), 
+                        min_val=min_prob
+                    ).flatten()
 
-            # Update emission parameters
+            # Update emission parameters with numerical stability
             for s in range(self.n_states):
                 gamma_s = gamma[:, s]
                 gamma_s_sum = np.sum(gamma_s)
-                gamma_s_sum = np.maximum(gamma_s_sum, 1e-300) # Avoid division by zero
+                gamma_s_sum = np.maximum(gamma_s_sum, tdmc_config.min_probability) # Avoid division by zero
 
                 # Update mean
                 current_mean = np.sum(gamma_s[:, np.newaxis] * X_scaled, axis=0) / gamma_s_sum
-                if not np.any(np.isnan(current_mean)): self.emission_means[s] = current_mean
+                if not np.any(np.isnan(current_mean)): 
+                    self.emission_means[s] = current_mean
+                    if logger:
+                        logger.debug(f"Updated mean for state {s}: {current_mean}")
                 
-                # Update covariance
+                # Update covariance with numerical stability
                 diff = X_scaled - self.emission_means[s]
                 cov_s = np.dot((gamma_s[:, np.newaxis] * diff).T, diff) / gamma_s_sum
                 
-                # Ensure positive definiteness and add regularization
-                min_eig = np.min(np.real(np.linalg.eigvals(cov_s)))
-                if min_eig <= 1e-9: # Check positive definiteness
-                    cov_s += (-min_eig + 1e-6) * np.eye(self.n_emissions) 
-                cov_s += 1e-4 * np.eye(self.n_emissions) # Regularization
-                if not np.any(np.isnan(cov_s)): self.emission_covars[s] = cov_s
+                # Fix eigenvalues for numerical stability
+                cov_s = _fix_eigenvalues(
+                    cov_s, 
+                    tdmc_config.min_eigenvalue_threshold,
+                    tdmc_config.covariance_regularization,
+                    logger
+                )
+                
+                if not np.any(np.isnan(cov_s)): 
+                    self.emission_covars[s] = cov_s
+                    if logger:
+                        min_eig = np.min(np.linalg.eigvals(cov_s))
+                        logger.debug(f"Updated covariance for state {s}, min eigenvalue: {min_eig:.2e}")
         
-        # print(f"Finished training. Final Log-Likelihood: {log_likelihood:.4f}")
+        if logger:
+            logger.info(f"Finished training. Final Log-Likelihood: {log_likelihood:.4f}")
         return log_likelihood
 
     def predict_states(self, X: np.ndarray, 
@@ -330,21 +527,41 @@ class SolarTDMC:
         if not self.trained:
             raise ValueError("Model not trained yet. Call fit() first.")
         
+        config = get_config()
+        tdmc_config = config.models.tdmc
+        
+        # Initialize logger if verbose logging is enabled
+        logger = _get_logger(tdmc_config.verbose_logging) if tdmc_config.verbose_logging else None
+        
         X_scaled, time_indices = self._preprocess_data(X, timestamps)
         n_samples = len(X_scaled)
+        
+        if logger:
+            logger.debug(f"Predicting states for {n_samples} samples")
         
         emission_probs = np.zeros((n_samples, self.n_states))
         for s in range(self.n_states):
             try:
-                cov = self.emission_covars[s]
-                if np.min(np.linalg.eigvalsh(cov)) <= 1e-9: cov += 1e-6 * np.eye(self.n_emissions)
+                # Use eigenvalue fixing for numerical stability
+                cov = _fix_eigenvalues(
+                    self.emission_covars[s], 
+                    tdmc_config.min_eigenvalue_threshold,
+                    tdmc_config.covariance_regularization,
+                    logger
+                )
                 mvn = multivariate_normal(mean=self.emission_means[s], cov=cov, allow_singular=False)
                 emission_probs[:, s] = mvn.pdf(X_scaled)
             except Exception: # Fallback
+                if logger:
+                    logger.warning(f"MVN PDF failed for state {s} in prediction. Using fallback.")
                 precision = np.diag(1.0 / np.maximum(np.diag(self.emission_covars[s]), 1e-9))
                 emission_probs[:, s] = np.exp(-0.5 * np.sum((X_scaled - self.emission_means[s])**2 @ precision, axis=1))
 
-        emission_probs = np.maximum(emission_probs, 1e-300) # Avoid log(0) later
+        # Apply probability floor for numerical stability
+        emission_probs = floor_prob(emission_probs, tdmc_config.min_probability) # Avoid log(0) later
+        
+        if logger:
+            logger.debug(f"Emission probabilities computed - min: {np.min(emission_probs):.2e}, max: {np.max(emission_probs):.2e}")
         
         viterbi_probs = np.zeros((n_samples, self.n_states))
         backpointers = np.zeros((n_samples, self.n_states), dtype=int)
@@ -367,6 +584,10 @@ class SolarTDMC:
         states[-1] = np.argmax(viterbi_probs[-1])
         for t in range(n_samples - 2, -1, -1):
             states[t] = backpointers[t + 1, states[t + 1]]
+        
+        if logger:
+            state_counts = np.bincount(states, minlength=self.n_states)
+            logger.debug(f"Predicted state distribution: {dict(zip(self.state_names, state_counts))}")
             
         return states
 
@@ -601,29 +822,134 @@ class SolarTDMC:
         if ax is None: fig.tight_layout()
         return fig
 
-    def save_model(self, filepath: str):
-        """Save model parameters to a .npz file."""
+    def save_model(self, filepath: str, hp=None, train_cfg=None, history=None, metrics=None, use_enhanced=True):
+        """Save model parameters using enhanced checkpointing or legacy format.
+        
+        Parameters:
+        -----------
+        filepath : str
+            Path to save the model
+        hp : dict, optional
+            Hyperparameters dictionary (for enhanced checkpointing)
+        train_cfg : dict, optional
+            Training configuration dictionary (for enhanced checkpointing)
+        history : dict, optional
+            Training history dictionary (for enhanced checkpointing)
+        metrics : dict, optional
+            Final metrics dictionary (for enhanced checkpointing)
+        use_enhanced : bool
+            Whether to use enhanced checkpointing format (default True)
+        """
         if not self.trained:
             print("Warning: Model is not trained. Saving current (possibly initial) parameters.")
         
-        model_data = {
-            'n_states': self.n_states,
-            'n_emissions': self.n_emissions,
-            'time_slices': self.time_slices,
-            'transitions': self.transitions,
-            'emission_means': self.emission_means,
-            'emission_covars': self.emission_covars,
-            'initial_probs': self.initial_probs,
-            'state_names': self.state_names,
-            'scaler_mean_': self.scaler.mean_ if hasattr(self.scaler, 'mean_') else None,
-            'scaler_scale_': self.scaler.scale_ if hasattr(self.scaler, 'scale_') else None,
-            'trained': self.trained
-        }
-        np.savez(filepath, **model_data)
+        if use_enhanced and hp is not None:
+            # Use enhanced checkpointing
+            from .checkpointing import save_checkpoint
+            
+            # Create default values if not provided
+            if train_cfg is None:
+                train_cfg = {}
+            if history is None:
+                history = {}
+            if metrics is None:
+                metrics = {}
+            
+            save_checkpoint(
+                model=self,
+                path=filepath,
+                hp=hp,
+                train_cfg=train_cfg,
+                history=history,
+                metrics=metrics
+            )
+        else:
+            # Use legacy .npz format
+            model_data = {
+                'n_states': self.n_states,
+                'n_emissions': self.n_emissions,
+                'time_slices': self.time_slices,
+                'transitions': self.transitions,
+                'emission_means': self.emission_means,
+                'emission_covars': self.emission_covars,
+                'initial_probs': self.initial_probs,
+                'state_names': self.state_names,
+                'scaler_mean_': self.scaler.mean_ if hasattr(self.scaler, 'mean_') else None,
+                'scaler_scale_': self.scaler.scale_ if hasattr(self.scaler, 'scale_') else None,
+                'trained': self.trained
+            }
+            np.savez(filepath, **model_data)
 
     @classmethod
-    def load_model(cls, filepath: str) -> 'SolarTDMC':
-        """Load model from a .npz file."""
+    def load_model(cls, filepath: str, map_location: Optional[str] = None, strict: bool = False) -> 'SolarTDMC':
+        """Load model from file using enhanced checkpointing or legacy format.
+        
+        Parameters:
+        -----------
+        filepath : str
+            Path to the saved model file
+        map_location : str, optional
+            Device location for loading (unused for TDMC but kept for API consistency)
+        strict : bool
+            Whether to enforce strict checkpoint format compatibility
+            
+        Returns:
+        --------
+        SolarTDMC
+            Loaded model instance
+        """
+        from pathlib import Path
+        
+        # Determine file format by extension
+        file_path = Path(filepath)
+        
+        if file_path.suffix == '.pt':
+            # Try enhanced checkpointing first
+            try:
+                from .checkpointing import load_checkpoint
+                checkpoint, metadata = load_checkpoint(filepath, map_location, strict)
+                
+                # Verify it's a TDMC model
+                if metadata.get('model_type') != 'TDMC':
+                    raise ValueError(f"Expected TDMC model, got {metadata.get('model_type')}")
+                
+                # Create model from checkpoint
+                model = cls(
+                    n_states=checkpoint['n_states'],
+                    n_emissions=checkpoint['n_emissions'],
+                    time_slices=checkpoint['time_slices']
+                )
+                
+                # Load state
+                state_dict = checkpoint['state_dict']
+                model.transitions = state_dict['transitions']
+                model.emission_means = state_dict['emission_means']
+                model.emission_covars = state_dict['emission_covars']
+                model.initial_probs = state_dict['initial_probs']
+                model.trained = state_dict.get('trained', False)
+                
+                # Load scaler state
+                model.scaler = StandardScaler()
+                if state_dict.get('scaler_mean_') is not None:
+                    model.scaler.mean_ = state_dict['scaler_mean_']
+                    model.scaler.scale_ = state_dict['scaler_scale_']
+                    model.scaler.n_features_in_ = model.n_emissions
+                    model.scaler.n_samples_seen_ = 1
+                
+                # Load metadata
+                if 'state_names' in checkpoint:
+                    model.state_names = checkpoint['state_names']
+                
+                print(f"Loaded TDMC model from enhanced checkpoint (version {metadata.get('version')})")
+                return model
+                
+            except Exception as e:
+                if strict:
+                    raise ValueError(f"Failed to load enhanced checkpoint: {e}")
+                else:
+                    print(f"Enhanced checkpointing failed ({e}), falling back to legacy format")
+        
+        # Legacy .npz format loading
         try:
             data = np.load(filepath, allow_pickle=True) # allow_pickle for state_names if they are objects
         except FileNotFoundError:

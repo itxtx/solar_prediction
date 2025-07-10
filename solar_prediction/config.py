@@ -19,7 +19,7 @@ Usage:
 from typing import List, Dict, Optional, Union, Any
 from pathlib import Path
 from dataclasses import dataclass, field
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import os
 
 
@@ -93,16 +93,16 @@ class FeatureEngineeringConfig(BaseModel):
     # Predefined feature sets
     minimal_features: List[str] = Field(
         default_factory=lambda: [
-            'Radiation', 'Temperature', 'Humidity', 
-            'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover'
+            'GHI', 'temp', 'humidity', 
+            'TimeMinutesSin', 'TimeMinutesCos', 'clouds_all'
         ],
         description="Minimal feature set"
     )
     
     basic_features: List[str] = Field(
         default_factory=lambda: [
-            'Radiation', 'Temperature', 'Pressure', 'Humidity', 'WindSpeed',
-            'TimeMinutesSin', 'TimeMinutesCos', 'Cloudcover', 'Rain'
+            'GHI', 'temp', 'pressure', 'humidity', 'wind_speed',
+            'TimeMinutesSin', 'TimeMinutesCos', 'clouds_all', 'rain_1h'
         ],
         description="Basic feature set"
     )
@@ -152,7 +152,8 @@ class SequenceConfig(BaseModel):
     test_size: float = Field(0.2, description="Test set proportion")
     val_size_from_train_val: float = Field(0.25, description="Validation size as fraction of train+val")
     
-    @validator('test_size', 'val_size_from_train_val')
+    @field_validator('test_size', 'val_size_from_train_val')
+    @classmethod
     def validate_proportions(cls, v):
         if not 0 < v < 1:
             raise ValueError("Proportions must be between 0 and 1")
@@ -206,7 +207,8 @@ class LSTMConfig(BaseModel):
     mc_dropout_samples: int = Field(30, description="Number of Monte Carlo dropout samples")
     uncertainty_alpha: float = Field(0.05, description="Alpha for uncertainty confidence intervals")
     
-    @validator('dropout_prob')
+    @field_validator('dropout_prob')
+    @classmethod
     def validate_dropout(cls, v):
         if not 0 <= v <= 1:
             raise ValueError("Dropout probability must be between 0 and 1")
@@ -246,7 +248,8 @@ class GRUConfig(BaseModel):
     eval_batch_size: int = Field(256, description="Batch size for evaluation")
     mape_epsilon: float = Field(1e-8, description="Epsilon for MAPE calculation")
     
-    @validator('dropout_prob')
+    @field_validator('dropout_prob')
+    @classmethod
     def validate_dropout(cls, v):
         if not 0 <= v <= 1:
             raise ValueError("Dropout probability must be between 0 and 1")
@@ -275,6 +278,11 @@ class TDMCConfig(BaseModel):
     # Numerical stability
     eigenvalue_min_tolerance: float = Field(1e-9, description="Minimum eigenvalue tolerance")
     min_probability: float = Field(1e-300, description="Minimum probability to avoid numerical issues")
+    probability_floor: float = Field(1e-300, description="Floor value for probabilities to avoid underflow")
+    
+    # Logging
+    verbose_logging: bool = Field(False, description="Enable verbose logging for debugging")
+    log_likelihood_every_n_iter: int = Field(10, description="Log likelihood every N iterations")
     
     # K-means initialization
     kmeans_n_init: str = Field("auto", description="Number of K-means initializations")
@@ -420,6 +428,7 @@ class SolarPredictionConfig(BaseModel):
     
     # Configuration sections
     data: DataProcessingConfig = Field(default_factory=DataProcessingConfig)
+    input: DataInputConfig = Field(default_factory=lambda: DataInputConfig(target_col_original_name="GHI"))
     transformation: DataTransformationConfig = Field(default_factory=DataTransformationConfig)
     features: FeatureEngineeringConfig = Field(default_factory=FeatureEngineeringConfig)
     scaling: ScalingConfig = Field(default_factory=ScalingConfig)

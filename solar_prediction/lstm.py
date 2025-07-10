@@ -16,6 +16,8 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 
 # Import centralized configuration
 from .config import get_config
+# Import memory tracking utility
+from .memory_tracker import MemoryTracker
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -233,7 +235,8 @@ class WeatherLSTM(nn.Module):
              raise ValueError(f"Target variables (y_train, y_val) must be 2-dimensional (samples, output_dim) and match model output_dim={self.params.output_dim}.")
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray, 
-            train_config: TrainingConfig, device: str = "cpu"):
+            train_config: TrainingConfig, device: str = "cpu", 
+            memory_tracker: Optional[MemoryTracker] = None):
         try:
             self._validate_fit_inputs(X_train, y_train, X_val, y_val)
         except ValueError as e:
@@ -241,6 +244,15 @@ class WeatherLSTM(nn.Module):
             raise
 
         logging.info(f"LSTM Training started. Device: {device}, Training Config: {train_config}")
+        
+        # Initialize memory tracker if not provided
+        if memory_tracker is None:
+            config = get_config()
+            memory_tracker = MemoryTracker(device=device, verbose=config.logging.level == "DEBUG")
+        
+        memory_tracker.log_device_info()
+        memory_tracker.snapshot("training_start", "before training loop")
+        
         self.history = {key: [] for key in self.history}
         
         train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
@@ -251,8 +263,12 @@ class WeatherLSTM(nn.Module):
         optimizer = optim.Adam(self.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
         criterion = self._get_criterion(train_config)
         
+        # Initialize gradient scaler for mixed precision if CUDA is available
+        scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() and 'cuda' in device else None
+        use_amp = scaler is not None
+        
         if train_config.scheduler_type.lower() == "plateau":
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=train_config.factor, patience=train_config.patience//2, min_lr=train_config.min_lr, verbose=True)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=train_config.factor, patience=train_config.patience//2, min_lr=train_config.min_lr)
         elif train_config.scheduler_type.lower() == "cosine":
             T_max = train_config.T_max_cosine if train_config.T_max_cosine is not None else train_config.epochs
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=train_config.min_lr)
@@ -263,30 +279,57 @@ class WeatherLSTM(nn.Module):
         early_stopping_counter = 0
         self.to(device)
         
+        logging.info(f"Training with mixed precision: {use_amp}")
+        
         for epoch in range(train_config.epochs):
+            memory_tracker.snapshot(f"epoch_{epoch}_start", f"start of epoch {epoch}")
+            
             self.train()
             train_loss_epoch = 0.0
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
-                outputs = self(inputs)
-                # Pass value_multiplier if criterion is CombinedLoss and mode is value_aware
-                if isinstance(criterion, CombinedLoss) and criterion.loss_mode == "value_aware":
-                    loss = criterion(outputs, targets, value_multiplier=train_config.value_multiplier)
+                
+                # Use automatic mixed precision for forward pass and loss calculation
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    outputs = self(inputs)
+                    # Pass value_multiplier if criterion is CombinedLoss and mode is value_aware
+                    if isinstance(criterion, CombinedLoss) and criterion.loss_mode == "value_aware":
+                        loss = criterion(outputs, targets, value_multiplier=train_config.value_multiplier)
+                    else:
+                        loss = criterion(outputs, targets)
+                
+                # Backward pass with gradient scaling
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    # Gradient clipping with scaled gradients
+                    if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    loss = criterion(outputs, targets)
-                loss.backward()
-                if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
-                     torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
-                optimizer.step()
+                    loss.backward()
+                    if train_config.clip_grad_norm is not None and train_config.clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), train_config.clip_grad_norm)
+                    optimizer.step()
+                
                 train_loss_epoch += loss.item() * inputs.size(0)
+                
+                # Clean up batch tensors
+                del inputs, targets, outputs, loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
             train_loss_epoch /= len(train_loader.dataset)
             
-            # Validation phase
+            # Validation phase with memory tracking
+            memory_tracker.snapshot(f"epoch_{epoch}_val_start", f"start of validation for epoch {epoch}")
+            
             self.eval()
             val_loss_epoch = 0.0
             val_outputs_all, val_targets_all = [], []
-            with torch.no_grad():
+            with torch.inference_mode():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = self(inputs)
@@ -297,6 +340,12 @@ class WeatherLSTM(nn.Module):
                     val_loss_epoch += loss_val.item() * inputs.size(0)
                     val_outputs_all.append(outputs.cpu().numpy())
                     val_targets_all.append(targets.cpu().numpy())
+                    
+                    # Clean up validation tensors
+                    del inputs, targets, outputs, loss_val
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
             val_loss_epoch /= len(val_loader.dataset)
             
             val_predictions = np.vstack(val_outputs_all)
@@ -324,9 +373,27 @@ class WeatherLSTM(nn.Module):
             else: early_stopping_counter += 1
             if early_stopping_counter >= train_config.patience:
                 logging.info(f"LSTM Early stopping at epoch {epoch+1}"); break
+                
+            # Memory tracking at end of each epoch
+            memory_tracker.snapshot(f"epoch_{epoch}_end", f"end of epoch {epoch}")
+            memory_tracker.log_memory_diff(f"epoch_{epoch}_start", f"epoch_{epoch}_end", f"epoch_{epoch}")
+            
+            # Clean up memory periodically
+            if (epoch + 1) % 5 == 0:  # Every 5 epochs
+                memory_tracker.cleanup_memory()
+        
+        # Final memory cleanup
+        memory_tracker.snapshot("training_end", "training completed")
+        memory_tracker.log_memory_diff("training_start", "training_end", "full_training")
+        memory_tracker.cleanup_memory(force=True)
         
         if best_model_state: self.load_state_dict(best_model_state)
         logging.info("LSTM Training complete. Best model state loaded.")
+        
+        # Final memory summary if verbose
+        if memory_tracker.verbose:
+            logging.info(memory_tracker.get_summary())
+            
         return self
 
     def _ensure_2d(self, arr: np.ndarray) -> np.ndarray:
@@ -453,8 +520,8 @@ class WeatherLSTM(nn.Module):
             all_predictions_scaled = []
             all_actuals_scaled = []
         
-        # Process in batches
-        with torch.no_grad():
+        # Process in batches with inference mode for better performance
+        with torch.inference_mode():
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 predictions = self(inputs)
@@ -486,6 +553,11 @@ class WeatherLSTM(nn.Module):
                 if return_predictions:
                     all_predictions_scaled.append(pred_batch)
                     all_actuals_scaled.append(actual_batch)
+                
+                # Clean up batch tensors for memory efficiency
+                del inputs, targets, predictions
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # Calculate scaled metrics from accumulated statistics
         mse_scaled = sum_squared_error / n_samples
@@ -684,10 +756,15 @@ class WeatherLSTM(nn.Module):
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         
         predictions_scaled_list = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for (inputs_batch,) in loader: # inputs_batch is already on device from _ensure_batched_input
                 outputs = self(inputs_batch)
                 predictions_scaled_list.append(outputs.cpu().numpy())
+                
+                # Clean up batch tensors
+                del inputs_batch, outputs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         predictions_scaled_np = np.concatenate(predictions_scaled_list, axis=0)
         
@@ -802,31 +879,118 @@ class WeatherLSTM(nn.Module):
         return fig
 
 
-    def save(self, path: str):
+    def save(self, path: str, train_cfg=None, metrics=None, use_enhanced=True):
+        """Save LSTM model using enhanced checkpointing or legacy format.
+        
+        Parameters:
+        -----------
+        path : str
+            Path to save the model
+        train_cfg : TrainingConfig or dict, optional
+            Training configuration (for enhanced checkpointing)
+        metrics : dict, optional
+            Final metrics dictionary (for enhanced checkpointing)
+        use_enhanced : bool
+            Whether to use enhanced checkpointing format (default True)
+        """
         try:
-            # Convert dataclass to dict to avoid module path serialization issues
-            model_params_dict = {
-                'input_dim': self.params.input_dim,
-                'hidden_dim': self.params.hidden_dim,
-                'num_layers': self.params.num_layers,
-                'output_dim': self.params.output_dim,
-                'dropout_prob': self.params.dropout_prob
-            }
-            
-            save_content = {
-                'model_state_dict': self.state_dict(),
-                'model_params': model_params_dict, 
-                'history': self.history, 
-                'transform_info': self.transform_info
-            }
-            torch.save(save_content, path)
-            logging.info(f"LSTM Model saved to {path}")
+            if use_enhanced:
+                # Use enhanced checkpointing
+                from .checkpointing import save_checkpoint
+                
+                # Create default values if not provided
+                if train_cfg is None:
+                    train_cfg = {}
+                if metrics is None:
+                    metrics = {}
+                
+                save_checkpoint(
+                    model=self,
+                    path=path,
+                    hp=self.params,
+                    train_cfg=train_cfg,
+                    history=self.history,
+                    metrics=metrics
+                )
+            else:
+                # Use legacy format
+                # Convert dataclass to dict to avoid module path serialization issues
+                model_params_dict = {
+                    'input_dim': self.params.input_dim,
+                    'hidden_dim': self.params.hidden_dim,
+                    'num_layers': self.params.num_layers,
+                    'output_dim': self.params.output_dim,
+                    'dropout_prob': self.params.dropout_prob
+                }
+                
+                save_content = {
+                    'model_state_dict': self.state_dict(),
+                    'model_params': model_params_dict, 
+                    'history': self.history, 
+                    'transform_info': self.transform_info
+                }
+                torch.save(save_content, path)
+                logging.info(f"LSTM Model saved to {path} (legacy format)")
         except Exception as e:
             logging.error(f"Failed to save LSTM model to {path}: {e}")
             raise
     
     @classmethod
-    def load(cls, path: str, device: str = "cpu") -> 'WeatherLSTM':
+    def load(cls, path: str, device: str = "cpu", strict: bool = False) -> 'WeatherLSTM':
+        """Load LSTM model from file using enhanced checkpointing or legacy format.
+        
+        Parameters:
+        -----------
+        path : str
+            Path to the saved model file
+        device : str
+            Device to load model on
+        strict : bool
+            Whether to enforce strict checkpoint format compatibility
+            
+        Returns:
+        --------
+        WeatherLSTM
+            Loaded model instance
+        """
+        from pathlib import Path
+        
+        # Determine file format by extension
+        file_path = Path(path)
+        
+        if file_path.suffix == '.pt':
+            # Try enhanced checkpointing first
+            try:
+                from .checkpointing import load_checkpoint
+                checkpoint, metadata = load_checkpoint(path, device, strict)
+                
+                # Verify it's an LSTM model
+                if metadata.get('model_type') != 'LSTM':
+                    raise ValueError(f"Expected LSTM model, got {metadata.get('model_type')}")
+                
+                # Create model parameters
+                model_params_dict = checkpoint.get('model_params', checkpoint.get('hyperparameters', {}))
+                model_params = ModelHyperparameters(**model_params_dict)
+                
+                # Create model
+                model = cls(model_params)
+                model.load_state_dict(checkpoint['state_dict'])
+                
+                # Load additional attributes
+                model.history = checkpoint.get('history', {key: [] for key in model.history_template_keys})
+                model.transform_info = checkpoint.get('transform_info')
+                
+                model.to(device)
+                logging.info(f"LSTM Model loaded from enhanced checkpoint (version {metadata.get('version')})")
+                return model
+                
+            except Exception as e:
+                if strict:
+                    raise ValueError(f"Failed to load enhanced checkpoint: {e}")
+                else:
+                    logging.warning(f"Enhanced checkpointing failed ({e}), falling back to legacy format")
+        
+        # Legacy format loading
         try:
             # Try loading with weights_only=False first (for backward compatibility)
             try:
@@ -838,13 +1002,15 @@ class WeatherLSTM(nn.Module):
                 # Add comprehensive list of NumPy types that might be in the saved model
                 safe_globals = [
                     ModelHyperparameters, 
-                    np.core.multiarray.scalar,
                     np.dtype,
                     np.ndarray,
-                    np.core.multiarray._reconstruct
+                    # Use numpy's public API instead of private core module
+                    np.float64,
+                    np.float32,
+                    np.int64,
+                    np.int32,
+                    np.bool_
                 ]
-                
-
                 
                 # Add specific dtype classes for newer NumPy versions
                 try:
@@ -885,7 +1051,7 @@ class WeatherLSTM(nn.Module):
             model.history = checkpoint.get('history', default_history) 
             model.transform_info = checkpoint.get('transform_info')
             model.to(device)
-            logging.info(f"LSTM Model loaded from {path}")
+            logging.info(f"LSTM Model loaded from {path} (legacy format)")
             return model
         except Exception as e: 
             logging.error(f"Failed to load LSTM model: {e}")
@@ -910,25 +1076,63 @@ class WeatherLSTM(nn.Module):
                                  return_samples: bool = False, alpha: float = 0.05) -> Dict[str, np.ndarray]:
         self.enable_mc_dropout() # Enable dropout for MC sampling
         try:
+            # Get eval_batch_size from config for MC sampling
+            config = get_config()
+            mc_batch_size = config.models.lstm.eval_batch_size
+            
             X_batched_tensor = self._ensure_batched_input(X).to(device)
+            batch_size, seq_len, features = X_batched_tensor.shape
+            
+            # Process MC samples in mini-batches for memory efficiency
             predictions_scaled_mc_list = []
-            with torch.no_grad(): # Still no grad for inference part
-                for _ in range(mc_samples):
-                    predictions_scaled_mc_list.append(self(X_batched_tensor).cpu().numpy())
+            
+            with torch.inference_mode():  # Use inference_mode for better performance
+                for batch_start in range(0, mc_samples, mc_batch_size):
+                    batch_end = min(batch_start + mc_batch_size, mc_samples)
+                    current_mc_batch_size = batch_end - batch_start
+                    
+                    # Collect predictions for this MC batch
+                    mc_batch_predictions = []
+                    for i in range(current_mc_batch_size):
+                        pred = self(X_batched_tensor).cpu().numpy()
+                        mc_batch_predictions.append(pred)
+                        
+                        # Clean up tensors
+                        del pred
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    # Add to main list
+                    predictions_scaled_mc_list.extend(mc_batch_predictions)
+                    
+                    # Clean up batch list
+                    del mc_batch_predictions
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                    if len(predictions_scaled_mc_list) % 10 == 0:  # Log progress
+                        logging.debug(f"Completed {len(predictions_scaled_mc_list)}/{mc_samples} MC samples")
             
             predictions_scaled_mc_np = np.stack(predictions_scaled_mc_list, axis=0)
             
+            # Process inverse transforms in batches for memory efficiency
             predictions_original_mc = np.zeros_like(predictions_scaled_mc_np)
             if target_scaler is not None and transform_info is not None:
-                for i in range(mc_samples):
-                    current_batch_scaled = predictions_scaled_mc_np[i, :, :]
-                    # Ensure input to _inverse_transform_target is 2D (samples, features)
-                    # Model output is (batch, output_dim). If output_dim=1, it's (batch, 1)
-                    inverted_sample = self._inverse_transform_target(
-                        current_batch_scaled, target_scaler, transform_info, scalers_dict
-                    ) # _inverse_transform_target now returns 1D if input was effectively (N,1)
-                    # Reshape to (batch, output_dim) for consistency in predictions_original_mc
-                    predictions_original_mc[i, :, :] = inverted_sample.reshape(current_batch_scaled.shape)
+                inverse_batch_size = min(10, mc_samples)  # Process inverse transforms in smaller batches
+                
+                for batch_start in range(0, mc_samples, inverse_batch_size):
+                    batch_end = min(batch_start + inverse_batch_size, mc_samples)
+                    
+                    for i in range(batch_start, batch_end):
+                        current_batch_scaled = predictions_scaled_mc_np[i, :, :]
+                        inverted_sample = self._inverse_transform_target(
+                            current_batch_scaled, target_scaler, transform_info, scalers_dict
+                        )
+                        predictions_original_mc[i, :, :] = inverted_sample.reshape(current_batch_scaled.shape)
+                    
+                    # Clean up memory after each inverse transform batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             else:
                 logging.warning("No scalers/transform_info for uncertainty. Returning scaled uncertainty.")
                 predictions_original_mc = predictions_scaled_mc_np
