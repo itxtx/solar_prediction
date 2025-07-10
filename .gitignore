@@ -22,3 +22,6 @@ n.md
 .github/
 .vscode/
 .pytest_cache/
+
+/docs
+/sarima_memory_results
