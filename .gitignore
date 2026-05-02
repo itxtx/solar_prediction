@@ -1,27 +1,47 @@
-
+# Python/cache
 __pycache__/
-*.env
-*.csv
-*venv
-*.png
-
-.ipynb_checkpoints
-
-.DS_Store
-
-*.pt
-
-n.md
-
-.vscode
-
-*.log
-*venv_test/
-
-
-.github/
-.vscode/
+*.py[cod]
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
 
-/docs
-/sarima_memory_results
+# Local environments and secrets
+.env
+*.env
+venv/
+venv_test/
+.venv/
+.DS_Store
+.vscode/
+
+# Generated artifacts
+artifacts/
+plots/
+logs/
+*.log
+*.pt
+*.pth
+*.pkl
+memory_benchmark_results/
+sarima_memory_results/
+
+# Full/local datasets stay out of Git. The curated sample dataset is tracked.
+*.csv
+!data/
+!data/sample/
+!data/sample/*.csv
+
+# README/report images are allowed, ad-hoc generated images are ignored elsewhere.
+*.png
+!assets/
+!assets/images/
+!assets/images/*.png
+
+# Notebook checkpoints
+.ipynb_checkpoints/

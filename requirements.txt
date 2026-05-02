@@ -1,33 +1,20 @@
-# Core scientific computing and data manipulation
-numpy>=1.21.0,<2.0  # <2.0 for pmdarima compatibility
-pandas>=1.3.0
-scipy>=1.7.0
-
-# Machine learning and deep learning
-torch>=1.9.0
-scikit-learn>=1.0.0
-
-# Time series analysis
-statsmodels>=0.13.0
-pmdarima>=1.8.0
-
-# Visualization
-matplotlib>=3.4.0
-seaborn>=0.11.0
-
-# Hyperparameter optimization
-optuna>=2.10.0
-
-# Configuration management
-pydantic>=1.10.0
-
-# Jupyter notebook support (for running the notebooks)
-jupyter>=1.0.0
-ipykernel>=6.0.0
-
-# Additional utilities
-tqdm>=4.62.0
-psutil>=5.8.0  # For memory and system monitoring
-
-# Testing framework
-pytest>=6.0.0
+# Compatibility export for environments that do not use pyproject extras.
+# Preferred portfolio setup:
+#   pip install -e ".[dev,notebooks]"
+numpy>=1.24,<2.0
+pandas>=1.5
+scipy>=1.10
+torch>=2.0
+scikit-learn>=1.2
+matplotlib>=3.7
+seaborn>=0.12
+optuna>=3.0
+pydantic>=2.0
+tqdm>=4.62
+psutil>=5.8
+pytest>=7
+pytest-cov>=4
+ruff>=0.4
+black>=24
+jupyter>=1.0
+ipykernel>=6.0

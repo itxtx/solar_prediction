@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solar-prediction"
+version = "1.0.0"
+description = "Reproducible solar irradiance forecasting with simple baselines and neural sequence models."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Tom" }]
+dependencies = [
+    "numpy>=1.24,<2.0",
+    "pandas>=1.5",
+    "scipy>=1.10",
+    "torch>=2.0",
+    "scikit-learn>=1.2",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "optuna>=3.0",
+    "pydantic>=2.0",
+    "tqdm>=4.62",
+    "psutil>=5.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "ruff>=0.4",
+    "black>=24",
+]
+notebooks = [
+    "jupyter>=1.0",
+    "ipykernel>=6.0",
+    "nbconvert>=7",
+]
+classical = [
+    "statsmodels>=0.14",
+    "pmdarima>=2.0",
+]
+
+[project.scripts]
+solar-predict = "solar_prediction.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["solar_prediction*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
