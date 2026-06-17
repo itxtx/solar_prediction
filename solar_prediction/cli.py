@@ -317,6 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--epochs", type=int, default=2)
         subparser.add_argument("--hidden-dim", type=int, default=16)
         subparser.add_argument("--batch-size", type=int, default=32)
+        subparser.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
 
     train = subparsers.add_parser("train", help="Train an LSTM or GRU checkpoint")
     train.add_argument("--model", choices=["lstm", "gru"], default="lstm")
@@ -330,6 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--data", default=str(DEFAULT_SAMPLE_DATA))
     evaluate.add_argument("--device", default="cpu")
     evaluate.add_argument("--batch-size", type=int, default=32)
+    evaluate.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
     evaluate.set_defaults(func=command_evaluate)
 
     compare = subparsers.add_parser("compare", help="Compare baselines with LSTM and GRU")
@@ -345,6 +347,8 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "quiet", False):
+        logging.getLogger().setLevel(logging.WARNING)
     if args.func is None:
         parser.print_help()
         return

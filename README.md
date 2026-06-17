@@ -20,7 +20,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,notebooks]"
 pytest
-solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8
+solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8 --quiet
 ```
 
 For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab.

@@ -36,6 +36,7 @@ def test_cli_compare_smoke(tmp_path, capsys):
             "16",
             "--seasonal-lag",
             "24",
+            "--quiet",
         ]
     )
 

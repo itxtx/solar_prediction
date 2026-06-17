@@ -51,7 +51,7 @@ class MemoryTracker:
         # handler here can leave background Optuna workers writing to a closed
         # ipykernel stream after a cell is interrupted or restarted.
         self.logger.propagate = True
-        self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+        self.logger.setLevel(logging.DEBUG if verbose else logging.getLogger().getEffectiveLevel())
 
     def is_cuda_available(self) -> bool:
         """Check if CUDA device is available for tracking."""
