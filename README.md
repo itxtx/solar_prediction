@@ -23,7 +23,7 @@ pytest
 solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8 --quiet
 ```
 
-For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab. For the full ignored dataset, upload `data/solar_weather.csv` too and run `notebooks/colab_full_run_actual_data.ipynb`.
+For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab. For the full ignored dataset, upload `data/solar_weather.csv` too and run `notebooks/colab_full_run_actual_data.ipynb`. Use `notebooks/colab_horizon_sweep_actual_data.ipynb` when comparing 15-minute, 1-hour, 4-hour, and 24-hour forecast horizons.
 
 The comparison command prints a CSV-style metrics table:
 
@@ -86,7 +86,7 @@ This avoids the common time-series leakage pattern where scalers or target trans
 
 The portfolio comparison includes:
 
-- **Persistence baseline**: predicts the next value from the most recent observed value.
+- **Persistence baseline**: predicts the future value from the most recent observed value at the configured horizon.
 - **Seasonal naive baseline**: predicts from the same offset in a previous daily cycle when available.
 - **LSTM**: compact recurrent neural network implemented in PyTorch.
 - **GRU**: compact recurrent neural network implemented in PyTorch.

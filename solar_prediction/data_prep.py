@@ -82,13 +82,15 @@ def _resolve_input_config(df_input: pd.DataFrame, cfg: DataInputConfig) -> DataI
 
 def _compute_sequence_split_metadata(n_rows: int, sequence_cfg: SequenceConfig) -> Dict[str, Any]:
     """Compute chronological sequence split boundaries before fitted preprocessing."""
-    if n_rows <= sequence_cfg.window_size:
+    min_rows = sequence_cfg.window_size + sequence_cfg.horizon_steps
+    if n_rows < min_rows:
         raise ValueError(
-            f"Data length ({n_rows}) is <= window_size ({sequence_cfg.window_size}). "
+            f"Data length ({n_rows}) is too short for window_size "
+            f"({sequence_cfg.window_size}) and horizon_steps ({sequence_cfg.horizon_steps}). "
             "Cannot create sequences."
         )
 
-    n_sequences = n_rows - sequence_cfg.window_size
+    n_sequences = n_rows - sequence_cfg.window_size - sequence_cfg.horizon_steps + 1
     n_test = int(math.ceil(sequence_cfg.test_size * n_sequences))
     n_train_val = n_sequences - n_test
     if n_train_val <= 0:
@@ -105,12 +107,13 @@ def _compute_sequence_split_metadata(n_rows: int, sequence_cfg: SequenceConfig) 
 
     window_size = sequence_cfg.window_size
     feature_fit_end = window_size + n_train
-    target_fit_start = window_size
-    target_fit_end = window_size + n_train
+    target_fit_start = window_size + sequence_cfg.horizon_steps - 1
+    target_fit_end = target_fit_start + n_train
 
     return {
         "n_rows": n_rows,
         "window_size": window_size,
+        "horizon_steps": sequence_cfg.horizon_steps,
         "n_sequences": n_sequences,
         "n_train_sequences": n_train,
         "n_val_sequences": n_val,
@@ -982,14 +985,19 @@ def _create_sequences_and_split(
     data_for_sequences.ffill(inplace=True)  # Apply ffill inplace
     data_for_sequences.bfill(inplace=True)  # Then apply bfill inplace
 
-    if len(data_for_sequences) <= sequence_cfg.window_size:
+    min_rows = sequence_cfg.window_size + sequence_cfg.horizon_steps
+    if len(data_for_sequences) < min_rows:
         raise ValueError(
-            f"Data length ({len(data_for_sequences)}) after NaN handling is <= window_size ({sequence_cfg.window_size}). Cannot create sequences."
+            f"Data length ({len(data_for_sequences)}) after NaN handling is too short for "
+            f"window_size ({sequence_cfg.window_size}) and horizon_steps "
+            f"({sequence_cfg.horizon_steps}). Cannot create sequences."
         )
 
     # Optimized sequence generation using pre-allocated arrays and stride tricks
     num_features = len(feature_cols)
-    sequence_length = len(data_for_sequences) - sequence_cfg.window_size
+    sequence_length = (
+        len(data_for_sequences) - sequence_cfg.window_size - sequence_cfg.horizon_steps + 1
+    )
 
     if sequence_length <= 0:
         # Handle edge case where not enough data for sequences
@@ -1018,17 +1026,18 @@ def _create_sequences_and_split(
         X_windows = sliding_window_view(
             feature_data, window_shape=(sequence_cfg.window_size, num_features), axis=(0, 1)
         )
-        X_all = X_windows[:, 0, :, :][:-1]
+        X_all = X_windows[:, 0, :, :][:sequence_length]
 
         # Extract target values efficiently
-        y_all = target_data[sequence_cfg.window_size : sequence_cfg.window_size + sequence_length]
+        target_start = sequence_cfg.window_size + sequence_cfg.horizon_steps - 1
+        y_all = target_data[target_start : target_start + sequence_length]
 
     except Exception as e:
         logging.warning(f"Sliding window optimization failed, falling back to loop: {e}")
         # Fallback to the original method if stride tricks fail
         for i in range(sequence_length):
             X_all[i] = feature_data[i : i + sequence_cfg.window_size]
-            y_all[i] = target_data[i + sequence_cfg.window_size]
+            y_all[i] = target_data[i + sequence_cfg.window_size + sequence_cfg.horizon_steps - 1]
 
     # Reshape y to column vector
     y_all = y_all.reshape(-1, 1)

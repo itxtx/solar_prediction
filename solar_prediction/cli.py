@@ -27,21 +27,35 @@ from .lstm import (
 DEFAULT_SAMPLE_DATA = Path("data/sample/SolarPrediction_sample.csv")
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
 def _load_dataframe(data_path: Path) -> pd.DataFrame:
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
     return pd.read_csv(data_path)
 
 
-def _prepare(data_path: Path):
+def _copy_sequence_config_with_horizon(sequence_cfg: Any, horizon_steps: int):
+    if hasattr(sequence_cfg, "model_copy"):
+        return sequence_cfg.model_copy(update={"horizon_steps": horizon_steps})
+    return sequence_cfg.copy(update={"horizon_steps": horizon_steps})
+
+
+def _prepare(data_path: Path, horizon_steps: int = 1):
     config = get_config()
+    sequence_cfg = _copy_sequence_config_with_horizon(config.sequences, horizon_steps)
     return prepare_weather_data(
         _load_dataframe(data_path),
         config.input,
         config.transformation,
         config.features,
         config.scaling,
-        config.sequences,
+        sequence_cfg,
     )
 
 
@@ -140,12 +154,13 @@ def _baseline_predictions(
     target = _raw_target_series(data_path)
     split = transform_info["split_metadata"]
     window = split["window_size"]
+    horizon_steps = split.get("horizon_steps", 1)
     test_start, test_end = split["test_sequence_range"]
     sequence_indices = np.arange(test_start, test_end)
-    target_indices = window + sequence_indices
+    target_indices = window + horizon_steps - 1 + sequence_indices
 
     actual = target[target_indices]
-    persistence = target[np.maximum(target_indices - 1, 0)]
+    persistence = target[np.maximum(target_indices - horizon_steps, 0)]
     seasonal_indices = target_indices - seasonal_lag
     seasonal = np.where(seasonal_indices >= 0, target[seasonal_indices], persistence)
 
@@ -201,7 +216,7 @@ def _evaluation_metrics_for_table(
 
 def command_train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output)
-    data = _prepare(Path(args.data))
+    data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
     X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = data
 
     model, train_cfg = _model_and_configs(
@@ -247,7 +262,7 @@ def command_train(args: argparse.Namespace) -> None:
 
 
 def command_evaluate(args: argparse.Namespace) -> None:
-    data = _prepare(Path(args.data))
+    data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
     X_train, X_val, X_test, y_train, y_val, y_test, scalers, _, transform_info = data
     del X_train, X_val, y_train, y_val
 
@@ -268,7 +283,7 @@ def command_evaluate(args: argparse.Namespace) -> None:
 
 
 def command_compare(args: argparse.Namespace) -> None:
-    data = _prepare(Path(args.data))
+    data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
     X_train, X_val, X_test, y_train, y_val, y_test, scalers, _, transform_info = data
 
     actual, baselines = _baseline_predictions(Path(args.data), transform_info, args.seasonal_lag)
@@ -317,6 +332,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--epochs", type=int, default=2)
         subparser.add_argument("--hidden-dim", type=int, default=16)
         subparser.add_argument("--batch-size", type=int, default=32)
+        subparser.add_argument(
+            "--horizon-steps",
+            type=_positive_int,
+            default=1,
+            help="Forecast horizon in rows after the input window",
+        )
         subparser.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
 
     train = subparsers.add_parser("train", help="Train an LSTM or GRU checkpoint")
@@ -331,6 +352,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--data", default=str(DEFAULT_SAMPLE_DATA))
     evaluate.add_argument("--device", default="cpu")
     evaluate.add_argument("--batch-size", type=int, default=32)
+    evaluate.add_argument(
+        "--horizon-steps",
+        type=_positive_int,
+        default=1,
+        help="Forecast horizon in rows after the input window",
+    )
     evaluate.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
     evaluate.set_defaults(func=command_evaluate)
 

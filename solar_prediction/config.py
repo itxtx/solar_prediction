@@ -192,10 +192,18 @@ class SequenceConfig(BaseModel):
     """Configuration for creating sequences."""
 
     window_size: int = Field(12, description="Sequence window size")
+    horizon_steps: int = Field(1, description="Forecast horizon in rows after the input window")
     test_size: float = Field(0.2, description="Test set proportion")
     val_size_from_train_val: float = Field(
         0.25, description="Validation size as fraction of train+val"
     )
+
+    @field_validator("window_size", "horizon_steps")
+    @classmethod
+    def validate_positive_steps(cls, v):
+        if v < 1:
+            raise ValueError("Sequence steps must be >= 1")
+        return v
 
     @field_validator("test_size", "val_size_from_train_val")
     @classmethod
