@@ -339,7 +339,7 @@ class WeatherLSTM(nn.Module):
 
         # Initialize gradient scaler for mixed precision if CUDA is available
         scaler = (
-            torch.cuda.amp.GradScaler() if torch.cuda.is_available() and "cuda" in device else None
+            torch.amp.GradScaler("cuda") if torch.cuda.is_available() and "cuda" in device else None
         )
         use_amp = scaler is not None
 
