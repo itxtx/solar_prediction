@@ -23,6 +23,8 @@ pytest
 solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8
 ```
 
+For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab.
+
 The comparison command prints a CSV-style metrics table:
 
 ```text

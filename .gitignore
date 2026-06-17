@@ -14,6 +14,7 @@ dist/
 # Local environments and secrets
 .env
 *.env
+uv.lock
 venv/
 venv_test/
 .venv/
