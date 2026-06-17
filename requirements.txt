@@ -1,7 +1,7 @@
 # Compatibility export for environments that do not use pyproject extras.
 # Preferred portfolio setup:
 #   pip install -e ".[dev,notebooks]"
-numpy>=1.24,<2.0
+numpy>=1.24
 pandas>=1.5
 scipy>=1.10
 torch>=2.0
