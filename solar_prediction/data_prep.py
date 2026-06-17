@@ -600,6 +600,8 @@ def _apply_target_transformations(
                 "params": {
                     "night_thresh": cfg.piecewise_night_threshold,
                     "moderate_thresh": cfg.piecewise_moderate_threshold,
+                    "moderate_slope": cfg.piecewise_moderate_slope,
+                    "high_slope": cfg.piecewise_high_slope,
                 },
             }
         )

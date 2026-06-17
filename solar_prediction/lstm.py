@@ -568,19 +568,17 @@ class WeatherLSTM(nn.Module):
     def _apply_inverse_structural_transforms(
         self, y: np.ndarray, transform_info: Dict, scalers_dict: Optional[Dict] = None
     ) -> np.ndarray:
-        """Handles inverse structural transformations (log, Yeo-Johnson)."""
+        """Handles inverse structural transformations (log, piecewise, Yeo-Johnson)."""
         y_processed = y  # Assumes y is 1D from _apply_inverse_scaling
-        if transform_info and "transforms" in transform_info:
-            target_col_orig_name = transform_info.get("target_col_original")
-            for t_details in reversed(transform_info.get("transforms", [])):
-                if t_details.get("original_col") != target_col_orig_name or not t_details.get(
-                    "applied", False
-                ):
+        if transform_info:
+            transforms = transform_info.get(
+                "structural_transforms", transform_info.get("transforms", [])
+            )
+            for t_details in reversed(transforms):
+                if not t_details.get("applied", False):
                     continue
                 t_type = t_details.get("type")
-                logging.info(
-                    f"Applying inverse structural transform: {t_type} for {target_col_orig_name}"
-                )
+                logging.info(f"Applying inverse structural transform: {t_type}")
                 if t_type == "log":
                     config = get_config()
                     offset = t_details.get("offset", 0)
@@ -590,6 +588,37 @@ class WeatherLSTM(nn.Module):
                     y_processed = np.exp(exp_input)
                     if offset > 0:
                         y_processed -= offset
+                elif t_type == "piecewise":
+                    params = t_details.get("params", {})
+                    config = get_config()
+                    night_thresh = params.get(
+                        "night_thresh", config.transformation.piecewise_night_threshold
+                    )
+                    moderate_thresh = params.get(
+                        "moderate_thresh", config.transformation.piecewise_moderate_threshold
+                    )
+                    moderate_slope = params.get(
+                        "moderate_slope", config.transformation.piecewise_moderate_slope
+                    )
+                    high_slope = params.get(
+                        "high_slope", config.transformation.piecewise_high_slope
+                    )
+                    night_end = np.log1p(night_thresh - 1e-6)
+                    moderate_end = night_end + moderate_slope * (
+                        moderate_thresh - night_thresh - 1e-6
+                    )
+                    y_original = np.empty_like(y_processed, dtype=float)
+                    night_mask = y_processed <= night_end
+                    moderate_mask = (y_processed > night_end) & (y_processed <= moderate_end)
+                    high_mask = y_processed > moderate_end
+                    y_original[night_mask] = np.expm1(y_processed[night_mask])
+                    y_original[moderate_mask] = (
+                        night_thresh + (y_processed[moderate_mask] - night_end) / moderate_slope
+                    )
+                    y_original[high_mask] = (
+                        moderate_thresh + (y_processed[high_mask] - moderate_end) / high_slope
+                    )
+                    y_processed = y_original
                 elif t_type == "yeo-johnson":
                     lambda_val = t_details.get("lambda")
                     pt_obj = (
@@ -615,7 +644,7 @@ class WeatherLSTM(nn.Module):
     def _apply_domain_clipping(self, y: np.ndarray, transform_info: Dict) -> np.ndarray:
         """Applies domain-specific clipping, e.g., for GHI."""
         y_processed = y
-        if transform_info and transform_info.get("target_col_original") == "Radiation":
+        if transform_info and transform_info.get("target_col_standardized") == "Radiation":
             config = get_config()
             y_processed = np.clip(y, config.data.min_radiation_clip, config.data.max_radiation_clip)
         return y_processed

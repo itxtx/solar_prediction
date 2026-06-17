@@ -331,6 +331,60 @@ class TestGRUModel:
 class TestModelComparisons:
     """Test comparisons between LSTM and GRU models."""
 
+    def test_lstm_and_gru_inverse_log_transform_targets(self):
+        """Model-side inverse transforms should consume pipeline structural metadata."""
+        config = get_config()
+        rows = 48
+        df = pd.DataFrame(
+            {
+                "Time": pd.date_range("2023-01-01", periods=rows, freq="h"),
+                "GHI": np.linspace(50, 800, rows),
+                "temp": np.linspace(5, 25, rows),
+                "pressure": np.linspace(1005, 1020, rows),
+                "humidity": np.linspace(80, 40, rows),
+                "wind_speed": np.linspace(1, 5, rows),
+                "clouds_all": np.linspace(90, 10, rows),
+                "rain_1h": np.zeros(rows),
+                "snow_1h": np.zeros(rows),
+            }
+        )
+        transform_cfg = config.transformation.model_copy(
+            update={"use_log_transform": True, "use_power_transform": False}
+        )
+        sequence_cfg = config.sequences.model_copy(
+            update={"window_size": 4, "test_size": 0.2, "val_size_from_train_val": 0.25}
+        )
+
+        X_train, X_val, X_test, y_train, y_val, y_test, scalers, _, transform_info = (
+            prepare_weather_data(
+                df,
+                config.input,
+                transform_cfg,
+                config.features,
+                config.scaling,
+                sequence_cfg,
+            )
+        )
+        target_scaler = scalers[transform_info["target_scaler_name"]]
+        y_all = np.concatenate([y_train, y_val, y_test])
+        expected = df["GHI"].to_numpy(dtype=float)[sequence_cfg.window_size :]
+
+        lstm = WeatherLSTM(create_model_hyperparameters_from_config(input_dim=X_train.shape[2]))
+        gru = WeatherGRU(create_gru_model_hyperparameters_from_config(input_dim=X_train.shape[2]))
+
+        np.testing.assert_allclose(
+            lstm._inverse_transform_target(y_all, target_scaler, transform_info, scalers),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            gru._inverse_transform_target(y_all, target_scaler, transform_info, scalers),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
     def test_lstm_vs_gru_output_shapes(self, numpy_arrays_2d, device):
         """Test that LSTM and GRU produce same output shapes."""
         X, y = numpy_arrays_2d
