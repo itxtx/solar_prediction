@@ -121,27 +121,27 @@ class FeatureEngineeringConfig(BaseModel):
     # Predefined feature sets
     minimal_features: List[str] = Field(
         default_factory=lambda: [
-            "GHI",
-            "temp",
-            "humidity",
+            "Radiation",
+            "Temperature",
+            "Humidity",
             "TimeMinutesSin",
             "TimeMinutesCos",
-            "clouds_all",
+            "Cloudcover",
         ],
         description="Minimal feature set",
     )
 
     basic_features: List[str] = Field(
         default_factory=lambda: [
-            "GHI",
-            "temp",
-            "pressure",
-            "humidity",
-            "wind_speed",
+            "Radiation",
+            "Temperature",
+            "Pressure",
+            "Humidity",
+            "WindSpeed",
             "TimeMinutesSin",
             "TimeMinutesCos",
-            "clouds_all",
-            "rain_1h",
+            "Cloudcover",
+            "Rain",
         ],
         description="Basic feature set",
     )

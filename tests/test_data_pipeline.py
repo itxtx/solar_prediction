@@ -331,6 +331,59 @@ class TestDataPipelineTransformations:
 
         print(f"Time features engineering test passed! Found: {time_features_found}")
 
+    def test_basic_and_minimal_feature_modes_use_standardized_names(self):
+        """Raw weather-schema feature modes should survive standardization."""
+        config = get_config()
+        rows = 48
+        df = pd.DataFrame(
+            {
+                "Time": pd.date_range("2023-01-01", periods=rows, freq="h"),
+                "GHI": np.linspace(0, 700, rows),
+                "temp": np.linspace(5, 25, rows),
+                "pressure": np.linspace(1005, 1020, rows),
+                "humidity": np.linspace(80, 40, rows),
+                "wind_speed": np.linspace(1, 5, rows),
+                "clouds_all": np.linspace(90, 10, rows),
+                "rain_1h": np.zeros(rows),
+                "snow_1h": np.zeros(rows),
+            }
+        )
+        sequence_cfg = config.sequences.model_copy(
+            update={"window_size": 4, "test_size": 0.2, "val_size_from_train_val": 0.25}
+        )
+
+        expected_by_mode = {
+            "minimal": {
+                "Temperature",
+                "Humidity",
+                "Cloudcover",
+                "TimeMinutesSin",
+                "TimeMinutesCos",
+            },
+            "basic": {
+                "Temperature",
+                "Pressure",
+                "Humidity",
+                "WindSpeed",
+                "Cloudcover",
+                "Rain",
+                "TimeMinutesSin",
+                "TimeMinutesCos",
+            },
+        }
+
+        for mode, expected_features in expected_by_mode.items():
+            feature_cfg = config.features.model_copy(update={"feature_selection_mode": mode})
+            *_, feature_cols, _ = prepare_weather_data(
+                df,
+                config.input,
+                config.transformation,
+                feature_cfg,
+                config.scaling,
+                sequence_cfg,
+            )
+            assert expected_features.issubset(set(feature_cols))
+
     def test_fitted_preprocessing_uses_training_rows_only(self):
         """Future/test target outliers should not affect fitted target scaling."""
         config = get_config()
