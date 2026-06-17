@@ -23,6 +23,7 @@ def test_cli_compare_smoke(tmp_path, capsys):
         }
     )
     df.to_csv(data_path, index=False)
+    output_dir = tmp_path / "artifacts"
 
     main(
         [
@@ -35,6 +36,8 @@ def test_cli_compare_smoke(tmp_path, capsys):
             "4",
             "--batch-size",
             "16",
+            "--output",
+            str(output_dir),
             "--seasonal-lag",
             "24",
             "--quiet",
@@ -47,6 +50,11 @@ def test_cli_compare_smoke(tmp_path, capsys):
     assert "seasonal_naive" in output
     assert "lstm" in output
     assert "gru" in output
+    assert (output_dir / "comparison_metrics.json").exists()
+    assert (output_dir / "lstm_model.pt").exists()
+    assert (output_dir / "lstm_metadata.json").exists()
+    assert (output_dir / "gru_model.pt").exists()
+    assert (output_dir / "gru_metadata.json").exists()
 
 
 def test_baseline_predictions_use_forecast_horizon(tmp_path):

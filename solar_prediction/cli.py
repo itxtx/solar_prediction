@@ -284,7 +284,10 @@ def command_evaluate(args: argparse.Namespace) -> None:
 
 def command_compare(args: argparse.Namespace) -> None:
     data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
-    X_train, X_val, X_test, y_train, y_val, y_test, scalers, _, transform_info = data
+    X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = data
+    output_dir = Path(args.output) if args.output else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     actual, baselines = _baseline_predictions(Path(args.data), transform_info, args.seasonal_lag)
     metrics_by_model = {name: _metrics(actual, pred) for name, pred in baselines.items()}
@@ -316,9 +319,29 @@ def command_compare(args: argparse.Namespace) -> None:
         else:
             metrics_by_model[model_name] = _metrics(actual_original, pred_original)
 
+        if output_dir:
+            checkpoint = output_dir / f"{model_name}_model.pt"
+            model.save(
+                str(checkpoint), train_cfg=train_cfg, metrics=eval_metrics, use_enhanced=False
+            )
+            metadata = {
+                "model": model_name,
+                "checkpoint": str(checkpoint),
+                "data": str(args.data),
+                "horizon_steps": args.horizon_steps,
+                "feature_columns": feature_cols,
+                "metrics": eval_metrics,
+                "transform_info": {
+                    key: value
+                    for key, value in transform_info.items()
+                    if key != "structural_transforms"
+                },
+            }
+            _write_json(output_dir / f"{model_name}_metadata.json", metadata)
+
     _print_metrics_table(metrics_by_model)
-    if args.output:
-        _write_json(Path(args.output) / "comparison_metrics.json", metrics_by_model)
+    if output_dir:
+        _write_json(output_dir / "comparison_metrics.json", metrics_by_model)
 
 
 def build_parser() -> argparse.ArgumentParser:
