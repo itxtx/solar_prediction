@@ -23,7 +23,7 @@ pytest
 solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8 --quiet
 ```
 
-For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab.
+For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab. For the full ignored dataset, upload `data/solar_weather.csv` too and run `notebooks/colab_full_run_actual_data.ipynb`.
 
 The comparison command prints a CSV-style metrics table:
 
@@ -104,7 +104,7 @@ solar_prediction/
   tdmc.py             # optional time-dynamic Markov chain experiments
 tests/                # unit and smoke tests
 data/sample/          # tracked sample data
-notebooks/            # Colab smoke verification
+notebooks/            # Colab smoke and full-data verification
 ```
 
 ## Development
