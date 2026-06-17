@@ -7,10 +7,10 @@ It uses Pydantic for validation and type safety.
 
 Usage:
     from solar_prediction.config import get_config
-    
+
     config = get_config()
     print(config.data.min_radiation_clip)
-    
+
     # Or for specific sections:
     data_config = get_config().data
     model_config = get_config().models.lstm
@@ -21,7 +21,6 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from pydantic import BaseModel, Field, field_validator
 import os
-
 
 # =============================================================================
 # Data Processing Configuration

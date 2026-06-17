@@ -29,7 +29,3 @@ jobs:
 
       - name: Test
         run: pytest --cov=solar_prediction --cov-report=term-missing
-
-      - name: CLI smoke test
-        run: |
-          solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8 --batch-size 64

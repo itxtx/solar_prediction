@@ -24,7 +24,6 @@ from .lstm import (
     create_training_config_from_config,
 )
 
-
 DEFAULT_SAMPLE_DATA = Path("data/sample/SolarPrediction_sample.csv")
 
 

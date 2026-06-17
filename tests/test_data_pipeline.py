@@ -12,46 +12,6 @@ from solar_prediction.config import get_config
 class TestDataPipelineEndToEnd:
     """Test end-to-end data preparation pipeline."""
 
-    def test_pipeline_with_sample_data(self, sample_data):
-        """Test complete data pipeline with sample data."""
-        # Skip this test for now since the function expects specific config structure
-        pytest.skip("Data pipeline test requires specific configuration setup")
-
-        # Unpack results
-        X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = (
-            result
-        )
-
-        # Test shapes
-        self._assert_valid_shapes(X_train, X_val, X_test, y_train, y_val, y_test)
-
-        # Test for NaN values
-        self._assert_no_nan_values(X_train, X_val, X_test, y_train, y_val, y_test)
-
-        # Test feature columns
-        assert isinstance(feature_cols, list)
-        assert len(feature_cols) > 0
-        assert all(isinstance(col, str) for col in feature_cols)
-
-        # Test scalers
-        assert isinstance(scalers, dict)
-        assert len(scalers) > 0
-
-        # Test transform info
-        assert isinstance(transform_info, dict)
-        assert "feature_columns_used" in transform_info
-
-        print(f"Pipeline test passed:")
-        print(f"  X_train shape: {X_train.shape}")
-        print(f"  X_val shape: {X_val.shape}")
-        print(f"  X_test shape: {X_test.shape}")
-        print(f"  Features: {len(feature_cols)}")
-        print(f"  Scalers: {len(scalers)}")
-
-    def test_pipeline_with_minimal_data(self, temp_csv_file):
-        """Test pipeline with minimal data."""
-        pytest.skip("Data pipeline tests require specific configuration setup")
-
     def test_pipeline_shapes_consistency(self, small_sample_data):
         """Test that pipeline produces consistent shapes."""
         config = get_config()
