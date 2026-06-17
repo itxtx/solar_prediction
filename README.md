@@ -11,7 +11,7 @@ The project is designed as a portfolio-ready ML repository: a reviewer can clone
 - Baseline comparison against persistence and seasonal naive forecasts.
 - LSTM and GRU sequence models with checkpoint save/load support.
 - A script-first workflow for reproducible training, evaluation, and comparison.
-- Optional notebooks and experimental SARIMA/TDMC work for deeper analysis.
+- A small Colab smoke notebook for verification without local training.
 
 ## Quick Start
 
@@ -91,11 +91,7 @@ The portfolio comparison includes:
 - **LSTM**: compact recurrent neural network implemented in PyTorch.
 - **GRU**: compact recurrent neural network implemented in PyTorch.
 
-SARIMA and TDMC implementations remain in the repository as optional/experimental analysis paths. Install classical dependencies with:
-
-```bash
-pip install -e ".[classical]"
-```
+The TDMC implementation remains in the repository as an optional experimental analysis path.
 
 ## Repository Layout
 
@@ -105,11 +101,10 @@ solar_prediction/
   data_prep.py        # leakage-safe preprocessing and sequence creation
   lstm.py             # PyTorch LSTM model
   gru.py              # PyTorch GRU model
-  sarima.py           # optional classical time-series experiments
   tdmc.py             # optional time-dynamic Markov chain experiments
 tests/                # unit and smoke tests
 data/sample/          # tracked sample data
-notebooks/            # supporting reports, not the primary execution path
+notebooks/            # Colab smoke verification
 ```
 
 ## Development

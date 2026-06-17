@@ -35,10 +35,6 @@ notebooks = [
     "ipykernel>=6.0",
     "nbconvert>=7",
 ]
-classical = [
-    "statsmodels>=0.14",
-    "pmdarima>=2.0",
-]
 
 [project.scripts]
 solar-predict = "solar_prediction.cli:main"
