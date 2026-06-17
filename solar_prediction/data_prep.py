@@ -490,7 +490,7 @@ def _engineer_time_features(
 
             # Vectorized daylight position calculation
             df[STD_DAYLIGHT_POSITION] = np.clip(time_since_sunrise / daylight_duration_safe, 0, 1)
-            df[STD_DAYLIGHT_POSITION].fillna(0, inplace=True)
+            df[STD_DAYLIGHT_POSITION] = df[STD_DAYLIGHT_POSITION].fillna(0)
 
             df[STD_TIME_SINCE_SUNRISE] = time_since_sunrise
             time_until_sunset = sunset_minutes - current_time_minutes
