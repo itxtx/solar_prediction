@@ -1016,7 +1016,7 @@ def _create_sequences_and_split(
         X_windows = sliding_window_view(
             feature_data, window_shape=(sequence_cfg.window_size, num_features), axis=(0, 1)
         )
-        X_all = X_windows.squeeze(axis=-1)  # Remove extra dimension
+        X_all = X_windows[:, 0, :, :][:-1]
 
         # Extract target values efficiently
         y_all = target_data[sequence_cfg.window_size : sequence_cfg.window_size + sequence_length]

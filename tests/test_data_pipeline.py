@@ -5,8 +5,8 @@ Test data pipeline: end-to-end prepare → shapes/NaN asserts.
 import pytest
 import numpy as np
 import pandas as pd
-from solar_prediction.data_prep import prepare_weather_data
-from solar_prediction.config import get_config
+from solar_prediction.data_prep import _create_sequences_and_split, prepare_weather_data
+from solar_prediction.config import SequenceConfig, get_config
 
 
 class TestDataPipelineEndToEnd:
@@ -84,6 +84,51 @@ class TestDataPipelineEndToEnd:
         assert feature_cols == transform_info["feature_columns_used"]
 
         print(f"Feature columns match test passed: {len(feature_cols)} features")
+
+    def test_sequence_creation_uses_aligned_stride_windows(self):
+        """Test multi-feature stride windows align with next-step targets."""
+        scaled_df = pd.DataFrame(
+            {
+                "feature_a": np.arange(8, dtype=float),
+                "feature_b": np.arange(100, 108, dtype=float),
+                "target_scaled": np.arange(200, 208, dtype=float),
+            }
+        )
+        sequence_cfg = SequenceConfig(window_size=3, test_size=0.4, val_size_from_train_val=0.25)
+
+        X_train, X_val, X_test, y_train, y_val, y_test = _create_sequences_and_split(
+            scaled_df, ["feature_a", "feature_b"], "target_scaled", sequence_cfg
+        )
+
+        X_all = np.concatenate([X_train, X_val, X_test])
+        y_all = np.concatenate([y_train, y_val, y_test]).reshape(-1)
+
+        assert X_all.shape == (5, 3, 2)
+        np.testing.assert_array_equal(X_all[0], scaled_df[["feature_a", "feature_b"]].iloc[:3])
+        np.testing.assert_array_equal(X_all[-1], scaled_df[["feature_a", "feature_b"]].iloc[4:7])
+        np.testing.assert_array_equal(y_all, scaled_df["target_scaled"].iloc[3:8])
+
+    def test_sequence_creation_handles_single_feature_stride_windows(self):
+        """Test one-feature stride windows keep a 3D feature axis."""
+        scaled_df = pd.DataFrame(
+            {
+                "feature_a": np.arange(8, dtype=float),
+                "target_scaled": np.arange(200, 208, dtype=float),
+            }
+        )
+        sequence_cfg = SequenceConfig(window_size=3, test_size=0.4, val_size_from_train_val=0.25)
+
+        X_train, X_val, X_test, y_train, y_val, y_test = _create_sequences_and_split(
+            scaled_df, ["feature_a"], "target_scaled", sequence_cfg
+        )
+
+        X_all = np.concatenate([X_train, X_val, X_test])
+        y_all = np.concatenate([y_train, y_val, y_test]).reshape(-1)
+
+        assert X_all.shape == (5, 3, 1)
+        np.testing.assert_array_equal(X_all[0, :, 0], scaled_df["feature_a"].iloc[:3])
+        np.testing.assert_array_equal(X_all[-1, :, 0], scaled_df["feature_a"].iloc[4:7])
+        np.testing.assert_array_equal(y_all, scaled_df["target_scaled"].iloc[3:8])
 
     def _assert_valid_shapes(
         self, X_train, X_val, X_test, y_train, y_val, y_test, allow_empty=False
