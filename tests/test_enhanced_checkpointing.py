@@ -186,6 +186,24 @@ def test_gru_enhanced_checkpointing():
         print("✓ GRU enhanced checkpointing tests passed")
 
 
+def test_legacy_sequence_checkpoints_load_without_enhanced_warning(caplog):
+    """Legacy LSTM/GRU checkpoints should load quietly after enhanced probing."""
+    lstm = WeatherLSTM(create_model_hyperparameters_from_config(input_dim=10))
+    gru = WeatherGRU(create_gru_model_hyperparameters_from_config(input_dim=10))
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        lstm_path = Path(temp_dir) / "lstm_legacy.pt"
+        gru_path = Path(temp_dir) / "gru_legacy.pt"
+        lstm.save(str(lstm_path), use_enhanced=False)
+        gru.save(str(gru_path), use_enhanced=False)
+
+        with caplog.at_level(logging.WARNING):
+            WeatherLSTM.load(str(lstm_path))
+            WeatherGRU.load(str(gru_path))
+
+    assert "Enhanced checkpointing failed" not in caplog.text
+
+
 def test_cross_compatibility():
     """Test version compatibility and error handling."""
     print("\n=== Testing Cross-Compatibility ===")

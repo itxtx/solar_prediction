@@ -1318,7 +1318,7 @@ class WeatherLSTM(nn.Module):
             except Exception as e:
                 if strict:
                     raise ValueError(f"Failed to load enhanced checkpoint: {e}")
-                else:
+                if "got unknown" not in str(e):
                     logging.warning(
                         f"Enhanced checkpointing failed ({e}), falling back to legacy format"
                     )
