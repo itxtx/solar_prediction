@@ -44,6 +44,27 @@ solar-predict evaluate --model lstm --checkpoint artifacts/lstm_model.pt --data 
 
 Generated checkpoints and metrics are written to `artifacts/`, which is intentionally ignored by Git.
 
+## Full-Data Colab Results
+
+The full-data Colab sweep below used `data/solar_weather.csv`, 15-minute rows, `epochs=50`, `hidden_dim=32`, `batch_size=256`, and `seasonal_lag=96`. Results are preliminary single-run checks rather than a final benchmark.
+
+| Horizon | Best baseline RMSE / R2 | LSTM RMSE / R2 | GRU RMSE / R2 | Takeaway |
+| --- | ---: | ---: | ---: | --- |
+| 15 min | 8.41 / 0.976 | 16.79 / 0.903 | 16.48 / 0.906 | Persistence is the right baseline to beat; one-step forecasting is mostly copying the latest value. |
+| 1 h | 21.03 / 0.847 | 17.85 / 0.890 | 17.44 / 0.895 | GRU/LSTM start to outperform persistence. |
+| 4 h | 30.09 / 0.688 | 20.28 / 0.858 | 19.89 / 0.864 | Recurrent models clearly beat persistence and seasonal naive. |
+| 24 h | 30.09 / 0.688 | 24.26 / 0.797 | 23.61 / 0.808 | GRU/LSTM beat same-time-yesterday forecasting. |
+
+`capped_mape` is reported by the CLI, but solar irradiance has many near-zero/night values, so RMSE, MAE, and R2 are better headline metrics for these runs.
+
+![Horizon sweep comparison](plots/download_barchart.png)
+
+![GRU forecast compared with actual GHI](plots/gru_forecast.png)
+
+A small GRU tuning sweep found only marginal gains over the default compact model; larger hidden dimensions did not reliably improve performance. The best observed GRU settings were `epochs=150, hidden_dim=64` for the 4-hour horizon (RMSE 19.77, R2 0.865) and `epochs=100, hidden_dim=64` for the 24-hour horizon (RMSE 23.64, R2 0.807).
+
+![GRU hyperparameter tuning comparison](plots/GRU_tuning_comparision.png)
+
 ## Data
 
 The repository tracks only a small sample dataset:
