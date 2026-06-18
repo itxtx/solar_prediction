@@ -2,7 +2,6 @@
 
 Reproducible solar Global Horizontal Irradiance (GHI) forecasting with a leakage-safe preprocessing pipeline, simple time-series baselines, and compact PyTorch LSTM/GRU models.
 
-The project is designed as a portfolio-ready ML repository: a reviewer can clone it, install it, run tests, and execute a small end-to-end comparison without needing private local files or a GPU.
 
 ## What This Project Shows
 
