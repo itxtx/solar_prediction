@@ -55,13 +55,24 @@ The full-data Colab sweep below used `data/solar_weather.csv`, 15-minute rows, `
 | 4 h | 30.09 / 0.688 | 20.28 / 0.858 | 19.89 / 0.864 | Recurrent models clearly beat persistence and seasonal naive. |
 | 24 h | 30.09 / 0.688 | 24.26 / 0.797 | 23.61 / 0.808 | GRU/LSTM beat same-time-yesterday forecasting. |
 
+### Key Takeaways
+
+On held-out full-data Colab runs, the best GRU reduced RMSE by about 34% versus the strongest naive baseline at the 4-hour horizon and about 21% at the 24-hour horizon, reaching R2 of 0.865 and 0.807 respectively.
+
+| Horizon | Best GRU | Strongest naive baseline | RMSE improvement |
+| --- | ---: | ---: | ---: |
+| 4 h | RMSE 19.77, MAE 10.37, R2 0.865 | RMSE 30.09, R2 0.688 | ~34% |
+| 24 h | RMSE 23.64, MAE 12.66, R2 0.807 | RMSE 30.09, R2 0.688 | ~21% |
+
+A small GRU tuning sweep found only marginal gains over the compact default model. `hidden_dim=64` helped slightly, while larger hidden dimensions and longer training did not reliably improve performance. This suggests the main improvement came from reframing the task as multi-horizon forecasting rather than from model complexity.
+
+These are encouraging all-hours metrics, but the next stricter check is daylight-only evaluation because nighttime periods are easier and can make long-horizon solar forecasts look better than they are.
+
 `capped_mape` is reported by the CLI, but solar irradiance has many near-zero/night values, so RMSE, MAE, and R2 are better headline metrics for these runs.
 
 ![Horizon sweep comparison](plots/download_barchart.png)
 
 ![GRU forecast compared with actual GHI](plots/gru_forecast.png)
-
-A small GRU tuning sweep found only marginal gains over the default compact model; larger hidden dimensions did not reliably improve performance. The best observed GRU settings were `epochs=150, hidden_dim=64` for the 4-hour horizon (RMSE 19.77, R2 0.865) and `epochs=100, hidden_dim=64` for the 24-hour horizon (RMSE 23.64, R2 0.807).
 
 ![GRU hyperparameter tuning comparison](plots/GRU_tuning_comparision.png)
 
