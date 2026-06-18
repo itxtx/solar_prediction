@@ -23,7 +23,7 @@ pytest
 solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 --hidden-dim 8 --quiet
 ```
 
-For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab. For the full ignored dataset, upload `data/solar_weather.csv` too and run `notebooks/colab_full_run_actual_data.ipynb`. Use `notebooks/colab_horizon_sweep_actual_data.ipynb` when comparing 15-minute, 1-hour, 4-hour, and 24-hour forecast horizons.
+For a no-local-training check, upload the lightweight project folder to Google Drive and run `notebooks/colab_smoke_check.ipynb` in Colab. For the full ignored dataset, upload `data/solar_weather.csv` too and run `notebooks/colab_full_run_actual_data.ipynb`. Use `notebooks/colab_horizon_sweep_actual_data.ipynb` when comparing 15-minute, 1-hour, 4-hour, and 24-hour forecast horizons, then `notebooks/colab_gru_tuning_actual_data.ipynb` for a focused GRU-only tuning pass on the 4-hour and 24-hour horizons.
 
 The comparison command prints a CSV-style metrics table:
 
