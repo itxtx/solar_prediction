@@ -21,7 +21,7 @@ from .config import get_config
 from .memory_tracker import MemoryTracker
 
 # Setup basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -172,7 +172,7 @@ class CombinedLoss(nn.Module):
     ) -> torch.Tensor:
         if self.loss_mode == "value_aware":
             if value_multiplier is None:  # Should be passed by training loop
-                logging.warning(
+                logger.warning(
                     "value_multiplier not provided for value_aware loss, using default 0.01."
                 )
                 value_multiplier = 0.01
@@ -312,10 +312,10 @@ class WeatherLSTM(nn.Module):
         try:
             self._validate_fit_inputs(X_train, y_train, X_val, y_val)
         except ValueError as e:
-            logging.error(f"Input validation failed for fit method: {e}")
+            logger.error(f"Input validation failed for fit method: {e}")
             raise
 
-        logging.info(f"LSTM Training started. Device: {device}, Training Config: {train_config}")
+        logger.info(f"LSTM Training started. Device: {device}, Training Config: {train_config}")
 
         # Initialize memory tracker if not provided
         if memory_tracker is None:
@@ -368,7 +368,7 @@ class WeatherLSTM(nn.Module):
         early_stopping_counter = 0
         self.to(device)
 
-        logging.info(f"Training with mixed precision: {use_amp}")
+        logger.info(f"Training with mixed precision: {use_amp}")
 
         for epoch in range(train_config.epochs):
             memory_tracker.snapshot(f"epoch_{epoch}_start", f"start of epoch {epoch}")
@@ -477,7 +477,7 @@ class WeatherLSTM(nn.Module):
             self.history["val_mae"].append(val_mae)
             self.history["lr"].append(optimizer.param_groups[0]["lr"])
 
-            logging.info(
+            logger.info(
                 f"LSTM Epoch {epoch+1}/{train_config.epochs} - TrainLoss: {train_loss_epoch:.4f} - ValLoss: {val_loss_epoch:.4f} | Scaled Metrics: ValRMSE: {val_rmse:.4f}, ValR²: {val_r2:.4f}, ValCappedMAPE: {val_mape_capped:.2f}%, ValMAE: {val_mae:.4f}"
             )
 
@@ -495,7 +495,7 @@ class WeatherLSTM(nn.Module):
             else:
                 early_stopping_counter += 1
             if early_stopping_counter >= train_config.patience:
-                logging.info(f"LSTM Early stopping at epoch {epoch+1}")
+                logger.info(f"LSTM Early stopping at epoch {epoch+1}")
                 break
 
             # Memory tracking at end of each epoch
@@ -516,11 +516,11 @@ class WeatherLSTM(nn.Module):
         if best_model_state:
             self.load_state_dict(best_model_state)
             self.to(device)
-        logging.info("LSTM Training complete. Best model state loaded.")
+        logger.info("LSTM Training complete. Best model state loaded.")
 
         # Final memory summary if verbose
         if memory_tracker.verbose:
-            logging.info(memory_tracker.get_summary())
+            logger.info(memory_tracker.get_summary())
 
         return self
 
@@ -550,11 +550,11 @@ class WeatherLSTM(nn.Module):
                     try:
                         target_idx = list(target_scaler.feature_names_in_).index(target_col_name)
                     except ValueError:
-                        logging.warning(
+                        logger.warning(
                             f"Target '{target_col_name}' not in scaler features. Defaulting to last."
                         )
                 else:
-                    logging.warning(
+                    logger.warning(
                         "Scaler has no feature_names_in_. Assuming target is last for multi-feature scaler."
                     )
 
@@ -578,7 +578,7 @@ class WeatherLSTM(nn.Module):
                 if not t_details.get("applied", False):
                     continue
                 t_type = t_details.get("type")
-                logging.info(f"Applying inverse structural transform: {t_type}")
+                logger.info(f"Applying inverse structural transform: {t_type}")
                 if t_type == "log":
                     config = get_config()
                     offset = t_details.get("offset", 0)
@@ -631,14 +631,14 @@ class WeatherLSTM(nn.Module):
                             self._ensure_2d(y_processed)
                         ).flatten()
                     elif lambda_val is not None:
-                        logging.warning("Recreating PowerTransformer for inverse Yeo-Johnson.")
+                        logger.warning("Recreating PowerTransformer for inverse Yeo-Johnson.")
                         pt_inv = PowerTransformer(method="yeo-johnson", standardize=False)
                         pt_inv.lambdas_ = np.array([lambda_val])
                         y_processed = pt_inv.inverse_transform(
                             self._ensure_2d(y_processed)
                         ).flatten()
                     else:
-                        logging.warning(f"Yeo-Johnson lambda/object not found. Skipping.")
+                        logger.warning(f"Yeo-Johnson lambda/object not found. Skipping.")
         return y_processed
 
     def _apply_domain_clipping(self, y: np.ndarray, transform_info: Dict) -> np.ndarray:
@@ -782,8 +782,8 @@ class WeatherLSTM(nn.Module):
         ss_res = sum_squared_error
         r2_scaled = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-        logging.info("\n--- LSTM Scaled Metrics ---")
-        logging.info(
+        logger.info("\n--- LSTM Scaled Metrics ---")
+        logger.info(
             f"RMSE (scaled): {rmse_scaled:.4f}, R² (scaled): {r2_scaled:.4f}, "
             f"MAE (scaled): {mae_scaled:.4f}, Capped MAPE (scaled): {mape_scaled_capped:.2f}%"
         )
@@ -798,7 +798,7 @@ class WeatherLSTM(nn.Module):
         }
 
         if target_scaler_object and transform_info_dict and return_predictions:
-            logging.info("\n--- LSTM Original Scale Metrics ---")
+            logger.info("\n--- LSTM Original Scale Metrics ---")
             try:
                 # Concatenate all predictions and actuals
                 model_predictions_scaled_np = np.vstack(all_predictions_scaled)
@@ -862,7 +862,7 @@ class WeatherLSTM(nn.Module):
                         * 100
                     )
 
-                    logging.info(
+                    logger.info(
                         f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, "
                         f"MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%"
                     )
@@ -881,7 +881,7 @@ class WeatherLSTM(nn.Module):
                         )
 
             except Exception as e:
-                logging.error(f"Error in original scale metrics calculation: {e}")
+                logger.error(f"Error in original scale metrics calculation: {e}")
 
         # Prepare return values
         all_metrics = {
@@ -909,7 +909,7 @@ class WeatherLSTM(nn.Module):
 
     def _generate_evaluation_plots(self, original_preds: np.ndarray, original_actuals: np.ndarray):
         """Generate residual and prediction vs actual plots."""
-        logging.info(
+        logger.info(
             "Generating residual and prediction vs. actual plots for original scale data..."
         )
 
@@ -955,7 +955,7 @@ class WeatherLSTM(nn.Module):
             sample_indices = np.random.choice(len(original_actuals), 10000, replace=False)
             plot_actuals = original_actuals[sample_indices]
             plot_preds = original_preds[sample_indices]
-            logging.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
+            logger.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
         else:
             plot_actuals = original_actuals
             plot_preds = original_preds
@@ -1006,7 +1006,7 @@ class WeatherLSTM(nn.Module):
         if X_tensor.ndim == 1:  # Single feature vector for one timestep (features,)
             # This case is ambiguous for LSTMs expecting (seq_len, features).
             # Assuming it's a sequence of length 1.
-            logging.warning("1D input to _ensure_batched_input, assuming seq_len=1.")
+            logger.warning("1D input to _ensure_batched_input, assuming seq_len=1.")
             return X_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, features)
         elif X_tensor.ndim == 2:  # Single sequence (seq_len, features)
             return X_tensor.unsqueeze(0)  # (1, seq_len, features)
@@ -1056,7 +1056,7 @@ class WeatherLSTM(nn.Module):
                 predictions_scaled_np, target_scaler, transform_info, scalers_dict
             )
         else:
-            logging.warning(
+            logger.warning(
                 "target_scaler or transform_info not provided to predict method. Returning scaled predictions."
             )
             return predictions_scaled_np.squeeze()
@@ -1069,7 +1069,7 @@ class WeatherLSTM(nn.Module):
         from matplotlib.colors import is_color_like
 
         if not self.history.get("epochs"):  # Use .get for safer dictionary access
-            logging.info("No LSTM training history to plot.")
+            logger.info("No LSTM training history to plot.")
             return None
 
         fig, axes = plt.subplots(4, 2, figsize=figsize)
@@ -1106,7 +1106,7 @@ class WeatherLSTM(nn.Module):
                     if style_spec and not has_linestyle and not has_marker:
                         # Plain color name validation
                         if not is_color_like(style_spec):
-                            logging.warning(
+                            logger.warning(
                                 f"Invalid color specification '{style_spec}', using default"
                             )
                             style_spec = None
@@ -1254,9 +1254,9 @@ class WeatherLSTM(nn.Module):
                     "transform_info": self.transform_info,
                 }
                 torch.save(save_content, path)
-                logging.info(f"LSTM Model saved to {path} (legacy format)")
+                logger.info(f"LSTM Model saved to {path} (legacy format)")
         except Exception as e:
-            logging.error(f"Failed to save LSTM model to {path}: {e}")
+            logger.error(f"Failed to save LSTM model to {path}: {e}")
             raise
 
     @classmethod
@@ -1310,7 +1310,7 @@ class WeatherLSTM(nn.Module):
                 model.transform_info = checkpoint.get("transform_info")
 
                 model.to(device)
-                logging.info(
+                logger.info(
                     f"LSTM Model loaded from enhanced checkpoint (version {metadata.get('version')})"
                 )
                 return model
@@ -1319,7 +1319,7 @@ class WeatherLSTM(nn.Module):
                 if strict:
                     raise ValueError(f"Failed to load enhanced checkpoint: {e}")
                 if "got unknown" not in str(e):
-                    logging.warning(
+                    logger.warning(
                         f"Enhanced checkpointing failed ({e}), falling back to legacy format"
                     )
 
@@ -1388,10 +1388,10 @@ class WeatherLSTM(nn.Module):
             model.history = checkpoint.get("history", default_history)
             model.transform_info = checkpoint.get("transform_info")
             model.to(device)
-            logging.info(f"LSTM Model loaded from {path} (legacy format)")
+            logger.info(f"LSTM Model loaded from {path} (legacy format)")
             return model
         except Exception as e:
-            logging.error(f"Failed to load LSTM model: {e}")
+            logger.error(f"Failed to load LSTM model: {e}")
             raise
 
     def enable_mc_dropout(self):
@@ -1454,7 +1454,7 @@ class WeatherLSTM(nn.Module):
                         torch.cuda.empty_cache()
 
                     if len(predictions_scaled_mc_list) % 10 == 0:  # Log progress
-                        logging.debug(
+                        logger.debug(
                             f"Completed {len(predictions_scaled_mc_list)}/{mc_samples} MC samples"
                         )
 
@@ -1483,7 +1483,7 @@ class WeatherLSTM(nn.Module):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
             else:
-                logging.warning(
+                logger.warning(
                     "No scalers/transform_info for uncertainty. Returning scaled uncertainty."
                 )
                 predictions_original_mc = predictions_scaled_mc_np
@@ -1550,7 +1550,7 @@ class WeatherLSTM(nn.Module):
                 y_true_original_np = y_true_arr.flatten()
 
         if plot_indices.size == 0:  # Corrected line 736
-            logging.info("No valid samples to plot for LSTM uncertainty.")
+            logger.info("No valid samples to plot for LSTM uncertainty.")
             return plt.figure(figsize=figsize)
 
         fig, axs = plt.subplots(len(plot_indices), 1, figsize=figsize, squeeze=False)

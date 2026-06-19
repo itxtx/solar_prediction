@@ -20,7 +20,7 @@ from .config import (
 from .benchmark import benchmark, benchmark_context
 
 # Setup basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # Configuration classes are now imported from centralized config module
 # Legacy dataclasses are deprecated - use centralized config instead
@@ -70,7 +70,7 @@ def _resolve_input_config(df_input: pd.DataFrame, cfg: DataInputConfig) -> DataI
     ]
     for alias in target_aliases:
         if alias in df_input.columns:
-            logging.info(
+            logger.info(
                 "Target column '%s' was not found. Using available target column '%s'.",
                 cfg.target_col_original_name,
                 alias,
@@ -161,7 +161,7 @@ def prepare_weather_data(
             f"Original target column '{input_cfg.target_col_original_name}' not found in input DataFrame."
         )
 
-    logging.info("Starting weather data preparation pipeline v2.")
+    logger.info("Starting weather data preparation pipeline v2.")
 
     # Set chained assignment to None for in-place operations optimization
     with pd.option_context("mode.chained_assignment", None):
@@ -239,7 +239,7 @@ def prepare_weather_data(
         },
     }
 
-    logging.info("Weather data preparation pipeline v2 finished successfully.")
+    logger.info("Weather data preparation pipeline v2 finished successfully.")
     return (
         X_train,
         X_val,
@@ -261,7 +261,7 @@ def _initial_df_setup(
     df: pd.DataFrame, cfg: DataInputConfig
 ) -> Tuple[pd.DataFrame, str, Dict[str, str]]:
     """Standardizes key column names, and sorts by time (optimized with in-place operations)."""
-    logging.debug("Performing initial DataFrame setup.")
+    logger.debug("Performing initial DataFrame setup.")
 
     # Work with a copy to avoid modifying the original
     df = df.copy()
@@ -311,9 +311,9 @@ def _initial_df_setup(
     df.rename(columns=actual_rename_map, inplace=True)
     if df.columns.duplicated().any():
         duplicated = sorted(set(df.columns[df.columns.duplicated()].tolist()))
-        logging.info(f"Dropping duplicate standardized columns after rename: {duplicated}")
+        logger.info(f"Dropping duplicate standardized columns after rename: {duplicated}")
         df = df.loc[:, ~df.columns.duplicated()].copy()
-    logging.info(f"Applied column renames: {actual_rename_map}")
+    logger.info(f"Applied column renames: {actual_rename_map}")
 
     final_target_col_name = actual_rename_map.get(
         cfg.target_col_original_name, cfg.target_col_original_name
@@ -330,9 +330,9 @@ def _initial_df_setup(
             df[STD_TIME_COL] = pd.to_datetime(df[cfg.unix_time_col], unit="s", cache=True)
             df.sort_values(STD_TIME_COL, inplace=True)
             df.reset_index(drop=True, inplace=True)
-            logging.info(f"Sorted DataFrame by '{cfg.unix_time_col}' as '{STD_TIME_COL}'.")
+            logger.info(f"Sorted DataFrame by '{cfg.unix_time_col}' as '{STD_TIME_COL}'.")
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 f"Could not parse or sort by '{cfg.unix_time_col}': {e}. Trying '{STD_TIME_COL}'."
             )
     if STD_TIME_COL in df.columns and not pd.api.types.is_datetime64_any_dtype(df[STD_TIME_COL]):
@@ -341,25 +341,25 @@ def _initial_df_setup(
             df[STD_TIME_COL] = pd.to_datetime(df[STD_TIME_COL], cache=True)
             df.sort_values(STD_TIME_COL, inplace=True)
             df.reset_index(drop=True, inplace=True)
-            logging.info(f"Sorted DataFrame by '{STD_TIME_COL}'.")
+            logger.info(f"Sorted DataFrame by '{STD_TIME_COL}'.")
         except Exception as e:
-            logging.warning(f"Could not parse or sort by '{STD_TIME_COL}': {e}. Trying UNIXTime.")
+            logger.warning(f"Could not parse or sort by '{STD_TIME_COL}': {e}. Trying UNIXTime.")
             if cfg.unix_time_col in df.columns:
                 df.sort_values(cfg.unix_time_col, inplace=True)  # Assuming UNIXTime is sortable
                 df.reset_index(drop=True, inplace=True)
-                logging.info(f"Sorted DataFrame by '{cfg.unix_time_col}'.")
+                logger.info(f"Sorted DataFrame by '{cfg.unix_time_col}'.")
             else:
-                logging.warning("No primary or fallback time column found for sorting.")
+                logger.warning("No primary or fallback time column found for sorting.")
     elif STD_TIME_COL in df.columns:
         df.sort_values(STD_TIME_COL, inplace=True)
         df.reset_index(drop=True, inplace=True)
-        logging.info(f"Sorted DataFrame by '{STD_TIME_COL}'.")
+        logger.info(f"Sorted DataFrame by '{STD_TIME_COL}'.")
     elif cfg.unix_time_col in df.columns:
         df.sort_values(cfg.unix_time_col, inplace=True)
         df.reset_index(drop=True, inplace=True)
-        logging.info(f"Sorted DataFrame by '{cfg.unix_time_col}'.")
+        logger.info(f"Sorted DataFrame by '{cfg.unix_time_col}'.")
     else:
-        logging.warning(
+        logger.warning(
             f"Neither '{STD_TIME_COL}' nor '{cfg.unix_time_col}' found for sorting. Data order is preserved as is."
         )
 
@@ -434,9 +434,9 @@ def _engineer_time_features(
     df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, input_cfg: DataInputConfig
 ) -> pd.DataFrame:
     """Engineers time-based features like cyclical hour/month, daylight, solar elevation (vectorized)."""
-    logging.debug("Engineering time features.")
+    logger.debug("Engineering time features.")
     if STD_TIME_COL not in df.columns or not pd.api.types.is_datetime64_any_dtype(df[STD_TIME_COL]):
-        logging.warning(
+        logger.warning(
             f"'{STD_TIME_COL}' not found or not datetime. Skipping detailed time feature engineering."
         )
         return df
@@ -503,7 +503,7 @@ def _engineer_time_features(
             )
 
         else:
-            logging.warning(
+            logger.warning(
                 f"Could not parse all sunrise/sunset times from '{input_cfg.sunrise_col}'/'{input_cfg.sunset_col}'. Daylight features might be incomplete."
             )
     # Fallback to raw columns if they exist and parsed ones are missing
@@ -533,9 +533,9 @@ def _engineer_time_features(
         solar_elevation[valid_mask] = np.sin(daylight_pos[valid_mask] * np.pi)
 
         df[STD_SOLAR_ELEVATION] = solar_elevation
-        logging.info(f"Engineered '{STD_SOLAR_ELEVATION}' feature.")
+        logger.info(f"Engineered '{STD_SOLAR_ELEVATION}' feature.")
     elif feature_cfg.use_solar_elevation_proxy:
-        logging.warning(
+        logger.warning(
             f"Cannot create '{STD_SOLAR_ELEVATION}' as '{STD_DAYLIGHT_POSITION}' is missing."
         )
 
@@ -547,14 +547,14 @@ def _apply_target_transformations(
     df: pd.DataFrame, target_col: str, cfg: TransformationConfig, fit_indices: np.ndarray
 ) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]]]:
     """Applies configured transformations to the target column (optimized)."""
-    logging.debug(f"Applying target transformations to '{target_col}'. Config: {cfg}")
+    logger.debug(f"Applying target transformations to '{target_col}'. Config: {cfg}")
 
     current_target_col = target_col
     applied_transforms_log: List[Dict[str, Any]] = []
 
     # 0. Initial Min Threshold
     if cfg.min_target_threshold_initial is not None:
-        logging.info(
+        logger.info(
             f"Applying initial min threshold of {cfg.min_target_threshold_initial} to '{current_target_col}'."
         )
         df[current_target_col] = df[current_target_col].clip(lower=cfg.min_target_threshold_initial)
@@ -566,7 +566,7 @@ def _apply_target_transformations(
 
     # 1. Piecewise Transform (typically for GHI/Radiation)
     if is_radiation_target and cfg.use_piecewise_transform_target:
-        logging.info(f"Applying piecewise radiation transform to '{current_target_col}'.")
+        logger.info(f"Applying piecewise radiation transform to '{current_target_col}'.")
         new_col_name = f"{current_target_col}_piecewise"
 
         radiation_values = df[current_target_col].values.astype(float)
@@ -613,7 +613,7 @@ def _apply_target_transformations(
     # 2. Power Transform (Yeo-Johnson) OR Log Transform (mutually exclusive)
     # Power transform takes precedence if both are True
     if cfg.use_power_transform:
-        logging.info(f"Applying Yeo-Johnson Power Transform to '{current_target_col}'.")
+        logger.info(f"Applying Yeo-Johnson Power Transform to '{current_target_col}'.")
         new_col_name = f"{current_target_col}_yj"
 
         # Optional clipping before power transform
@@ -626,7 +626,7 @@ def _apply_target_transformations(
             upper_b = np.percentile(fit_values, cfg.original_target_clip_upper_percentile)
             df[current_target_col] = df[current_target_col].clip(lower_b, upper_b)
             clip_bounds_orig = (float(lower_b), float(upper_b))
-            logging.info(
+            logger.info(
                 f"Clipped '{current_target_col}' to [{lower_b:.2f}, {upper_b:.2f}] before Yeo-Johnson."
             )
 
@@ -634,7 +634,7 @@ def _apply_target_transformations(
             df[current_target_col] = np.maximum(
                 df[current_target_col].astype(float), cfg.min_radiation_floor_before_power_transform
             )
-            logging.info(
+            logger.info(
                 f"Applied floor of {cfg.min_radiation_floor_before_power_transform} to '{current_target_col}' before Yeo-Johnson."
             )
 
@@ -680,7 +680,7 @@ def _apply_target_transformations(
         current_target_col = new_col_name
 
     elif cfg.use_log_transform:  # Only if power transform was not applied
-        logging.info(f"Applying Log Transform to '{current_target_col}'.")
+        logger.info(f"Applying Log Transform to '{current_target_col}'.")
         new_col_name = f"{current_target_col}_log"
 
         values_for_log = df[current_target_col].copy()
@@ -697,7 +697,7 @@ def _apply_target_transformations(
             upper_b = np.percentile(fit_values, cfg.log_clip_upper_percentile)
             df[new_col_name] = df[new_col_name].clip(lower_b, upper_b)
             clip_bounds_log = (float(lower_b), float(upper_b))
-            logging.info(
+            logger.info(
                 f"Clipped log-transformed target '{new_col_name}' to [{lower_b:.2f}, {upper_b:.2f}]."
             )
 
@@ -727,7 +727,7 @@ def _engineer_other_domain_features(
     fit_indices: np.ndarray,
 ) -> pd.DataFrame:
     """Engineers other domain-specific features, e.g., low target indicator."""
-    logging.debug("Engineering other domain features.")
+    logger.debug("Engineering other domain features.")
 
     # Low Target Indicator (based on the structurally transformed target, or original standardized if no structural transforms)
     # This helps the model identify periods of very low values, which might behave differently.
@@ -755,15 +755,15 @@ def _engineer_other_domain_features(
                 df[indicator_col_name] = (df[col_for_low_indicator_ref] < low_threshold).astype(
                     float
                 )
-                logging.info(
+                logger.info(
                     f"Engineered '{indicator_col_name}' feature with train-only threshold {low_threshold:.4f} (based on '{col_for_low_indicator_ref}')."
                 )
             else:
-                logging.warning(
+                logger.warning(
                     f"Cannot create low target indicator for '{col_for_low_indicator_ref}': not numeric or no variance."
                 )
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 f"Failed to create low target indicator for '{col_for_low_indicator_ref}': {e}"
             )
 
@@ -803,7 +803,7 @@ def _get_base_feature_set(df_columns: pd.Index, feature_cfg: FeatureEngineeringC
         ]
         selected_set = [col for col in potential_all_features if col in df_columns]
     else:
-        logging.warning(
+        logger.warning(
             f"Unknown feature_selection_mode: '{feature_cfg.feature_selection_mode}'. Defaulting to 'all'."
         )
         # Recursive call with 'all' or define default 'all' set here. For safety, use a defined 'all'.
@@ -829,7 +829,7 @@ def _select_final_features(
     df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, target_col_after_transforms: str
 ) -> List[str]:
     """Selects the final list of feature columns to be used for modeling."""
-    logging.debug("Selecting final feature columns.")
+    logger.debug("Selecting final feature columns.")
 
     base_features = _get_base_feature_set(df.columns, feature_cfg)
 
@@ -840,7 +840,7 @@ def _select_final_features(
     for lic in possible_low_indicator_cols:
         if lic not in base_features:
             base_features.append(lic)
-            logging.info(f"Including low target indicator '{lic}' in features.")
+            logger.info(f"Including low target indicator '{lic}' in features.")
 
     # Ensure the actual target column (after transforms, before scaling) is NOT in features
     final_feature_list = [col for col in base_features if col != target_col_after_transforms]
@@ -851,7 +851,7 @@ def _select_final_features(
     if not final_feature_list:
         raise ValueError("No feature columns were selected or are available after processing.")
 
-    logging.info(
+    logger.info(
         f"Final selected features for scaling ({len(final_feature_list)}): {final_feature_list}"
     )
     return final_feature_list
@@ -868,22 +868,22 @@ def _scale_data(
     target_fit_indices: np.ndarray,
 ) -> Tuple[pd.DataFrame, Dict[str, Any], str]:
     """Scales features and the (potentially transformed) target column."""
-    logging.debug(f"Scaling data. Features: {feature_cols}, Target to scale: {target_col_to_scale}")
+    logger.debug(f"Scaling data. Features: {feature_cols}, Target to scale: {target_col_to_scale}")
 
     scalers: Dict[str, Any] = {}
     scaled_df_data = {}  # To build the new DataFrame
 
     # Determine feature scaler type
     FeatureScalerClass = StandardScaler if scaling_cfg.standardize_features else MinMaxScaler
-    logging.info(f"Using {FeatureScalerClass.__name__} for feature scaling.")
+    logger.info(f"Using {FeatureScalerClass.__name__} for feature scaling.")
 
     # Scale features
     for col in feature_cols:
         if col not in df.columns:
-            logging.warning(f"Feature column '{col}' not found in DataFrame for scaling. Skipping.")
+            logger.warning(f"Feature column '{col}' not found in DataFrame for scaling. Skipping.")
             continue
         if df[col].isnull().all():
-            logging.warning(
+            logger.warning(
                 f"All values in feature column '{col}' are NaN. Scaled output will be NaN."
             )
             scaled_df_data[col] = np.nan
@@ -917,12 +917,12 @@ def _scale_data(
     )
 
     if yj_was_applied:
-        logging.info(
+        logger.info(
             f"Yeo-Johnson was applied to target. Using StandardScaler for '{target_col_to_scale}'."
         )
     else:  # No Yeo-Johnson, use general scaling config
         TargetScalerClass = StandardScaler if scaling_cfg.standardize_features else MinMaxScaler
-        logging.info(f"Using {TargetScalerClass.__name__} for target '{target_col_to_scale}'.")
+        logger.info(f"Using {TargetScalerClass.__name__} for target '{target_col_to_scale}'.")
 
     target_values = df[target_col_to_scale].ffill().bfill().values.reshape(-1, 1)
     target_fit_values = (
@@ -949,13 +949,13 @@ def _scale_data(
             ]
             break
 
-    logging.info(f"Target '{target_col_to_scale}' scaled to '{scaled_target_col_name}'.")
+    logger.info(f"Target '{target_col_to_scale}' scaled to '{scaled_target_col_name}'.")
     if isinstance(target_scaler_instance, StandardScaler):
-        logging.info(
+        logger.info(
             f"Target scaler ({scaled_target_col_name}): mean={target_scaler_instance.mean_[0]:.4f}, std={target_scaler_instance.scale_[0]:.4f}"
         )
     elif isinstance(target_scaler_instance, MinMaxScaler):
-        logging.info(
+        logger.info(
             f"Target scaler ({scaled_target_col_name}): min={target_scaler_instance.min_[0]:.4f}, scale={target_scaler_instance.scale_[0]:.4f} (data_min={target_scaler_instance.data_min_[0]:.4f}, data_max={target_scaler_instance.data_max_[0]:.4f})"
         )
 
@@ -971,7 +971,7 @@ def _create_sequences_and_split(
     sequence_cfg: SequenceConfig,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Creates sequences from scaled data and splits into train, validation, and test sets (optimized)."""
-    logging.debug("Creating sequences and splitting data.")
+    logger.debug("Creating sequences and splitting data.")
 
     if not (feature_cols and target_col_scaled in scaled_df.columns):
         raise ValueError(
@@ -1033,7 +1033,7 @@ def _create_sequences_and_split(
         y_all = target_data[target_start : target_start + sequence_length]
 
     except Exception as e:
-        logging.warning(f"Sliding window optimization failed, falling back to loop: {e}")
+        logger.warning(f"Sliding window optimization failed, falling back to loop: {e}")
         # Fallback to the original method if stride tricks fail
         for i in range(sequence_length):
             X_all[i] = feature_data[i : i + sequence_cfg.window_size]
@@ -1053,7 +1053,7 @@ def _create_sequences_and_split(
             X_train_val, y_train_val, test_size=sequence_cfg.val_size_from_train_val, shuffle=False
         )
     else:  # Not enough data for validation split or val_size is 0
-        logging.warning(
+        logger.warning(
             "Insufficient data for validation split or val_size_from_train_val is 0. Validation set will be empty or X_train_val used as X_train."
         )
         X_train, y_train = X_train_val, y_train_val
@@ -1068,7 +1068,7 @@ def _create_sequences_and_split(
         )
         X_val, y_val = np.empty(val_X_shape), np.empty(val_y_shape)
 
-    logging.info(
+    logger.info(
         f"Data split complete: "
         f"X_train: {X_train.shape}, y_train: {y_train.shape}, "
         f"X_val: {X_val.shape}, y_val: {y_val.shape}, "

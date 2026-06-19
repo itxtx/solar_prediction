@@ -21,7 +21,7 @@ from .config import get_config
 from .memory_tracker import MemoryTracker
 
 # Setup basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -166,7 +166,7 @@ class WeatherGRU(nn.Module):
             return nn.L1Loss()  # MAE Loss
 
         else:
-            logging.warning(f"Unknown loss type '{config.loss_type}' for GRU. Defaulting to MSE.")
+            logger.warning(f"Unknown loss type '{config.loss_type}' for GRU. Defaulting to MSE.")
             return nn.MSELoss()
 
     def _validate_fit_inputs(
@@ -225,10 +225,10 @@ class WeatherGRU(nn.Module):
         try:
             self._validate_fit_inputs(X_train, y_train, X_val, y_val)
         except ValueError as e:
-            logging.error(f"Input validation failed for GRU fit: {e}")
+            logger.error(f"Input validation failed for GRU fit: {e}")
             raise
 
-        logging.info(f"GRU Training started. Device: {device}, Config: {train_config}")
+        logger.info(f"GRU Training started. Device: {device}, Config: {train_config}")
 
         # Initialize memory tracker if not provided
         if memory_tracker is None:
@@ -282,7 +282,7 @@ class WeatherGRU(nn.Module):
         early_stopping_counter = 0
         self.to(device)
 
-        logging.info(f"GRU training with mixed precision: {use_amp}")
+        logger.info(f"GRU training with mixed precision: {use_amp}")
 
         for epoch in range(train_config.epochs):
             memory_tracker.snapshot(f"epoch_{epoch}_start", f"start of GRU epoch {epoch}")
@@ -377,7 +377,7 @@ class WeatherGRU(nn.Module):
             self.history["val_mae"].append(val_mae)
             self.history["lr"].append(optimizer.param_groups[0]["lr"])
 
-            logging.info(
+            logger.info(
                 f"GRU Epoch {epoch+1}/{train_config.epochs} - TrainLoss: {train_loss_epoch:.4f} - ValLoss: {val_loss_epoch:.4f} | Scaled Metrics: ValRMSE: {val_rmse:.4f}, ValR²: {val_r2:.4f}, ValCappedMAPE: {val_mape_cap:.2f}%, ValMAE: {val_mae:.4f}"
             )
 
@@ -395,7 +395,7 @@ class WeatherGRU(nn.Module):
             else:
                 early_stopping_counter += 1
             if early_stopping_counter >= train_config.patience:
-                logging.info(f"GRU Early stopping at epoch {epoch+1}")
+                logger.info(f"GRU Early stopping at epoch {epoch+1}")
                 break
 
             # Memory tracking at end of each epoch
@@ -416,11 +416,11 @@ class WeatherGRU(nn.Module):
         if best_model_state:
             self.load_state_dict(best_model_state)
             self.to(device)
-        logging.info("GRU Training complete. Best model state loaded.")
+        logger.info("GRU Training complete. Best model state loaded.")
 
         # Final memory summary if verbose
         if memory_tracker.verbose:
-            logging.info(memory_tracker.get_summary())
+            logger.info(memory_tracker.get_summary())
 
         return self
 
@@ -450,11 +450,11 @@ class WeatherGRU(nn.Module):
                     try:
                         target_idx = list(target_scaler.feature_names_in_).index(target_col_name)
                     except ValueError:
-                        logging.warning(
+                        logger.warning(
                             f"GRU Target '{target_col_name}' not in scaler features. Defaulting to last."
                         )
                 else:
-                    logging.warning(
+                    logger.warning(
                         "GRU Scaler has no feature_names_in_. Assuming target is last for multi-feature scaler."
                     )
                 dummy = np.zeros((y_proc.shape[0], target_scaler.n_features_in_))
@@ -476,7 +476,7 @@ class WeatherGRU(nn.Module):
                 if not t_details.get("applied", False):
                     continue
                 t_type = t_details.get("type")
-                logging.info(f"GRU applying inverse structural transform: {t_type}")
+                logger.info(f"GRU applying inverse structural transform: {t_type}")
                 if t_type == "log":
                     config = get_config()
                     offset = t_details.get("offset", 0)
@@ -531,7 +531,7 @@ class WeatherGRU(nn.Module):
                         pt_inv.lambdas_ = np.array([lambda_val])
                         y_proc = pt_inv.inverse_transform(self._ensure_2d(y_proc)).flatten()
                     else:
-                        logging.warning(f"GRU Yeo-Johnson lambda/object not found. Skipping.")
+                        logger.warning(f"GRU Yeo-Johnson lambda/object not found. Skipping.")
         return y_proc
 
     def _apply_domain_clipping(self, y: np.ndarray, transform_info: Dict) -> np.ndarray:
@@ -666,8 +666,8 @@ class WeatherGRU(nn.Module):
         ss_res = sum_squared_error
         r2_scaled = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-        logging.info("\n--- GRU Scaled Metrics ---")
-        logging.info(
+        logger.info("\n--- GRU Scaled Metrics ---")
+        logger.info(
             f"RMSE (scaled): {rmse_scaled:.4f}, R² (scaled): {r2_scaled:.4f}, "
             f"MAE (scaled): {mae_scaled:.4f}, Capped MAPE (scaled): {mape_scaled_capped:.2f}%"
         )
@@ -682,7 +682,7 @@ class WeatherGRU(nn.Module):
         }
 
         if target_scaler_object and transform_info_dict and return_predictions:
-            logging.info("\n--- GRU Original Scale Metrics ---")
+            logger.info("\n--- GRU Original Scale Metrics ---")
             try:
                 # Concatenate all predictions and actuals
                 model_predictions_scaled_np = np.vstack(all_predictions_scaled)
@@ -746,7 +746,7 @@ class WeatherGRU(nn.Module):
                         * 100
                     )
 
-                    logging.info(
+                    logger.info(
                         f"RMSE (original): {rmse_orig:.4f}, R² (original): {r2_orig:.4f}, "
                         f"MAE (original): {mae_orig:.4f}, Capped MAPE (original): {mape_orig_capped:.2f}%"
                     )
@@ -765,7 +765,7 @@ class WeatherGRU(nn.Module):
                         )
 
             except Exception as e:
-                logging.error(f"Error in original scale metrics calculation: {e}")
+                logger.error(f"Error in original scale metrics calculation: {e}")
 
         # Prepare return values
         all_metrics = {
@@ -793,7 +793,7 @@ class WeatherGRU(nn.Module):
 
     def _generate_evaluation_plots(self, original_preds: np.ndarray, original_actuals: np.ndarray):
         """Generate residual and prediction vs actual plots."""
-        logging.info(
+        logger.info(
             "Generating residual and prediction vs. actual plots for original scale data..."
         )
 
@@ -839,7 +839,7 @@ class WeatherGRU(nn.Module):
             sample_indices = np.random.choice(len(original_actuals), 10000, replace=False)
             plot_actuals = original_actuals[sample_indices]
             plot_preds = original_preds[sample_indices]
-            logging.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
+            logger.info(f"Sampled 10,000 points from {len(original_actuals)} for plotting")
         else:
             plot_actuals = original_actuals
             plot_preds = original_preds
@@ -886,7 +886,7 @@ class WeatherGRU(nn.Module):
         else:
             raise TypeError(f"Input X must be np.ndarray or torch.Tensor, got {type(X)}")
         if X_t.ndim == 1:
-            logging.warning("1D input to GRU _ensure_batched_input, assuming seq_len=1.")
+            logger.warning("1D input to GRU _ensure_batched_input, assuming seq_len=1.")
             return X_t.unsqueeze(0).unsqueeze(0)
         elif X_t.ndim == 2:
             return X_t.unsqueeze(0)
@@ -934,7 +934,7 @@ class WeatherGRU(nn.Module):
         self, figsize: Tuple[int, int] = (20, 18), log_scale_loss: bool = True
     ):
         if not self.history["epochs"]:
-            logging.info("No GRU training history.")
+            logger.info("No GRU training history.")
             return None
         # ... (Plotting logic similar to LSTM, using self.history) ...
         fig, axes = plt.subplots(4, 2, figsize=figsize)
@@ -1051,9 +1051,9 @@ class WeatherGRU(nn.Module):
                     },
                     path,
                 )
-                logging.info(f"GRU Model saved to {path} (legacy format)")
+                logger.info(f"GRU Model saved to {path} (legacy format)")
         except Exception as e:
-            logging.error(f"Failed to save GRU model: {e}")
+            logger.error(f"Failed to save GRU model: {e}")
             raise
 
     @classmethod
@@ -1105,7 +1105,7 @@ class WeatherGRU(nn.Module):
                 model.transform_info = checkpoint.get("transform_info")
 
                 model.to(device)
-                logging.info(
+                logger.info(
                     f"GRU Model loaded from enhanced checkpoint (version {metadata.get('version')})"
                 )
                 return model
@@ -1114,7 +1114,7 @@ class WeatherGRU(nn.Module):
                 if strict:
                     raise ValueError(f"Failed to load enhanced checkpoint: {e}")
                 if "got unknown" not in str(e):
-                    logging.warning(
+                    logger.warning(
                         f"Enhanced checkpointing failed ({e}), falling back to legacy format"
                     )
 
@@ -1181,10 +1181,10 @@ class WeatherGRU(nn.Module):
             model.history = ckpt.get("history", {key: [] for key in model.history})
             model.transform_info = ckpt.get("transform_info")
             model.to(device)
-            logging.info(f"GRU Model loaded from {path} (legacy format)")
+            logger.info(f"GRU Model loaded from {path} (legacy format)")
             return model
         except Exception as e:
-            logging.error(f"Failed to load GRU model: {e}")
+            logger.error(f"Failed to load GRU model: {e}")
             raise
 
     def enable_mc_dropout(self):
@@ -1245,7 +1245,7 @@ class WeatherGRU(nn.Module):
                         torch.cuda.empty_cache()
 
                     if len(preds_s_mc_list) % 10 == 0:  # Log progress
-                        logging.debug(
+                        logger.debug(
                             f"Completed {len(preds_s_mc_list)}/{mc_samples} GRU MC samples"
                         )
 
@@ -1272,7 +1272,7 @@ class WeatherGRU(nn.Module):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
             else:
-                logging.warning("No scalers/transform for GRU uncertainty. Returning scaled.")
+                logger.warning("No scalers/transform for GRU uncertainty. Returning scaled.")
                 preds_orig_mc = preds_s_mc_np
 
             res = {
@@ -1335,7 +1335,7 @@ class WeatherGRU(nn.Module):
                 y_true_orig = y_true_arr.flatten()
 
         if len(plot_idxs) == 0:
-            logging.info("No valid samples for GRU uncertainty plot.")
+            logger.info("No valid samples for GRU uncertainty plot.")
             return plt.figure(figsize=figsize)
         fig, axs = plt.subplots(len(plot_idxs), 1, figsize=figsize, squeeze=False)
         for i, s_idx_batch in enumerate(plot_idxs):
