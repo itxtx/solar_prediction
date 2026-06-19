@@ -130,10 +130,16 @@ The TDMC implementation remains in the repository as an optional experimental an
 ```text
 solar_prediction/
   cli.py              # train/evaluate/compare command-line workflow
+  config.py           # centralized (pydantic) configuration for pipeline and models
   data_prep.py        # leakage-safe preprocessing and sequence creation
+  data_loader.py      # data loading utility (chunked CSV reading)
   lstm.py             # PyTorch LSTM model
   gru.py              # PyTorch GRU model
   tdmc.py             # optional time-dynamic Markov chain experiments
+  checkpointing.py    # model checkpoint save/load
+  benchmark.py        # timing/benchmark utilities for pipeline operations
+  memory_tracker.py   # memory-usage tracking for PyTorch models
+  plot_utils.py       # evaluation and plotting helpers
 tests/                # unit and smoke tests
 data/sample/          # tracked sample data
 notebooks/            # Colab smoke and full-data verification
