@@ -1024,6 +1024,7 @@ class WeatherLSTM(nn.Module):
         transform_info: Optional[Dict] = None,
         scalers_dict: Optional[Dict] = None,
     ) -> np.ndarray:
+        """Predict target values with shape (n_samples, output_dim) in either scale."""
         self.eval()
         self.to(device)
 
@@ -1049,17 +1050,14 @@ class WeatherLSTM(nn.Module):
         predictions_scaled_np = np.concatenate(predictions_scaled_list, axis=0)
 
         if target_scaler is not None and transform_info is not None:
-            # Output from model is (N, output_dim). Ensure it's (N,1) for inverse transform if output_dim is 1.
-            if predictions_scaled_np.ndim == 1:
-                predictions_scaled_np = predictions_scaled_np.reshape(-1, 1)
             return self._inverse_transform_target(
-                predictions_scaled_np, target_scaler, transform_info, scalers_dict
-            )
+                predictions_scaled_np.reshape(-1, 1), target_scaler, transform_info, scalers_dict
+            ).reshape(predictions_scaled_np.shape)
         else:
             logger.warning(
                 "target_scaler or transform_info not provided to predict method. Returning scaled predictions."
             )
-            return predictions_scaled_np.squeeze()
+            return predictions_scaled_np
 
     # plot_training_history remains largely the same, ensure it uses self.history correctly.
     def plot_training_history(

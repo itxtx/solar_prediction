@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
 from solar_prediction.lstm import (
     WeatherLSTM,
     create_model_hyperparameters_from_config,
@@ -24,6 +25,7 @@ from solar_prediction.config import get_config
 @pytest.fixture
 def device():
     """Get device for testing (prefer CPU for consistency)."""
+    torch.manual_seed(42)
     return "cpu"  # Use CPU for tests to avoid GPU memory issues
 
 
@@ -315,6 +317,52 @@ class TestGRUModel:
 
 class TestModelComparisons:
     """Test comparisons between LSTM and GRU models."""
+
+    @pytest.mark.parametrize(
+        "model_class,params_factory",
+        [
+            (WeatherLSTM, create_model_hyperparameters_from_config),
+            (WeatherGRU, create_gru_model_hyperparameters_from_config),
+        ],
+        ids=["lstm", "gru"],
+    )
+    @pytest.mark.parametrize("n_samples,output_dim", [(1, 1), (3, 1), (1, 2), (3, 2)])
+    @pytest.mark.parametrize("original_scale", [False, True])
+    def test_predict_preserves_sample_and_output_axes(
+        self, model_class, params_factory, n_samples, output_dim, original_scale, device
+    ):
+        """Batching and target decoding should retain both prediction axes and values."""
+        params = params_factory(
+            input_dim=3,
+            config_override={
+                "hidden_dim": 8,
+                "num_layers": 1,
+                "output_dim": output_dim,
+                "dropout_prob": 0.0,
+            },
+        )
+        model = model_class(params).eval()
+        X = np.random.default_rng(42).normal(size=(n_samples, 4, 3)).astype(np.float32)
+        with torch.no_grad():
+            expected = model(torch.from_numpy(X)).numpy()
+
+        kwargs = {}
+        if original_scale:
+            scaler = StandardScaler().fit([[1.0], [3.0]])
+            kwargs = {
+                "target_scaler": scaler,
+                "transform_info": {
+                    "structural_transforms": [{"type": "log", "applied": True, "offset": 1.0}]
+                },
+            }
+            expected = np.expm1(scaler.inverse_transform(expected.reshape(-1, 1))).reshape(
+                n_samples, output_dim
+            )
+
+        # A single sequence can be passed without an explicit batch axis.
+        predictions = model.predict(X[0] if n_samples == 1 else X, batch_size=2, **kwargs)
+        assert predictions.shape == (n_samples, output_dim)
+        np.testing.assert_allclose(predictions, expected, rtol=1e-5, atol=1e-6)
 
     def test_lstm_and_gru_inverse_log_transform_targets(self):
         """Model-side inverse transforms should consume pipeline structural metadata."""

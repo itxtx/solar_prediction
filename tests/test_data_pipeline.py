@@ -458,11 +458,12 @@ class TestDataPipelineEdgeCases:
         config = get_config()
 
         # Create data with only some expected columns
+        rows = 24
         minimal_data = pd.DataFrame(
             {
-                "Timestamp": ["2023-01-01 08:00:00", "2023-01-01 09:00:00"],
-                "Radiation": [100.0, 200.0],
-                "Temperature": [15.0, 16.0],
+                "Timestamp": pd.date_range("2023-01-01", periods=rows, freq="h"),
+                "Radiation": np.linspace(100.0, 200.0, rows),
+                "Temperature": np.linspace(15.0, 16.0, rows),
                 # Missing other expected columns
             }
         )
@@ -476,7 +477,7 @@ class TestDataPipelineEdgeCases:
             config.sequences,
         )
 
-        # If it succeeds, check the results are valid
+        # Missing optional weather columns should still produce valid sequences.
         (
             X_train,
             X_val,
@@ -489,6 +490,20 @@ class TestDataPipelineEdgeCases:
             transform_info,
         ) = result
         self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
+
+    def test_pipeline_rejects_insufficient_rows(self):
+        """Too few rows for the configured window should fail explicitly."""
+        config = get_config()
+        data = pd.DataFrame({"Radiation": [100.0, 200.0], "Temperature": [15.0, 16.0]})
+        with pytest.raises(ValueError, match="too short for window_size"):
+            prepare_weather_data(
+                data,
+                config.input,
+                config.transformation,
+                config.features,
+                config.scaling,
+                config.sequences,
+            )
 
     def test_pipeline_with_constant_values(self):
         """Test pipeline behavior with constant values in features."""
@@ -506,7 +521,6 @@ class TestDataPipelineEdgeCases:
                 "clouds_all": [50] * 20,  # Constant
                 "rain_1h": [0.0] * 20,  # Constant
                 "snow_1h": [0.0] * 20,  # Constant
-                "weather_type": ["clear"] * 20,  # Constant
                 "HourOfDay": list(range(20)),  # Variable
                 "Month": [1] * 20,  # Constant
                 "DayLength": [8.5] * 20,  # Constant
@@ -558,7 +572,6 @@ class TestDataPipelineEdgeCases:
                 "clouds_all": [0, 100, 50, 0, 100, 25, 75, 0, 100, 50],
                 "rain_1h": [0, 50, 0, 10, 0, 5, 0, 20, 0, 2],  # Heavy rain
                 "snow_1h": [0, 10, 0, 5, 0, 1, 0, 8, 0, 3],
-                "weather_type": ["clear"] * 10,
                 "HourOfDay": list(range(10)),
                 "Month": [1] * 10,
                 "DayLength": [8.5] * 10,
@@ -570,13 +583,15 @@ class TestDataPipelineEdgeCases:
             }
         )
 
+        # Use a window that fits this short fixture, so the test exercises scaling.
+        sequence_cfg = config.sequences.model_copy(update={"window_size": 3})
         result = prepare_weather_data(
             extreme_data,
             config.input,
             config.transformation,
             config.features,
             config.scaling,
-            config.sequences,
+            sequence_cfg,
         )
 
         (
@@ -607,5 +622,5 @@ class TestDataPipelineEdgeCases:
         arrays = [X_train, X_val, X_test, y_train, y_val, y_test]
         for arr in arrays:
             assert isinstance(arr, np.ndarray)
-            if arr.size > 0:
-                assert np.all(np.isfinite(arr))
+            assert arr.size > 0
+            assert np.all(np.isfinite(arr))

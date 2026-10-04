@@ -263,7 +263,6 @@ class WeatherGRU(nn.Module):
                 factor=train_config.factor,
                 patience=train_config.patience // 2,
                 min_lr=train_config.min_lr,
-                verbose=True,
             )
         elif train_config.scheduler_type.lower() == "cosine":
             T_max = (
@@ -904,6 +903,7 @@ class WeatherGRU(nn.Module):
         transform_info: Optional[Dict] = None,
         scalers_dict: Optional[Dict] = None,
     ) -> np.ndarray:
+        """Predict target values with shape (n_samples, output_dim) in either scale."""
         self.eval()
         self.to(device)
         X_batch_t = self._ensure_batched_input(X).to(device)
@@ -922,13 +922,11 @@ class WeatherGRU(nn.Module):
                     torch.cuda.empty_cache()
 
         preds_s_np = np.concatenate(preds_s_list, axis=0)
-        if target_scaler and transform_info:
-            if preds_s_np.ndim == 1:
-                preds_s_np = preds_s_np.reshape(-1, 1)  # Ensure 2D for inverse
+        if target_scaler is not None and transform_info is not None:
             return self._inverse_transform_target(
-                preds_s_np, target_scaler, transform_info, scalers_dict
-            )
-        return preds_s_np.squeeze()
+                preds_s_np.reshape(-1, 1), target_scaler, transform_info, scalers_dict
+            ).reshape(preds_s_np.shape)
+        return preds_s_np
 
     def plot_training_history(
         self, figsize: Tuple[int, int] = (20, 18), log_scale_loss: bool = True
