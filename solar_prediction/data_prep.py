@@ -106,7 +106,7 @@ def _compute_sequence_split_metadata(n_rows: int, sequence_cfg: SequenceConfig) 
         raise ValueError("No training sequences remain after validation split.")
 
     window_size = sequence_cfg.window_size
-    feature_fit_end = window_size + n_train
+    feature_fit_end = window_size + n_train - 1
     target_fit_start = window_size + sequence_cfg.horizon_steps - 1
     target_fit_end = target_fit_start + n_train
 
@@ -148,109 +148,12 @@ def prepare_weather_data(
     List[str],
     Dict[str, Any],
 ]:
-    """
-    Revised pipeline to prepare weather time series data for recurrent model training.
-    Uses configuration objects and has improved structure and error handling.
-    """
-    if df_input.empty:
-        raise ValueError("Input DataFrame is empty.")
+    """Compatibility wrapper for callers using the original nine-element tuple."""
+    from .preprocessing import prepare_dataset
 
-    input_cfg = _resolve_input_config(df_input, input_cfg)
-    if input_cfg.target_col_original_name not in df_input.columns:
-        raise ValueError(
-            f"Original target column '{input_cfg.target_col_original_name}' not found in input DataFrame."
-        )
-
-    logger.info("Starting weather data preparation pipeline v2.")
-
-    # Set chained assignment to None for in-place operations optimization
-    with pd.option_context("mode.chained_assignment", None):
-        # 1. Initial DataFrame Setup (with in-place operations optimization)
-        df, standardized_target_col_name, column_rename_map = _initial_df_setup(df_input, input_cfg)
-
-        # 2. Engineer Time-Based Features
-        df = _engineer_time_features(
-            df, feature_cfg, input_cfg
-        )  # Pass input_cfg for raw time col names
-
-        # 3. Compute chronological sequence split boundaries before fitting any
-        # preprocessing objects. Fitted transforms, thresholds, and scalers must
-        # learn only from rows participating in training windows/targets.
-        split_metadata = _compute_sequence_split_metadata(len(df), sequence_cfg)
-        feature_fit_indices = split_metadata["feature_fit_indices"]
-        target_fit_indices = split_metadata["target_fit_indices"]
-
-        # 4. Apply Target Variable Transformations (optimized - no copy needed with chained assignment None)
-        # target_col_after_transforms is the name of the column that holds the target values
-        # after all structural transformations (log, power, piecewise) but BEFORE scaling.
-        df, target_col_after_transforms, applied_target_transforms_info = (
-            _apply_target_transformations(
-                df,  # No copy needed with chained assignment guard
-                standardized_target_col_name,
-                transform_cfg,
-                target_fit_indices,
-            )
-        )
-
-    # 5. Engineer Other Features (e.g., low target indicator)
-    df = _engineer_other_domain_features(
-        df,
-        target_col_after_transforms,
-        feature_cfg,
-        standardized_target_col_name,
-        feature_fit_indices,
-    )
-
-    # 6. Select Final Set of Feature Columns (using standardized names)
-    feature_cols_final = _select_final_features(df, feature_cfg, target_col_after_transforms)
-
-    # 7. Scale Features and the (potentially transformed) Target
-    # scaled_df contains all selected features and the target, scaled.
-    # target_col_scaled is the name of the target column within scaled_df.
-    scaled_df, scalers, target_col_scaled = _scale_data(
-        df,
-        feature_cols_final,
-        target_col_after_transforms,
-        scaling_cfg,
-        applied_target_transforms_info,
-        feature_fit_indices,
-        target_fit_indices,
-    )
-
-    # 8. Create Sequences and Split Data
-    X_train, X_val, X_test, y_train, y_val, y_test = _create_sequences_and_split(
-        scaled_df, feature_cols_final, target_col_scaled, sequence_cfg
-    )
-
-    # 9. Consolidate Transformation Information for saving/loading/inverting
-    # This should include details about structural transforms and the final scaler for the target.
-    full_transform_details = {
-        "structural_transforms": applied_target_transforms_info,
-        "target_scaler_name": target_col_scaled,  # Name of the target column in the scalers dict
-        "target_col_original": input_cfg.target_col_original_name,  # The very original name
-        "target_col_standardized": standardized_target_col_name,  # Name after initial standardization
-        "target_col_after_structural_transforms": target_col_after_transforms,  # Name before scaling
-        "feature_columns_used": feature_cols_final,
-        "preprocessing_fit_scope": "train_only",
-        "split_metadata": {
-            key: value
-            for key, value in split_metadata.items()
-            if key not in {"feature_fit_indices", "target_fit_indices"}
-        },
-    }
-
-    logger.info("Weather data preparation pipeline v2 finished successfully.")
-    return (
-        X_train,
-        X_val,
-        X_test,
-        y_train,
-        y_val,
-        y_test,
-        scalers,
-        feature_cols_final,
-        full_transform_details,
-    )
+    return prepare_dataset(
+        df_input, input_cfg, transform_cfg, feature_cfg, scaling_cfg, sequence_cfg
+    ).as_legacy_tuple()
 
 
 # --- Helper Functions for `prepare_weather_data_v2` ---
@@ -446,8 +349,7 @@ def _engineer_time_features(
     df[STD_MONTH] = df[STD_TIME_COL].dt.month
 
     # Use centralized configuration for time constants
-    config = get_config()
-    minutes_in_day = config.features.minutes_in_day
+    minutes_in_day = feature_cfg.minutes_in_day
 
     # Vectorized time feature engineering using NumPy operations
     time_values = df[STD_TIME_COL].dt
@@ -544,11 +446,16 @@ def _engineer_time_features(
 
 @benchmark(stage_name="apply_target_transformations")
 def _apply_target_transformations(
-    df: pd.DataFrame, target_col: str, cfg: TransformationConfig, fit_indices: np.ndarray
+    df: pd.DataFrame,
+    target_col: str,
+    cfg: TransformationConfig,
+    fit_indices: np.ndarray,
+    fitted_transforms: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]]]:
     """Applies configured transformations to the target column (optimized)."""
     logger.debug(f"Applying target transformations to '{target_col}'. Config: {cfg}")
 
+    fitted = {item["type"]: item for item in fitted_transforms or []}
     current_target_col = target_col
     applied_transforms_log: List[Dict[str, Any]] = []
 
@@ -570,7 +477,7 @@ def _apply_target_transformations(
         new_col_name = f"{current_target_col}_piecewise"
 
         radiation_values = df[current_target_col].values.astype(float)
-        transformed = np.zeros_like(radiation_values)
+        transformed = np.full_like(radiation_values, np.nan)
 
         night_mask = radiation_values < cfg.piecewise_night_threshold
         transformed[night_mask] = np.log1p(radiation_values[night_mask])
@@ -621,9 +528,12 @@ def _apply_target_transformations(
         if (
             cfg.clip_original_target_before_power_transform and is_radiation_target
         ):  # Typically for radiation
-            fit_values = df.loc[fit_index, current_target_col].dropna()
-            lower_b = np.percentile(fit_values, cfg.original_target_clip_lower_percentile)
-            upper_b = np.percentile(fit_values, cfg.original_target_clip_upper_percentile)
+            if fitted_transforms is None:
+                fit_values = df.loc[fit_index, current_target_col].dropna()
+                lower_b = np.percentile(fit_values, cfg.original_target_clip_lower_percentile)
+                upper_b = np.percentile(fit_values, cfg.original_target_clip_upper_percentile)
+            else:
+                lower_b, upper_b = fitted["yeo-johnson"]["original_clip_bounds_before_yj"]
             df[current_target_col] = df[current_target_col].clip(lower_b, upper_b)
             clip_bounds_orig = (float(lower_b), float(upper_b))
             logger.info(
@@ -638,21 +548,14 @@ def _apply_target_transformations(
                 f"Applied floor of {cfg.min_radiation_floor_before_power_transform} to '{current_target_col}' before Yeo-Johnson."
             )
 
-        power_transformer = PowerTransformer(
-            method="yeo-johnson", standardize=False
-        )  # Scaler will handle standardization later
         values_to_transform = df[current_target_col].values.reshape(-1, 1)
-        values_to_fit = df.loc[fit_index, current_target_col].values.reshape(-1, 1)
-
-        # Handle NaNs before fitting PowerTransformer
-        fit_nan_mask = np.isnan(values_to_fit.squeeze())
-        if np.all(fit_nan_mask):
-            raise ValueError(
-                f"All values in '{current_target_col}' are NaN before PowerTransform. Cannot proceed."
-            )
-
+        if fitted_transforms is None:
+            power_transformer = PowerTransformer(method="yeo-johnson", standardize=False)
+            values_to_fit = df.loc[fit_index, current_target_col].values.reshape(-1, 1)
+            power_transformer.fit(values_to_fit)
+        else:
+            power_transformer = fitted["yeo-johnson"]["power_transformer_object"]
         transformed_values = np.full_like(values_to_transform, np.nan)
-        power_transformer.fit(values_to_fit[~fit_nan_mask])
         all_nan_mask = np.isnan(values_to_transform.squeeze())
         if not np.all(all_nan_mask):
             transformed_values[~all_nan_mask] = power_transformer.transform(
@@ -692,9 +595,12 @@ def _apply_target_transformations(
 
         clip_bounds_log = None
         if cfg.clip_log_transformed_target:
-            fit_values = df.loc[fit_index, new_col_name].dropna()
-            lower_b = np.percentile(fit_values, cfg.log_clip_lower_percentile)
-            upper_b = np.percentile(fit_values, cfg.log_clip_upper_percentile)
+            if fitted_transforms is None:
+                fit_values = df.loc[fit_index, new_col_name].dropna()
+                lower_b = np.percentile(fit_values, cfg.log_clip_lower_percentile)
+                upper_b = np.percentile(fit_values, cfg.log_clip_upper_percentile)
+            else:
+                lower_b, upper_b = fitted["log"]["clip_bounds_after_log"]
             df[new_col_name] = df[new_col_name].clip(lower_b, upper_b)
             clip_bounds_log = (float(lower_b), float(upper_b))
             logger.info(

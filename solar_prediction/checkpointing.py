@@ -24,6 +24,7 @@ def save_checkpoint(
     history: Dict[str, Any],
     metrics: Dict[str, float],
     version: str = "1.1",
+    preprocessor: Any = None,
 ) -> None:
     """
     Save model checkpoint with comprehensive metadata.
@@ -74,6 +75,10 @@ def save_checkpoint(
             "pytorch_version": torch.__version__,
             "config_snapshot": _get_config_snapshot(),
         }
+
+        if preprocessor is not None:
+            preprocessor._require_fitted()
+            checkpoint_data["preprocessor"] = preprocessor
 
         # Add model-specific metadata
         if hasattr(model, "params"):
@@ -240,7 +245,11 @@ def create_model_from_checkpoint(checkpoint_path: str, device: str = "cpu") -> A
         Loaded model instance
     """
     checkpoint, metadata = load_checkpoint(checkpoint_path, map_location=device)
-    model_type = metadata.get("model_type", "unknown")
+    return _model_from_checkpoint(checkpoint, device)
+
+
+def _model_from_checkpoint(checkpoint, device):
+    model_type = checkpoint.get("model_type", "unknown")
 
     if model_type == "LSTM":
         return _create_lstm_from_checkpoint(checkpoint, device)
@@ -248,6 +257,20 @@ def create_model_from_checkpoint(checkpoint_path: str, device: str = "cpu") -> A
         return _create_gru_from_checkpoint(checkpoint, device)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+
+def load_forecaster(checkpoint_path: str, device: str = "cpu") -> Tuple[Any, Any]:
+    """Load the model and its independently fitted preprocessing state."""
+    from .preprocessing import WeatherPreprocessor
+
+    checkpoint, _ = load_checkpoint(checkpoint_path, map_location=device)
+    preprocessor = checkpoint.get("preprocessor")
+    if not isinstance(preprocessor, WeatherPreprocessor):
+        raise ValueError(
+            "Checkpoint has no fitted preprocessor. Retrain and save a new checkpoint."
+        )
+    preprocessor._require_fitted()
+    return _model_from_checkpoint(checkpoint, device), preprocessor
 
 
 def _create_lstm_from_checkpoint(checkpoint: Dict[str, Any], device: str) -> Any:

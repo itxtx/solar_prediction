@@ -111,6 +111,12 @@ Important implementation details:
 - Target transforms and scalers are fit only on training target rows.
 - Feature scalers and low-radiation thresholds are fit only on training feature rows.
 - Validation and test data are transformed with the training-fitted objects.
+- CLI checkpoints bundle a `WeatherPreprocessor` with the model. Evaluation loads it without refitting, including feature order, transforms, scalers, window size and horizon.
+- Features are forward filled; leading gaps use saved training medians. Missing target labels raise an error.
+
+`evaluate` defaults to scoring the test split of a full dataset. For a separate held-out file, pass `--evaluation-scope all`; its first `window_size + horizon_steps - 1` rows provide context. The Python `preprocessor.sequences(data, history=prior_data)` interface can instead supply preceding observations explicitly. An explicit evaluation horizon must match the checkpoint.
+
+Older checkpoints without a fitted preprocessor require retraining for CLI evaluation. Existing model-only loading and the nine-element `prepare_weather_data` return tuple remain available.
 
 This avoids the common time-series leakage pattern where scalers or target transforms learn from future validation/test values.
 
@@ -129,7 +135,8 @@ The portfolio comparison includes:
 solar_prediction/
   cli.py              # train/evaluate/compare command-line workflow
   config.py           # centralized (pydantic) configuration for pipeline and models
-  data_prep.py        # leakage-safe preprocessing and sequence creation
+  preprocessing.py    # fitted preprocessor and named train/val/test sequence data
+  data_prep.py         # preprocessing helpers and legacy tuple wrapper
   data_loader.py      # data loading utility (chunked CSV reading)
   lstm.py             # PyTorch LSTM model
   gru.py              # PyTorch GRU model

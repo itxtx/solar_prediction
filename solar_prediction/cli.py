@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 
 from .config import get_config
-from .data_prep import prepare_weather_data
+from .preprocessing import prepare_dataset
+from .checkpointing import load_forecaster, save_checkpoint
 from .gru import (
     WeatherGRU,
     create_gru_model_hyperparameters_from_config,
@@ -49,7 +50,7 @@ def _copy_sequence_config_with_horizon(sequence_cfg: Any, horizon_steps: int):
 def _prepare(data_path: Path, horizon_steps: int = 1):
     config = get_config()
     sequence_cfg = _copy_sequence_config_with_horizon(config.sequences, horizon_steps)
-    return prepare_weather_data(
+    return prepare_dataset(
         _load_dataframe(data_path),
         config.input,
         config.transformation,
@@ -57,10 +58,6 @@ def _prepare(data_path: Path, horizon_steps: int = 1):
         config.scaling,
         sequence_cfg,
     )
-
-
-def _target_scaler(scalers: Dict[str, Any], transform_info: Dict[str, Any]):
-    return scalers.get(transform_info["target_scaler_name"])
 
 
 def _model_and_configs(
@@ -107,11 +104,11 @@ def _model_and_configs(
 
 
 def _load_model(model_name: str, checkpoint: Path, device: str):
-    if model_name == "lstm":
-        return WeatherLSTM.load(str(checkpoint), device=device)
-    if model_name == "gru":
-        return WeatherGRU.load(str(checkpoint), device=device)
-    raise ValueError(f"Unsupported model: {model_name}")
+    model, preprocessor = load_forecaster(str(checkpoint), device)
+    expected = {"lstm": WeatherLSTM, "gru": WeatherGRU}[model_name]
+    if not isinstance(model, expected):
+        raise ValueError(f"Checkpoint model does not match --model {model_name}.")
+    return model, preprocessor
 
 
 def _metrics(actual: np.ndarray, predicted: np.ndarray) -> Dict[str, float]:
@@ -196,55 +193,42 @@ def _print_metrics_table(metrics_by_model: Dict[str, Dict[str, float]]) -> None:
         )
 
 
-def _evaluation_metrics_for_table(
-    metrics: Dict[str, float], prefer_original: bool = False
-) -> Dict[str, float]:
-    if prefer_original and not np.isnan(metrics.get("rmse", np.nan)):
-        return {
-            "rmse": float(metrics["rmse"]),
-            "mae": float(metrics["mae"]),
-            "r2": float(metrics["r2"]),
-            "capped_mape": float(metrics["mape_capped"]),
-        }
-    return {
-        "rmse": float(metrics["scaled_rmse"]),
-        "mae": float(metrics["scaled_mae"]),
-        "r2": float(metrics["scaled_r2"]),
-        "capped_mape": float(metrics["scaled_mape_capped"]),
-    }
+def _evaluate_model(model, split, preprocessor, device, batch_size):
+    predictions = model.predict(split.X, device=device, batch_size=batch_size)
+    return _metrics(split.actuals, preprocessor.inverse_target(predictions))
+
+
+def _save_model(model, checkpoint, train_cfg, metrics, preprocessor):
+    save_checkpoint(
+        model,
+        str(checkpoint),
+        model.params,
+        train_cfg,
+        model.history,
+        metrics,
+        preprocessor=preprocessor,
+    )
 
 
 def command_train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output)
     data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
-    X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = data
+    feature_cols, transform_info = data.preprocessor.feature_columns, data.transform_info
 
     model, train_cfg = _model_and_configs(
         args.model,
-        input_dim=X_train.shape[2],
+        input_dim=data.train.X.shape[2],
         epochs=args.epochs,
         hidden_dim=args.hidden_dim,
         batch_size=args.batch_size,
     )
-    model.transform_info = transform_info
-    model.fit(X_train, y_train, X_val, y_val, train_cfg, device=args.device)
+    model.fit(data.train.X, data.train.y, data.val.X, data.val.y, train_cfg, device=args.device)
 
-    target_scaler = _target_scaler(scalers, transform_info)
-    _, _, _, _, metrics = model.evaluate(
-        X_test,
-        y_test,
-        device=args.device,
-        target_scaler_object=target_scaler,
-        transform_info_dict=transform_info,
-        scalers_dict=scalers,
-        batch_size=args.batch_size,
-        return_predictions=True,
-        plot_results=False,
-    )
+    metrics = _evaluate_model(model, data.test, data.preprocessor, args.device, args.batch_size)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = output_dir / f"{args.model}_model.pt"
-    model.save(str(checkpoint), train_cfg=train_cfg, metrics=metrics, use_enhanced=False)
+    _save_model(model, checkpoint, train_cfg, metrics, data.preprocessor)
 
     metadata = {
         "model": args.model,
@@ -258,33 +242,29 @@ def command_train(args: argparse.Namespace) -> None:
     }
     _write_json(output_dir / f"{args.model}_metadata.json", metadata)
     print(f"Saved checkpoint: {checkpoint}")
-    _print_metrics_table({args.model: _evaluation_metrics_for_table(metrics, prefer_original=True)})
+    _print_metrics_table({args.model: metrics})
 
 
 def command_evaluate(args: argparse.Namespace) -> None:
-    data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
-    X_train, X_val, X_test, y_train, y_val, y_test, scalers, _, transform_info = data
-    del X_train, X_val, y_train, y_val
-
-    model = _load_model(args.model, Path(args.checkpoint), args.device)
-    target_scaler = _target_scaler(scalers, transform_info)
-    _, _, _, _, metrics = model.evaluate(
-        X_test,
-        y_test,
-        device=args.device,
-        target_scaler_object=target_scaler,
-        transform_info_dict=transform_info,
-        scalers_dict=scalers,
-        batch_size=args.batch_size,
-        return_predictions=True,
-        plot_results=False,
+    model, preprocessor = _load_model(args.model, Path(args.checkpoint), args.device)
+    if (
+        args.horizon_steps is not None
+        and args.horizon_steps != preprocessor.sequence_cfg.horizon_steps
+    ):
+        raise ValueError("--horizon-steps must match the saved checkpoint horizon.")
+    raw = _load_dataframe(Path(args.data))
+    split = (
+        preprocessor.split_sequences(raw).test
+        if args.evaluation_scope == "test"
+        else preprocessor.sequences(raw)
     )
-    _print_metrics_table({args.model: _evaluation_metrics_for_table(metrics, prefer_original=True)})
+    metrics = _evaluate_model(model, split, preprocessor, args.device, args.batch_size)
+    _print_metrics_table({args.model: metrics})
 
 
 def command_compare(args: argparse.Namespace) -> None:
     data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
-    X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = data
+    feature_cols, transform_info = data.preprocessor.feature_columns, data.transform_info
     output_dir = Path(args.output) if args.output else None
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -295,35 +275,20 @@ def command_compare(args: argparse.Namespace) -> None:
     for model_name in ("lstm", "gru"):
         model, train_cfg = _model_and_configs(
             model_name,
-            input_dim=X_train.shape[2],
+            input_dim=data.train.X.shape[2],
             epochs=args.epochs,
             hidden_dim=args.hidden_dim,
             batch_size=args.batch_size,
         )
-        model.transform_info = transform_info
-        model.fit(X_train, y_train, X_val, y_val, train_cfg, device=args.device)
-        target_scaler = _target_scaler(scalers, transform_info)
-        _, _, pred_original, actual_original, eval_metrics = model.evaluate(
-            X_test,
-            y_test,
-            device=args.device,
-            target_scaler_object=target_scaler,
-            transform_info_dict=transform_info,
-            scalers_dict=scalers,
-            batch_size=args.batch_size,
-            return_predictions=True,
-            plot_results=False,
+        model.fit(data.train.X, data.train.y, data.val.X, data.val.y, train_cfg, device=args.device)
+        eval_metrics = _evaluate_model(
+            model, data.test, data.preprocessor, args.device, args.batch_size
         )
-        if pred_original is None or actual_original is None:
-            metrics_by_model[model_name] = _evaluation_metrics_for_table(eval_metrics)
-        else:
-            metrics_by_model[model_name] = _metrics(actual_original, pred_original)
+        metrics_by_model[model_name] = eval_metrics
 
         if output_dir:
             checkpoint = output_dir / f"{model_name}_model.pt"
-            model.save(
-                str(checkpoint), train_cfg=train_cfg, metrics=eval_metrics, use_enhanced=False
-            )
+            _save_model(model, checkpoint, train_cfg, eval_metrics, data.preprocessor)
             metadata = {
                 "model": model_name,
                 "checkpoint": str(checkpoint),
@@ -378,8 +343,14 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--horizon-steps",
         type=_positive_int,
-        default=1,
-        help="Forecast horizon in rows after the input window",
+        default=None,
+        help="Defaults to the saved horizon; an explicit value must match it",
+    )
+    evaluate.add_argument(
+        "--evaluation-scope",
+        choices=["test", "all"],
+        default="test",
+        help="Score the test split of a full dataset, or all windowable targets in a held-out file",
     )
     evaluate.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
     evaluate.set_defaults(func=command_evaluate)
