@@ -3,7 +3,7 @@
 Test script for enhanced checkpointing functionality.
 
 This script tests the new enhanced checkpointing utility to ensure it works correctly
-with all model types (TDMC, LSTM, GRU) and maintains backward compatibility.
+with LSTM and GRU models and maintains backward compatibility.
 """
 
 import numpy as np
@@ -17,7 +17,6 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Import model classes and checkpointing utilities
-from solar_prediction.tdmc import SolarTDMC
 from solar_prediction.lstm import (
     WeatherLSTM,
     ModelHyperparameters,
@@ -40,57 +39,6 @@ def create_test_data(n_samples=100, n_features=10, sequence_length=24):
     X = np.random.randn(n_samples, sequence_length, n_features)
     y = np.random.randn(n_samples, 1)
     return X, y
-
-
-def test_tdmc_enhanced_checkpointing():
-    """Test enhanced checkpointing with TDMC model."""
-    print("\n=== Testing TDMC Enhanced Checkpointing ===")
-
-    # Create TDMC model
-    model = SolarTDMC(n_states=3, n_emissions=5, time_slices=24)
-
-    # Create some test data
-    X_test = np.random.randn(50, 5)
-    timestamps = np.arange(50)
-
-    # Fit model (simulate training)
-    model.fit(X_test, timestamps)
-
-    # Prepare test metadata
-    hp = {"n_states": 3, "n_emissions": 5, "time_slices": 24}
-    train_cfg = {"max_iterations": 100, "tolerance": 1e-4}
-    history = {"log_likelihood": [-1000, -950, -920, -900]}
-    metrics = {"final_log_likelihood": -900, "convergence_iterations": 4}
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Test enhanced saving
-        enhanced_path = Path(temp_dir) / "tdmc_enhanced.pt"
-        model.save_model(
-            str(enhanced_path),
-            hp=hp,
-            train_cfg=train_cfg,
-            history=history,
-            metrics=metrics,
-            use_enhanced=True,
-        )
-
-        # Test enhanced loading
-        loaded_model = SolarTDMC.load_model(str(enhanced_path))
-
-        # Verify model state
-        assert loaded_model.n_states == model.n_states
-        assert loaded_model.n_emissions == model.n_emissions
-        assert loaded_model.time_slices == model.time_slices
-        assert loaded_model.trained == model.trained
-        np.testing.assert_array_almost_equal(loaded_model.transitions, model.transitions)
-
-        # Test legacy format compatibility
-        legacy_path = Path(temp_dir) / "tdmc_legacy.npz"
-        model.save_model(str(legacy_path), use_enhanced=False)
-        loaded_legacy = SolarTDMC.load_model(str(legacy_path))
-        assert loaded_legacy.n_states == model.n_states
-
-        print("✓ TDMC enhanced checkpointing tests passed")
 
 
 def test_lstm_enhanced_checkpointing():
@@ -205,35 +153,27 @@ def test_legacy_sequence_checkpoints_load_without_enhanced_warning(caplog):
 
 
 def test_cross_compatibility():
-    """Test version compatibility and error handling."""
-    print("\n=== Testing Cross-Compatibility ===")
-
-    # Test loading with strict mode
+    """The checkpoint factory should reconstruct both recurrent model types."""
+    models = [
+        WeatherLSTM(create_model_hyperparameters_from_config(input_dim=3)),
+        WeatherGRU(create_gru_model_hyperparameters_from_config(input_dim=3)),
+    ]
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Create a TDMC model and save it
-        model = SolarTDMC(n_states=2, n_emissions=3, time_slices=12)
-        model.fit(np.random.randn(30, 3), np.arange(30))
+        for model in models:
+            enhanced_path = Path(temp_dir) / f"{type(model).__name__}.pt"
+            model.save(str(enhanced_path), train_cfg={}, metrics={})
 
-        enhanced_path = Path(temp_dir) / "test_model.pt"
-        model.save_model(
-            str(enhanced_path),
-            hp={"n_states": 2, "n_emissions": 3, "time_slices": 12},
-            train_cfg={},
-            history={},
-            metrics={},
-        )
+            checkpoint, metadata = load_checkpoint(str(enhanced_path), strict=True)
+            assert metadata["model_type"] in {"LSTM", "GRU"}
+            assert "version" in metadata
 
-        # Test loading with different strict modes
-        checkpoint, metadata = load_checkpoint(str(enhanced_path), strict=False)
-        assert metadata["model_type"] == "TDMC"
-        assert "version" in metadata
-
-        # Test factory function
-        created_model = create_model_from_checkpoint(str(enhanced_path))
-        assert isinstance(created_model, SolarTDMC)
-        assert created_model.n_states == 2
-
-        print("✓ Cross-compatibility tests passed")
+            created_model = create_model_from_checkpoint(str(enhanced_path))
+            assert type(created_model) is type(model)
+            assert created_model.params == model.params
+            for key, value in model.state_dict().items():
+                np.testing.assert_array_equal(
+                    created_model.state_dict()[key].numpy(), value.numpy()
+                )
 
 
 def test_metadata_completeness():
@@ -329,7 +269,6 @@ def main():
     print("=" * 50)
 
     try:
-        test_tdmc_enhanced_checkpointing()
         test_lstm_enhanced_checkpointing()
         test_gru_enhanced_checkpointing()
         test_cross_compatibility()

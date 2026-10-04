@@ -7,7 +7,6 @@ handling of older checkpoint formats.
 """
 
 import torch
-import numpy as np
 from datetime import datetime
 from typing import Dict, Any, Optional, Union, Tuple
 import logging
@@ -32,7 +31,7 @@ def save_checkpoint(
     Parameters:
     -----------
     model : Any
-        Model object (TDMC, LSTM, or GRU)
+        Model object (LSTM or GRU)
     path : str
         Path to save the checkpoint
     hp : Any
@@ -60,13 +59,7 @@ def save_checkpoint(
             else train_cfg if isinstance(train_cfg, dict) else train_cfg.__dict__
         )
 
-        # Get state dict based on model type
-        if hasattr(model, "state_dict"):
-            # PyTorch models (LSTM, GRU)
-            state_dict = model.state_dict()
-        else:
-            # TDMC or other non-PyTorch models
-            state_dict = _extract_tdmc_state(model)
+        state_dict = model.state_dict()
 
         # Create comprehensive checkpoint data
         checkpoint_data = {
@@ -78,7 +71,7 @@ def save_checkpoint(
             "version": version,
             "timestamp": datetime.now().isoformat(),
             "model_type": _get_model_type(model),
-            "pytorch_version": torch.__version__ if hasattr(model, "state_dict") else None,
+            "pytorch_version": torch.__version__,
             "config_snapshot": _get_config_snapshot(),
         }
 
@@ -88,9 +81,6 @@ def save_checkpoint(
             checkpoint_data["model_params"] = _convert_params_to_dict(model.params)
             if hasattr(model, "transform_info"):
                 checkpoint_data["transform_info"] = model.transform_info
-        elif hasattr(model, "n_states"):
-            # TDMC model
-            checkpoint_data.update(_get_tdmc_metadata(model))
 
         # Save checkpoint
         torch.save(checkpoint_data, str(path))
@@ -153,35 +143,10 @@ def load_checkpoint(
         raise
 
 
-def _extract_tdmc_state(model) -> Dict[str, Any]:
-    """Extract state information from TDMC model."""
-    return {
-        "transitions": model.transitions,
-        "emission_means": model.emission_means,
-        "emission_covars": model.emission_covars,
-        "initial_probs": model.initial_probs,
-        "scaler_mean_": model.scaler.mean_ if hasattr(model.scaler, "mean_") else None,
-        "scaler_scale_": model.scaler.scale_ if hasattr(model.scaler, "scale_") else None,
-        "trained": model.trained,
-    }
-
-
-def _get_tdmc_metadata(model) -> Dict[str, Any]:
-    """Get TDMC-specific metadata."""
-    return {
-        "n_states": model.n_states,
-        "n_emissions": model.n_emissions,
-        "time_slices": model.time_slices,
-        "state_names": model.state_names,
-    }
-
-
 def _get_model_type(model) -> str:
     """Determine model type from model object."""
     class_name = model.__class__.__name__
-    if "TDMC" in class_name:
-        return "TDMC"
-    elif "LSTM" in class_name:
+    if "LSTM" in class_name:
         return "LSTM"
     elif "GRU" in class_name:
         return "GRU"
@@ -206,9 +171,6 @@ def _get_config_snapshot() -> Dict[str, Any]:
         return {
             "data_config": config.data.__dict__ if hasattr(config.data, "__dict__") else {},
             "model_configs": {
-                "tdmc": (
-                    config.models.tdmc.__dict__ if hasattr(config.models.tdmc, "__dict__") else {}
-                ),
                 "lstm": (
                     config.models.lstm.__dict__ if hasattr(config.models.lstm, "__dict__") else {}
                 ),
@@ -280,46 +242,12 @@ def create_model_from_checkpoint(checkpoint_path: str, device: str = "cpu") -> A
     checkpoint, metadata = load_checkpoint(checkpoint_path, map_location=device)
     model_type = metadata.get("model_type", "unknown")
 
-    if model_type == "TDMC":
-        return _create_tdmc_from_checkpoint(checkpoint, device)
-    elif model_type == "LSTM":
+    if model_type == "LSTM":
         return _create_lstm_from_checkpoint(checkpoint, device)
     elif model_type == "GRU":
         return _create_gru_from_checkpoint(checkpoint, device)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-
-
-def _create_tdmc_from_checkpoint(checkpoint: Dict[str, Any], device: str) -> Any:
-    """Create TDMC model from checkpoint."""
-    from .tdmc import SolarTDMC
-
-    model = SolarTDMC(
-        n_states=checkpoint["n_states"],
-        n_emissions=checkpoint["n_emissions"],
-        time_slices=checkpoint["time_slices"],
-    )
-
-    # Load state
-    state_dict = checkpoint["state_dict"]
-    model.transitions = state_dict["transitions"]
-    model.emission_means = state_dict["emission_means"]
-    model.emission_covars = state_dict["emission_covars"]
-    model.initial_probs = state_dict["initial_probs"]
-    model.trained = state_dict.get("trained", False)
-
-    # Load scaler state
-    if state_dict.get("scaler_mean_") is not None:
-        model.scaler.mean_ = state_dict["scaler_mean_"]
-        model.scaler.scale_ = state_dict["scaler_scale_"]
-        model.scaler.n_features_in_ = model.n_emissions
-        model.scaler.n_samples_seen_ = 1
-
-    # Load metadata
-    if "state_names" in checkpoint:
-        model.state_names = checkpoint["state_names"]
-
-    return model
 
 
 def _create_lstm_from_checkpoint(checkpoint: Dict[str, Any], device: str) -> Any:

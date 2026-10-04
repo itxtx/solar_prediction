@@ -310,52 +310,11 @@ class GRUConfig(BaseModel):
         return v
 
 
-class TDMCConfig(BaseModel):
-    """Configuration for Time-Dynamic Markov Chain model."""
-
-    # Model architecture
-    n_states: int = Field(4, description="Number of hidden states")
-    n_emissions: int = Field(2, description="Number of observable emission variables")
-    time_slices: int = Field(24, description="Number of time slices per day")
-
-    # Training
-    max_iter: int = Field(100, description="Maximum EM iterations")
-    tolerance: float = Field(1e-4, description="Convergence tolerance")
-    random_state: int = Field(42, description="Random state for reproducibility")
-
-    # Regularization
-    covariance_regularization: float = Field(1e-4, description="Covariance matrix regularization")
-    min_eigenvalue_threshold: float = Field(
-        1e-9, description="Minimum eigenvalue for positive definiteness"
-    )
-    transition_smoothing_prior: float = Field(1e-6, description="Smoothing prior for transitions")
-    initial_state_smoothing_prior: float = Field(
-        1e-6, description="Smoothing prior for initial states"
-    )
-
-    # Numerical stability
-    eigenvalue_min_tolerance: float = Field(1e-9, description="Minimum eigenvalue tolerance")
-    min_probability: float = Field(
-        1e-300, description="Minimum probability to avoid numerical issues"
-    )
-    probability_floor: float = Field(
-        1e-300, description="Floor value for probabilities to avoid underflow"
-    )
-
-    # Logging
-    verbose_logging: bool = Field(False, description="Enable verbose logging for debugging")
-    log_likelihood_every_n_iter: int = Field(10, description="Log likelihood every N iterations")
-
-    # K-means initialization
-    kmeans_n_init: str = Field("auto", description="Number of K-means initializations")
-
-
 class ModelsConfig(BaseModel):
     """Configuration for all models."""
 
     lstm: LSTMConfig = Field(default_factory=LSTMConfig)
     gru: GRUConfig = Field(default_factory=GRUConfig)
-    tdmc: TDMCConfig = Field(default_factory=TDMCConfig)
 
 
 # =============================================================================
@@ -383,7 +342,6 @@ class PathsConfig(BaseModel):
     # Model files
     lstm_model_filename: str = Field("lstm_model.pth", description="LSTM model filename")
     gru_model_filename: str = Field("gru_model.pth", description="GRU model filename")
-    tdmc_model_filename: str = Field("tdmc_model.pkl", description="TDMC model filename")
 
     # Configuration files
     config_filename: str = Field("config.yaml", description="Configuration file name")

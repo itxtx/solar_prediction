@@ -123,8 +123,6 @@ The portfolio comparison includes:
 - **LSTM**: compact recurrent neural network implemented in PyTorch.
 - **GRU**: compact recurrent neural network implemented in PyTorch.
 
-The TDMC implementation remains in the repository as an optional experimental analysis path.
-
 ## Repository Layout
 
 ```text
@@ -135,7 +133,6 @@ solar_prediction/
   data_loader.py      # data loading utility (chunked CSV reading)
   lstm.py             # PyTorch LSTM model
   gru.py              # PyTorch GRU model
-  tdmc.py             # optional time-dynamic Markov chain experiments
   checkpointing.py    # model checkpoint save/load
   benchmark.py        # timing/benchmark utilities for pipeline operations
   memory_tracker.py   # memory-usage tracking for PyTorch models
