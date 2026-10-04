@@ -36,30 +36,27 @@ def tiny_training_data(small_sample_data):
     # Use only the first 30 rows for very quick testing
     df = small_sample_data.head(30).copy()
 
-    try:
-        # Prepare data using the pipeline
-        X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = (
-            prepare_weather_data(
-                df,
-                config.data,
-                config.transformation,
-                config.features,
-                config.scaling,
-                config.sequences,
-            )
+    # Prepare data using the pipeline
+    X_train, X_val, X_test, y_train, y_val, y_test, scalers, feature_cols, transform_info = (
+        prepare_weather_data(
+            df,
+            config.input,
+            config.transformation,
+            config.features,
+            config.scaling,
+            config.sequences,
         )
+    )
 
-        return {
-            "X_train": X_train,
-            "X_val": X_val,
-            "y_train": y_train,
-            "y_val": y_val,
-            "feature_cols": feature_cols,
-            "scalers": scalers,
-            "transform_info": transform_info,
-        }
-    except Exception as e:
-        pytest.skip(f"Failed to prepare tiny training data: {e}")
+    return {
+        "X_train": X_train,
+        "X_val": X_val,
+        "y_train": y_train,
+        "y_val": y_val,
+        "feature_cols": feature_cols,
+        "scalers": scalers,
+        "transform_info": transform_info,
+    }
 
 
 class TestLSTMModel:
@@ -128,36 +125,32 @@ class TestLSTMModel:
         model = WeatherLSTM(model_params)
         model.to(device)
 
-        try:
-            # Train the model
-            model.fit(
-                data["X_train"],
-                data["y_train"],
-                data["X_val"] if data["X_val"].shape[0] > 0 else data["X_train"][:2],
-                data["y_val"] if data["y_val"].shape[0] > 0 else data["y_train"][:2],
-                training_config,
-                device=device,
-            )
+        # Train the model
+        model.fit(
+            data["X_train"],
+            data["y_train"],
+            data["X_val"] if data["X_val"].shape[0] > 0 else data["X_train"][:2],
+            data["y_val"] if data["y_val"].shape[0] > 0 else data["y_train"][:2],
+            training_config,
+            device=device,
+        )
 
-            # Check that training history exists
-            assert len(model.history["train_loss"]) == 2  # 2 epochs
-            assert len(model.history["val_loss"]) == 2
+        # Check that training history exists
+        assert len(model.history["train_loss"]) == 2  # 2 epochs
+        assert len(model.history["val_loss"]) == 2
 
-            # Assert that loss decreased or stayed stable (allow small increases due to tiny data)
-            initial_loss = model.history["train_loss"][0]
-            final_loss = model.history["train_loss"][-1]
+        # Assert that loss decreased or stayed stable (allow small increases due to tiny data)
+        initial_loss = model.history["train_loss"][0]
+        final_loss = model.history["train_loss"][-1]
 
-            # Loss should decrease or not increase by more than 20% (due to tiny dataset)
-            assert (
-                final_loss <= initial_loss * 1.2
-            ), f"Loss increased too much: {initial_loss} -> {final_loss}"
+        # Loss should decrease or not increase by more than 20% (due to tiny dataset)
+        assert final_loss <= initial_loss * 1.2, (
+            f"Loss increased too much: {initial_loss} -> {final_loss}"
+        )
 
-            # Check that losses are finite
-            assert all(np.isfinite(model.history["train_loss"]))
-            assert all(np.isfinite(model.history["val_loss"]))
-
-        except Exception as e:
-            pytest.skip(f"LSTM training failed: {e}")
+        # Check that losses are finite
+        assert all(np.isfinite(model.history["train_loss"]))
+        assert all(np.isfinite(model.history["val_loss"]))
 
     def test_lstm_prediction(self, tiny_training_data, device):
         """Test LSTM prediction after training."""
@@ -177,27 +170,23 @@ class TestLSTMModel:
         model = WeatherLSTM(model_params)
         model.to(device)
 
-        try:
-            # Quick training
-            model.fit(
-                data["X_train"][:5] if data["X_train"].shape[0] >= 5 else data["X_train"],
-                data["y_train"][:5] if data["y_train"].shape[0] >= 5 else data["y_train"],
-                data["X_train"][:2],
-                data["y_train"][:2],
-                training_config,
-                device=device,
-            )
+        # Quick training
+        model.fit(
+            data["X_train"][:5] if data["X_train"].shape[0] >= 5 else data["X_train"],
+            data["y_train"][:5] if data["y_train"].shape[0] >= 5 else data["y_train"],
+            data["X_train"][:2],
+            data["y_train"][:2],
+            training_config,
+            device=device,
+        )
 
-            # Test prediction
-            test_X = data["X_train"][:3]
-            predictions = model.predict(test_X, device=device)
+        # Test prediction
+        test_X = data["X_train"][:3]
+        predictions = model.predict(test_X, device=device)
 
-            # Check prediction shape and values
-            assert predictions.shape == (test_X.shape[0], model_params.output_dim)
-            assert np.all(np.isfinite(predictions))
-
-        except Exception as e:
-            pytest.skip(f"LSTM prediction test failed: {e}")
+        # Check prediction shape and values
+        assert predictions.shape == (test_X.shape[0], model_params.output_dim)
+        assert np.all(np.isfinite(predictions))
 
 
 class TestGRUModel:
@@ -272,36 +261,32 @@ class TestGRUModel:
         model = WeatherGRU(model_params)
         model.to(device)
 
-        try:
-            # Train the model
-            model.fit(
-                data["X_train"],
-                data["y_train"],
-                data["X_val"] if data["X_val"].shape[0] > 0 else data["X_train"][:2],
-                data["y_val"] if data["y_val"].shape[0] > 0 else data["y_train"][:2],
-                training_config,
-                device=device,
-            )
+        # Train the model
+        model.fit(
+            data["X_train"],
+            data["y_train"],
+            data["X_val"] if data["X_val"].shape[0] > 0 else data["X_train"][:2],
+            data["y_val"] if data["y_val"].shape[0] > 0 else data["y_train"][:2],
+            training_config,
+            device=device,
+        )
 
-            # Check that training history exists
-            assert len(model.history["train_loss"]) == 2  # 2 epochs
-            assert len(model.history["val_loss"]) == 2
+        # Check that training history exists
+        assert len(model.history["train_loss"]) == 2  # 2 epochs
+        assert len(model.history["val_loss"]) == 2
 
-            # Assert that loss decreased or stayed stable
-            initial_loss = model.history["train_loss"][0]
-            final_loss = model.history["train_loss"][-1]
+        # Assert that loss decreased or stayed stable
+        initial_loss = model.history["train_loss"][0]
+        final_loss = model.history["train_loss"][-1]
 
-            # Loss should decrease or not increase by more than 20% (due to tiny dataset)
-            assert (
-                final_loss <= initial_loss * 1.2
-            ), f"Loss increased too much: {initial_loss} -> {final_loss}"
+        # Loss should decrease or not increase by more than 20% (due to tiny dataset)
+        assert final_loss <= initial_loss * 1.2, (
+            f"Loss increased too much: {initial_loss} -> {final_loss}"
+        )
 
-            # Check that losses are finite
-            assert all(np.isfinite(model.history["train_loss"]))
-            assert all(np.isfinite(model.history["val_loss"]))
-
-        except Exception as e:
-            pytest.skip(f"GRU training failed: {e}")
+        # Check that losses are finite
+        assert all(np.isfinite(model.history["train_loss"]))
+        assert all(np.isfinite(model.history["val_loss"]))
 
     def test_gru_bidirectional(self, numpy_arrays_2d, device):
         """Test bidirectional GRU functionality."""
@@ -470,15 +455,12 @@ class TestModelEdgeCases:
         lstm_model = WeatherLSTM(lstm_params)
         lstm_model.to(device)
 
-        try:
-            # Filter out the UndefinedMetricWarning for R² with minimal data
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-                lstm_model.fit(X[:2], y[:2], X[2:], y[2:], training_config, device=device)
-            predictions = lstm_model.predict(X, device=device)
-            assert predictions.shape[0] == X.shape[0]
-        except Exception as e:
-            pytest.skip(f"LSTM minimal data test failed: {e}")
+        # Filter out the UndefinedMetricWarning for R² with minimal data
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+            lstm_model.fit(X[:2], y[:2], X[2:], y[2:], training_config, device=device)
+        predictions = lstm_model.predict(X, device=device)
+        assert predictions.shape[0] == X.shape[0]
 
     def test_model_error_handling(self, device):
         """Test model error handling with invalid inputs."""

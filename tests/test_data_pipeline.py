@@ -467,33 +467,28 @@ class TestDataPipelineEdgeCases:
             }
         )
 
-        try:
-            result = prepare_weather_data(
-                minimal_data,
-                config.input,
-                config.transformation,
-                config.features,
-                config.scaling,
-                config.sequences,
-            )
+        result = prepare_weather_data(
+            minimal_data,
+            config.input,
+            config.transformation,
+            config.features,
+            config.scaling,
+            config.sequences,
+        )
 
-            # If it succeeds, check the results are valid
-            (
-                X_train,
-                X_val,
-                X_test,
-                y_train,
-                y_val,
-                y_test,
-                scalers,
-                feature_cols,
-                transform_info,
-            ) = result
-            self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
-
-        except Exception as e:
-            # It's acceptable if pipeline fails with missing columns
-            pytest.skip(f"Pipeline failed with missing columns (expected): {e}")
+        # If it succeeds, check the results are valid
+        (
+            X_train,
+            X_val,
+            X_test,
+            y_train,
+            y_val,
+            y_test,
+            scalers,
+            feature_cols,
+            transform_info,
+        ) = result
+        self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
 
     def test_pipeline_with_constant_values(self):
         """Test pipeline behavior with constant values in features."""
@@ -523,33 +518,29 @@ class TestDataPipelineEdgeCases:
             }
         )
 
-        try:
-            result = prepare_weather_data(
-                constant_data,
-                config.input,
-                config.transformation,
-                config.features,
-                config.scaling,
-                config.sequences,
-            )
+        result = prepare_weather_data(
+            constant_data,
+            config.input,
+            config.transformation,
+            config.features,
+            config.scaling,
+            config.sequences,
+        )
 
-            (
-                X_train,
-                X_val,
-                X_test,
-                y_train,
-                y_val,
-                y_test,
-                scalers,
-                feature_cols,
-                transform_info,
-            ) = result
-            self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
+        (
+            X_train,
+            X_val,
+            X_test,
+            y_train,
+            y_val,
+            y_test,
+            scalers,
+            feature_cols,
+            transform_info,
+        ) = result
+        self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
 
-            print("Constant values test passed!")
-
-        except Exception as e:
-            pytest.skip(f"Pipeline failed with constant values: {e}")
+        print("Constant values test passed!")
 
     def test_pipeline_with_extreme_values(self):
         """Test pipeline behavior with extreme values."""
@@ -579,41 +570,37 @@ class TestDataPipelineEdgeCases:
             }
         )
 
-        try:
-            result = prepare_weather_data(
-                extreme_data,
-                config.input,
-                config.transformation,
-                config.features,
-                config.scaling,
-                config.sequences,
-            )
+        result = prepare_weather_data(
+            extreme_data,
+            config.input,
+            config.transformation,
+            config.features,
+            config.scaling,
+            config.sequences,
+        )
 
-            (
-                X_train,
-                X_val,
-                X_test,
-                y_train,
-                y_val,
-                y_test,
-                scalers,
-                feature_cols,
-                transform_info,
-            ) = result
-            self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
+        (
+            X_train,
+            X_val,
+            X_test,
+            y_train,
+            y_val,
+            y_test,
+            scalers,
+            feature_cols,
+            transform_info,
+        ) = result
+        self._assert_basic_validity(X_train, X_val, X_test, y_train, y_val, y_test)
 
-            # Check that extreme values are handled (scaled to reasonable ranges)
-            if X_train.size > 0:
-                X_flat = X_train.reshape(-1, X_train.shape[-1])
-                max_abs_value = np.max(np.abs(X_flat))
-                assert (
-                    max_abs_value < 1000
-                ), f"Extreme values not properly scaled: max={max_abs_value}"
+        # Check that extreme values are handled (scaled to reasonable ranges)
+        if X_train.size > 0:
+            X_flat = X_train.reshape(-1, X_train.shape[-1])
+            max_abs_value = np.max(np.abs(X_flat))
+            assert (
+                max_abs_value < 1000
+            ), f"Extreme values not properly scaled: max={max_abs_value}"
 
-            print("Extreme values test passed!")
-
-        except Exception as e:
-            pytest.skip(f"Pipeline failed with extreme values: {e}")
+        print("Extreme values test passed!")
 
     def _assert_basic_validity(self, X_train, X_val, X_test, y_train, y_val, y_test):
         """Basic validity checks for pipeline outputs."""
