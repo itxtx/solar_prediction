@@ -6,24 +6,23 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 
 from .config import get_config
 from .preprocessing import prepare_dataset
-from .evaluation import evaluate_forecaster, regression_metrics as _metrics
-from .checkpointing import load_forecaster, save_checkpoint
+from .evaluation import baseline_predictions, evaluate_forecaster, regression_metrics as _metrics
+from .recurrent_forecaster import training_config_from_config
+from .checkpointing import load_forecaster, save_forecaster
 from .gru import (
     WeatherGRU,
     create_gru_model_hyperparameters_from_config,
-    create_gru_training_config_from_config,
 )
 from .lstm import (
     WeatherLSTM,
     create_model_hyperparameters_from_config,
-    create_training_config_from_config,
 )
 
 DEFAULT_SAMPLE_DATA = Path("data/sample/SolarPrediction_sample.csv")
@@ -42,15 +41,9 @@ def _load_dataframe(data_path: Path) -> pd.DataFrame:
     return pd.read_csv(data_path)
 
 
-def _copy_sequence_config_with_horizon(sequence_cfg: Any, horizon_steps: int):
-    if hasattr(sequence_cfg, "model_copy"):
-        return sequence_cfg.model_copy(update={"horizon_steps": horizon_steps})
-    return sequence_cfg.copy(update={"horizon_steps": horizon_steps})
-
-
 def _prepare(data_path: Path, horizon_steps: int = 1):
     config = get_config()
-    sequence_cfg = _copy_sequence_config_with_horizon(config.sequences, horizon_steps)
+    sequence_cfg = config.sequences.model_copy(update={"horizon_steps": horizon_steps})
     return prepare_dataset(
         _load_dataframe(data_path),
         config.input,
@@ -64,44 +57,28 @@ def _prepare(data_path: Path, horizon_steps: int = 1):
 def _model_and_configs(
     model_name: str, input_dim: int, epochs: int, hidden_dim: int, batch_size: int
 ):
-    if model_name == "lstm":
-        params = create_model_hyperparameters_from_config(
-            input_dim=input_dim,
-            config_override={"hidden_dim": hidden_dim, "num_layers": 1, "dropout_prob": 0.1},
-        )
-        train_cfg = create_training_config_from_config(
-            config_override={
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "learning_rate": 0.001,
-                "patience": max(epochs + 1, 3),
-                "scheduler_type": "cosine",
-            }
-        )
-        return WeatherLSTM(params), train_cfg
-
+    factories = {
+        "lstm": (WeatherLSTM, create_model_hyperparameters_from_config),
+        "gru": (WeatherGRU, create_gru_model_hyperparameters_from_config),
+    }
+    if model_name not in factories:
+        raise ValueError(f"Unsupported model: {model_name}")
+    model_class, params_factory = factories[model_name]
+    architecture = {"hidden_dim": hidden_dim, "num_layers": 1, "dropout_prob": 0.1}
     if model_name == "gru":
-        params = create_gru_model_hyperparameters_from_config(
-            input_dim=input_dim,
-            config_override={
-                "hidden_dim": hidden_dim,
-                "num_layers": 1,
-                "dropout_prob": 0.1,
-                "bidirectional": False,
-            },
-        )
-        train_cfg = create_gru_training_config_from_config(
-            config_override={
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "learning_rate": 0.001,
-                "patience": max(epochs + 1, 3),
-                "scheduler_type": "cosine",
-            }
-        )
-        return WeatherGRU(params), train_cfg
-
-    raise ValueError(f"Unsupported model: {model_name}")
+        architecture["bidirectional"] = False
+    model = model_class(params_factory(input_dim=input_dim, config_override=architecture))
+    training = training_config_from_config(
+        model_name,
+        {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": 0.001,
+            "patience": max(epochs + 1, 3),
+            "scheduler_type": "cosine",
+        },
+    )
+    return model, training
 
 
 def _load_model(model_name: str, checkpoint: Path, device: str):
@@ -110,50 +87,6 @@ def _load_model(model_name: str, checkpoint: Path, device: str):
     if not isinstance(model, expected):
         raise ValueError(f"Checkpoint model does not match --model {model_name}.")
     return model, preprocessor
-
-
-def _raw_target_series(data_path: Path) -> np.ndarray:
-    df = _load_dataframe(data_path).copy()
-    target_col = "GHI" if "GHI" in df.columns else "Radiation"
-
-    if "UNIXTime" in df.columns:
-        df = df.sort_values("UNIXTime")
-    elif "Time" in df.columns:
-        parsed_time = pd.to_datetime(df["Time"], errors="coerce")
-        if parsed_time.notna().any():
-            df = df.assign(_parsed_time=parsed_time).sort_values("_parsed_time")
-
-    return df[target_col].ffill().bfill().to_numpy(dtype=float)
-
-
-def _baseline_predictions(
-    data_path: Path,
-    transform_info: Dict[str, Any],
-    seasonal_lag: int,
-) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-    target = _raw_target_series(data_path)
-    split = transform_info["split_metadata"]
-    window = split["window_size"]
-    horizon_steps = split.get("horizon_steps", 1)
-    test_start, test_end = split["test_sequence_range"]
-    sequence_indices = np.arange(test_start, test_end)
-    target_indices = window + horizon_steps - 1 + sequence_indices
-
-    actual = target[target_indices]
-    persistence = target[np.maximum(target_indices - horizon_steps, 0)]
-    if seasonal_lag < 1:
-        raise ValueError("seasonal_lag must be >= 1")
-    # Use the latest seasonal cycle observable at the forecast origin.
-    cycles_back = (horizon_steps + seasonal_lag - 1) // seasonal_lag
-    seasonal_indices = target_indices - cycles_back * seasonal_lag
-    seasonal = persistence.copy()
-    available = seasonal_indices >= 0
-    seasonal[available] = target[seasonal_indices[available]]
-
-    return actual, {
-        "persistence": persistence,
-        "seasonal_naive": seasonal,
-    }
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -189,14 +122,12 @@ def _evaluate_model(model, split, preprocessor, device, batch_size):
 
 
 def _save_model(model, checkpoint, train_cfg, metrics, preprocessor, metrics_scope="test"):
-    save_checkpoint(
+    save_forecaster(
         model,
+        preprocessor,
         str(checkpoint),
-        model.params,
-        train_cfg,
-        model.history,
-        metrics,
-        preprocessor=preprocessor,
+        training_config=train_cfg,
+        metrics=metrics,
         metrics_scope=metrics_scope,
     )
 
@@ -264,7 +195,13 @@ def command_compare(args: argparse.Namespace) -> None:
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    actual, baselines = _baseline_predictions(Path(args.data), transform_info, args.seasonal_lag)
+    observations = data.preprocessor.observed_targets(_load_dataframe(Path(args.data)))
+    actual, baselines = baseline_predictions(
+        observations,
+        data.test.target_indices,
+        horizon_steps=args.horizon_steps,
+        seasonal_lag=args.seasonal_lag,
+    )
     metrics_by_model = {name: _metrics(actual, pred) for name, pred in baselines.items()}
 
     for model_name in ("lstm", "gru"):

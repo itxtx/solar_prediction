@@ -1,8 +1,14 @@
+import json
+from io import StringIO
+from pathlib import Path
+import subprocess
+import sys
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from solar_prediction.cli import _baseline_predictions
+from solar_prediction.evaluation import baseline_predictions
 from solar_prediction.cli import main
 
 
@@ -68,20 +74,13 @@ def test_cli_compare_smoke(tmp_path, capsys):
         (4, 9, [4, 0, 1]),
     ],
 )
-def test_baseline_predictions_use_forecast_horizon(tmp_path, horizon, lag, expected):
-    data_path = tmp_path / "sample.csv"
-    pd.DataFrame(
-        {"Time": pd.date_range("2023-01-01", periods=12, freq="h"), "GHI": range(12)}
-    ).to_csv(data_path, index=False)
-    transform_info = {
-        "split_metadata": {
-            "window_size": 3,
-            "horizon_steps": horizon,
-            "test_sequence_range": (2, 5),
-        }
-    }
-
-    actual, baselines = _baseline_predictions(data_path, transform_info, seasonal_lag=lag)
+def test_baseline_predictions_use_forecast_horizon(horizon, lag, expected):
+    actual, baselines = baseline_predictions(
+        np.arange(12),
+        np.arange(4, 7) + horizon,
+        horizon_steps=horizon,
+        seasonal_lag=lag,
+    )
 
     np.testing.assert_array_equal(actual, np.arange(4, 7) + horizon)
     np.testing.assert_array_equal(baselines["persistence"], np.array([4.0, 5.0, 6.0]))
@@ -139,10 +138,3 @@ def test_tuning_notebook_evaluates_only_validation_winners(tmp_path, monkeypatch
     final = pd.read_csv(tmp_path / "gru_tuning_final_test_metrics.csv")
     assert final.test_rmse.tolist() == [20.0, 20.0]
     assert final.val_rmse.tolist() == [3.0, 5.0]
-
-
-import json
-from io import StringIO
-from pathlib import Path
-import subprocess
-import sys

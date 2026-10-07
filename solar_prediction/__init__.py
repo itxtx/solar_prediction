@@ -1,12 +1,5 @@
 """Solar Prediction Package - Optimized Data Pipeline."""
 
-import logging
-
-# Jupyter/Optuna worker threads can outlive the kernel stream they inherited.
-# Suppress logging's own handler tracebacks in that case; model exceptions still
-# propagate normally.
-logging.raiseExceptions = False
-
 # Import key components for easy access
 from .benchmark import (
     benchmark,

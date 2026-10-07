@@ -115,6 +115,11 @@ class WeatherPreprocessor:
         self._fit_frame(frame, target, indices, indices)
         return self
 
+    def observed_targets(self, data: pd.DataFrame) -> np.ndarray:
+        """Return raw labels in exactly the normalized row order used by sequences."""
+        frame, target = self._normalize(data)
+        return frame[target].to_numpy(dtype=float)
+
     def _fit_frame(self, frame, target, feature_indices, target_indices):
         self.target_column = target
         frame, self.transformed_target, self.structural_transforms = _apply_target_transformations(
@@ -208,34 +213,13 @@ class WeatherPreprocessor:
     def inverse_target(self, values: np.ndarray) -> np.ndarray:
         """Decode scaled predictions, preserving their shape."""
         self._require_fitted()
-        values = np.asarray(values)
-        result = self.scalers[self.scaled_target].inverse_transform(values.reshape(-1, 1)).ravel()
-        for transform in reversed(self.structural_transforms):
-            if transform["type"] == "log":
-                limit = self.domain_cfg.max_exp_input
-                result = np.exp(np.clip(result, -limit, limit)) - transform["offset"]
-            elif transform["type"] == "yeo-johnson":
-                result = (
-                    transform["power_transformer_object"].inverse_transform(result[:, None]).ravel()
-                )
-            elif transform["type"] == "piecewise":
-                params = transform["params"]
-                night, moderate = params["night_thresh"], params["moderate_thresh"]
-                night_end = np.log1p(night - 1e-6)
-                moderate_end = night_end + params["moderate_slope"] * (moderate - night - 1e-6)
-                decoded = np.empty_like(result)
-                low = result <= night_end
-                mid = (result > night_end) & (result <= moderate_end)
-                high = result > moderate_end
-                decoded[low] = np.expm1(result[low])
-                decoded[mid] = night + (result[mid] - night_end) / params["moderate_slope"]
-                decoded[high] = moderate + (result[high] - moderate_end) / params["high_slope"]
-                result = decoded
-        if self.target_column == STD_RADIATION_COL:
-            result = np.clip(
-                result, self.domain_cfg.min_radiation_clip, self.domain_cfg.max_radiation_clip
-            )
-        return result.reshape(values.shape)
+        return decode_target(
+            values,
+            self.scalers[self.scaled_target],
+            self.structural_transforms,
+            target_column=self.target_column,
+            domain_cfg=self.domain_cfg,
+        )
 
     def sequences(self, data: pd.DataFrame, *, history: pd.DataFrame | None = None) -> SequenceData:
         """Build windows with saved window/horizon settings.
@@ -316,3 +300,91 @@ def prepare_dataset(data, input_cfg, transform_cfg, feature_cfg, scaling_cfg, se
         metadata["target_fit_indices"],
     )
     return preprocessor.split_sequences(data)
+
+
+def decode_target(
+    values, target_scaler, structural_transforms, *, target_column="", domain_cfg=None
+):
+    """Shared shape-preserving inverse used by fitted and legacy preprocessing."""
+    domain_cfg = domain_cfg or get_config().data
+    values = np.asarray(values)
+    result = (
+        target_scaler.inverse_transform(values.reshape(-1, 1)).ravel()
+        if target_scaler is not None
+        else values.astype(float).ravel()
+    )
+    for transform in reversed(structural_transforms):
+        if transform["type"] == "log":
+            limit = domain_cfg.max_exp_input
+            result = np.exp(np.clip(result, -limit, limit)) - transform["offset"]
+        elif transform["type"] == "yeo-johnson":
+            result = (
+                transform["power_transformer_object"].inverse_transform(result[:, None]).ravel()
+            )
+        elif transform["type"] == "piecewise":
+            params = transform["params"]
+            night, moderate = params["night_thresh"], params["moderate_thresh"]
+            night_end = np.log1p(night - 1e-6)
+            moderate_end = night_end + params["moderate_slope"] * (moderate - night - 1e-6)
+            decoded = np.empty_like(result)
+            low = result <= night_end
+            mid = (result > night_end) & (result <= moderate_end)
+            high = result > moderate_end
+            decoded[low] = np.expm1(result[low])
+            decoded[mid] = night + (result[mid] - night_end) / params["moderate_slope"]
+            decoded[high] = moderate + (result[high] - moderate_end) / params["high_slope"]
+            result = decoded
+    if target_column == STD_RADIATION_COL:
+        result = np.clip(result, domain_cfg.min_radiation_clip, domain_cfg.max_radiation_clip)
+    return result.reshape(values.shape)
+
+
+def decode_legacy_target(values, target_scaler, transform_info, scalers_dict=None):
+    """Adapt old scaler/transform dictionaries to the fitted decoder's contract."""
+    from sklearn.preprocessing import PowerTransformer
+
+    info = transform_info or {}
+    transforms = []
+    for original in info.get("structural_transforms", info.get("transforms", [])):
+        if not original.get("applied", True):
+            continue
+        transform = dict(original)
+        kind = transform["type"]
+        if kind == "log":
+            transform.setdefault("offset", 0)
+        elif kind == "piecewise":
+            cfg = get_config().transformation
+            defaults = {
+                "night_thresh": cfg.piecewise_night_threshold,
+                "moderate_thresh": cfg.piecewise_moderate_threshold,
+                "moderate_slope": cfg.piecewise_moderate_slope,
+                "high_slope": cfg.piecewise_high_slope,
+            }
+            transform["params"] = defaults | transform.get("params", {})
+        elif kind == "yeo-johnson":
+            transformer = transform.get("power_transformer_object")
+            if transformer is None:
+                transformer = (scalers_dict or {}).get("power_transformer_object_for_target")
+            if transformer is None:
+                if transform.get("lambda") is None:
+                    raise ValueError("Missing fitted Yeo-Johnson transformer or lambda")
+                transformer = PowerTransformer(method="yeo-johnson", standardize=False)
+                transformer.lambdas_ = np.array([transform["lambda"]])
+            transform["power_transformer_object"] = transformer
+        else:
+            raise ValueError(f"Unknown target transform: {kind}")
+        transforms.append(transform)
+    values = np.asarray(values)
+    if target_scaler is not None and getattr(target_scaler, "n_features_in_", 1) > 1:
+        name = info.get("target_col_transformed_final", info.get("target_col_original"))
+        names = list(getattr(target_scaler, "feature_names_in_", []))
+        if name not in names:
+            raise ValueError("A multi-feature scaler requires a named target column")
+        index = names.index(name)
+        full = np.zeros((values.size, target_scaler.n_features_in_))
+        full[:, index] = values.ravel()
+        values = target_scaler.inverse_transform(full)[:, index].reshape(values.shape)
+        target_scaler = None
+    return decode_target(
+        values, target_scaler, transforms, target_column=info.get("target_col_standardized", "")
+    )

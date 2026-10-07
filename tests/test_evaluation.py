@@ -4,7 +4,11 @@ import pytest
 
 from solar_prediction.cli import _model_and_configs
 from solar_prediction.config import SequenceConfig, get_config
-from solar_prediction.evaluation import evaluate_forecaster, regression_metrics
+from solar_prediction.evaluation import (
+    baseline_predictions,
+    evaluate_forecaster,
+    regression_metrics,
+)
 from solar_prediction.preprocessing import prepare_dataset
 
 
@@ -84,3 +88,28 @@ def test_evaluation_bounds_batches_and_propagates_decode_errors(prepared, monkey
     monkeypatch.setattr(pp, "inverse_target", fail_decode)
     with pytest.raises(ValueError, match="invalid transform"):
         evaluate_forecaster(Model(), prepared.test, pp, batch_size=2, return_predictions=False)
+
+
+def test_baselines_and_sequences_use_the_same_normalized_order():
+    cfg = get_config()
+    raw = pd.DataFrame(
+        {
+            "Timestamp": pd.date_range("2023-01-01", periods=40, freq="h"),
+            "Radiation": np.arange(40, dtype=float),
+        }
+    ).iloc[::-1]
+    data = prepare_dataset(
+        raw,
+        cfg.input,
+        cfg.transformation,
+        cfg.features,
+        cfg.scaling,
+        SequenceConfig(window_size=3, horizon_steps=4),
+    )
+    observations = data.preprocessor.observed_targets(raw)
+    actuals, predictions = baseline_predictions(
+        observations, data.test.target_indices, horizon_steps=4, seasonal_lag=3
+    )
+    np.testing.assert_array_equal(actuals, data.test.actuals.ravel())
+    np.testing.assert_array_equal(predictions["persistence"], data.test.target_indices - 4)
+    np.testing.assert_array_equal(predictions["seasonal_naive"], data.test.target_indices - 6)

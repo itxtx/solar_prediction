@@ -1,301 +1,133 @@
-def create_evaluation_dashboard(
-    predictions,
-    actuals,
-    scalers,
-    target_col,
-    timestamps,
-    figsize=None,
-    resample_freq=None,
-    outlier_threshold=None,
-    mape_epsilon=None,
-):
-    """
-    Create a comprehensive evaluation dashboard for time series predictions
+"""Figures from history or evaluated results. Callers own display and saving."""
 
-    Args:
-        predictions: Model predictions (numpy array)
-        actuals: Actual values (numpy array)
-        scalers: Dictionary of scalers used to normalize each feature (optional)
-        target_col: Name of the target column for inverse scaling (optional)
-        timestamps: Array of timestamps for x-axis if available (optional)
-        figsize: Size of the figure (width, height). If None, uses config default.
-        resample_freq: Frequency for resampling time series data. If None, uses config default.
-        outlier_threshold: Threshold for outlier detection. If None, uses config default.
-        mape_epsilon: Epsilon for MAPE calculation. If None, uses config default.
+from collections.abc import Mapping
 
-    Returns:
-        matplotlib.figure.Figure: The dashboard figure
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-    from datetime import datetime
+import matplotlib.pyplot as plt
+import numpy as np
 
-    # Import centralized configuration
-    from .config import get_config
+from .evaluation import EvaluationResult, UncertaintyResult, resample_evaluation
 
-    # Use centralized configuration for defaults
-    config = get_config()
-    plot_config = config.plotting
-    eval_config = config.evaluation
 
-    # Apply defaults from config if not provided
-    if figsize is None:
-        figsize = (plot_config.dashboard_width, plot_config.dashboard_height)
-    if resample_freq is None:
-        resample_freq = plot_config.resample_frequency
-    if outlier_threshold is None:
-        outlier_threshold = eval_config.outlier_std_threshold
-    if mape_epsilon is None:
-        mape_epsilon = eval_config.mape_epsilon
-
-    # Ensure predictions and actuals are flattened
-    predictions = predictions.flatten()
-    actuals = actuals.flatten()
-
-    # If scalers and target_col are provided, inverse transform the data
-    if scalers is not None and target_col is not None:
-        if target_col in scalers:
-            predictions = (
-                scalers[target_col].inverse_transform(predictions.reshape(-1, 1)).flatten()
-            )
-            actuals = scalers[target_col].inverse_transform(actuals.reshape(-1, 1)).flatten()
-
-    # Calculate metrics
-    errors = actuals - predictions
-    rmse = np.sqrt(mean_squared_error(actuals, predictions))
-    mae = mean_absolute_error(actuals, predictions)
-    # Handle potential division by zero in MAPE calculation using config epsilon
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mape_errors = np.abs(errors / np.maximum(np.abs(actuals), mape_epsilon)) * 100
-        # Apply MAPE clipping if configured
-        if eval_config.mape_clip_value > 0:
-            mape_errors = np.clip(mape_errors, 0, eval_config.mape_clip_value * 100)
-        mape = np.mean(mape_errors)
-        mape = np.nan_to_num(mape)  # Replace NaN with 0
-    r2 = r2_score(actuals, predictions)
-
-    # Before plotting, make sure data is sorted by timestamp
-    sorted_indices = np.argsort(timestamps)
-    sorted_timestamps = timestamps[sorted_indices]
-    sorted_actuals = actuals[sorted_indices]
-    sorted_predictions = predictions[sorted_indices]
-
-    # Create pandas DataFrame for easier handling of time series
-    # Check if timestamps are Unix timestamps (numeric) and convert if necessary
-    if np.issubdtype(sorted_timestamps.dtype, np.number):
-        # Convert Unix timestamps to datetime objects
-        dt_timestamps = pd.to_datetime(sorted_timestamps, unit="s")
-    else:
-        # Assuming timestamps are already in datetime format or string format that pandas can parse
-        dt_timestamps = pd.to_datetime(sorted_timestamps)
-
-    data_df = pd.DataFrame(
-        {"timestamp": dt_timestamps, "actual": sorted_actuals, "predicted": sorted_predictions}
-    )
-
-    # Set timestamp as index
-    data_df.set_index("timestamp", inplace=True)
-
-    # Check for and remove duplicates in the index
-    if data_df.index.duplicated().any():
-        print(
-            f"Warning: Found {data_df.index.duplicated().sum()} duplicate timestamps. Keeping the first occurrence."
-        )
-        data_df = data_df[~data_df.index.duplicated(keep="first")]
-
-    # Resample if requested
-    if resample_freq is not None:
-        print(f"Resampling data to {resample_freq} frequency...")
-
-        # For resampling, we'll use mean for aggregation
-        resampled_df = data_df.resample(resample_freq).mean()
-
-        # Drop NaN values that may be introduced by resampling
-        resampled_df.dropna(inplace=True)
-
-        print(f"Original data points: {len(data_df)}, After resampling: {len(resampled_df)}")
-
-        # Update our data
-        data_df = resampled_df
-
-    # Extract resampled values
-    plot_timestamps = data_df.index
-    plot_actuals = data_df["actual"].values
-    plot_predictions = data_df["predicted"].values
-
-    # Create a figure with subplots
-    fig = plt.figure(figsize=figsize)
-    gs = fig.add_gridspec(3, 2)
-
-    # 1. Actual vs Predicted Line Plot
-    ax1 = fig.add_subplot(gs[0, :])
-    ax1.scatter(plot_timestamps, plot_actuals, label="Actual")
-    ax1.scatter(plot_timestamps, plot_predictions, label="Predicted")
-    ax1.set_title("Actual vs Predicted Values", fontsize=14, fontweight="bold")
-    ax1.set_xlabel("Time", fontsize=12)
-    ax1.set_ylabel(f"Value ({target_col})" if target_col else "Value", fontsize=12)
-    ax1.legend(fontsize=12)
-    ax1.grid(True, alpha=0.3)
-
-    # Format date axis if we have dates
-    plt.setp(ax1.get_xticklabels(), rotation=45, ha="right")
-    fig.autofmt_xdate()
-
-    # Shade the error area between actual and predicted
-    # ax1.fill_between(plot_timestamps, plot_actuals, plot_predictions, color='gray', alpha=0.2, label='Error')
-
-    # 2. Scatter Plot with Regression Line
-    ax2 = fig.add_subplot(gs[1, 0])
-    scatter = ax2.scatter(plot_actuals, plot_predictions, alpha=0.6, edgecolor="k", s=50)
-
-    # Add perfect prediction line
-    min_val = min(np.min(plot_actuals), np.min(plot_predictions))
-    max_val = max(np.max(plot_actuals), np.max(plot_predictions))
-    # Add some margin
-    range_val = max_val - min_val
-    min_val -= range_val * 0.05
-    max_val += range_val * 0.05
-
-    ax2.plot([min_val, max_val], [min_val, max_val], "r--", label="Perfect Prediction")
-
-    # Add regression line
-    from scipy import stats
-
-    slope, intercept, r_value, p_value, std_err = stats.linregress(plot_actuals, plot_predictions)
-    regression_line = slope * np.array([min_val, max_val]) + intercept
-    ax2.plot(
-        [min_val, max_val], regression_line, "g-", label=f"Regression Line (slope={slope:.3f})"
-    )
-
-    ax2.set_title("Actual vs Predicted Scatter", fontsize=14, fontweight="bold")
-    ax2.set_xlabel("Actual", fontsize=12)
-    ax2.set_ylabel("Predicted", fontsize=12)
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(fontsize=10)
-
-    # Add correlation coefficient
-    correlation = np.corrcoef(plot_actuals, plot_predictions)[0, 1]
-    ax2.text(
-        0.05,
-        0.95,
-        f"Correlation: {correlation:.4f}\nR²: {r2:.4f}",
-        transform=ax2.transAxes,
-        fontsize=10,
-        verticalalignment="top",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    )
-
-    # 3. Error Histogram
-    ax3 = fig.add_subplot(gs[1, 1])
-    errors_resampled = plot_actuals - plot_predictions
-    n, bins, patches = ax3.hist(
-        errors_resampled, bins=30, alpha=0.7, color="skyblue", edgecolor="black"
-    )
-    ax3.axvline(x=0, color="r", linestyle="--", linewidth=2)
-
-    # Add normal distribution curve
-    from scipy.stats import norm
-
-    mu, std = norm.fit(errors_resampled)
-    xmin, xmax = ax3.get_xlim()
-    x = np.linspace(xmin, xmax, 100)
-    p = norm.pdf(x, mu, std) * len(errors_resampled) * (xmax - xmin) / 30
-    ax3.plot(x, p, "k--", linewidth=2, label=f"Normal Dist. (μ={mu:.2f}, σ={std:.2f})")
-
-    ax3.set_title("Error Distribution", fontsize=14, fontweight="bold")
-    ax3.set_xlabel("Error", fontsize=12)
-    ax3.set_ylabel("Frequency", fontsize=12)
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(fontsize=10)
-
-    # 4. Residual Plot
-    ax4 = fig.add_subplot(gs[2, 0])
-
-    # Calculate z-scores for coloring
-    from scipy import stats
-
-    z_scores = np.abs(stats.zscore(errors_resampled))
-
-    # Create a colormap
-    cm = plt.cm.RdYlGn_r
-    scatter = ax4.scatter(
-        plot_predictions, errors_resampled, c=z_scores, cmap=cm, alpha=0.7, edgecolor="k", s=50
-    )
-
-    # Add colorbar
-    cbar = plt.colorbar(scatter, ax=ax4)
-    cbar.set_label("|Z-score| of Error", fontsize=10)
-
-    # Highlight outliers
-    outliers = z_scores > outlier_threshold
-    if np.any(outliers):
-        ax4.scatter(
-            plot_predictions[outliers],
-            errors_resampled[outliers],
-            s=80,
-            facecolors="none",
-            edgecolors="red",
-            label=f"Outliers (|Z| > {outlier_threshold})",
-        )
-
-    ax4.axhline(y=0, color="r", linestyle="--", linewidth=2)
-    ax4.set_title("Residual Plot", fontsize=14, fontweight="bold")
-    ax4.set_xlabel("Predicted", fontsize=12)
-    ax4.set_ylabel("Residual (Actual - Predicted)", fontsize=12)
-    ax4.grid(True, alpha=0.3)
-    if np.any(outliers):
-        ax4.legend(fontsize=10)
-
-    # 5. Metrics Table with more detailed statistics
-    ax5 = fig.add_subplot(gs[2, 1])
-    ax5.axis("off")
-
-    # Calculate additional metrics
-    mse = mean_squared_error(plot_actuals, plot_predictions)
-    rmse = np.sqrt(mse)
-    rmse_normalized = rmse / (np.max(plot_actuals) - np.min(plot_actuals))
-
-    # Calculate additional percentile-based metrics
-    q_errors = np.percentile(np.abs(errors_resampled), [25, 50, 75, 90, 95, 99])
-
-    metrics_text = (
-        f"Model Evaluation Metrics:\n\n"
-        f"Root Mean Squared Error (RMSE): {rmse:.4f}\n"
-        f"Normalized RMSE: {rmse_normalized:.4f}\n"
-        f"Mean Squared Error (MSE): {mse:.4f}\n"
-        f"Mean Absolute Error (MAE): {mae:.4f}\n"
-        f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%\n"
-        f"R-squared (R²): {r2:.4f}\n"
-        f"Correlation Coefficient: {correlation:.4f}\n\n"
-        f"Error Percentiles:\n"
-        f"25th: {q_errors[0]:.4f}\n"
-        f"50th (Median): {q_errors[1]:.4f}\n"
-        f"75th: {q_errors[2]:.4f}\n"
-        f"90th: {q_errors[3]:.4f}\n"
-        f"95th: {q_errors[4]:.4f}\n"
-        f"99th: {q_errors[5]:.4f}\n"
-    )
-    ax5.text(0.1, 0.5, metrics_text, fontsize=12, va="center")
-
-    # Add title with target variable info
-    if target_col:
-        plt.suptitle(
-            f"Prediction Evaluation for {target_col}", fontsize=16, fontweight="bold", y=0.98
-        )
-    else:
-        plt.suptitle("Time Series Prediction Evaluation", fontsize=16, fontweight="bold", y=0.98)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust for the suptitle
-
-    # Print summary statistics
-    print(f"Evaluation Summary:")
-    print(f"Number of samples (after resampling): {len(plot_actuals)}")
-    print(f"RMSE: {rmse:.6f}")
-    print(f"MAE: {mae:.6f}")
-    print(f"MAPE: {mape:.2f}%")
-    print(f"R²: {r2:.6f}")
-    print(f"Correlation: {correlation:.6f}")
-
+def plot_training_history(history: Mapping, *, figsize=(14, 10), log_scale_loss=False):
+    epochs = history.get("epochs", [])
+    if not len(epochs):
+        raise ValueError("Training history is empty")
+    fig, axes = plt.subplots(3, 2, figsize=figsize)
+    panels = [
+        ("Loss", ("train_loss", "val_loss")),
+        ("RMSE (model units)", ("val_rmse",)),
+        ("R²", ("val_r2",)),
+        ("Capped MAPE (%)", ("val_mape",)),
+        ("MAE (model units)", ("val_mae",)),
+        ("Learning rate", ("lr",)),
+    ]
+    for ax, (title, keys) in zip(axes.flat, panels):
+        for key in keys:
+            values = history.get(key, [])
+            if len(values):
+                if len(values) != len(epochs):
+                    plt.close(fig)
+                    raise ValueError(f"History length for {key} does not match epochs")
+                ax.plot(epochs, values, label=key.replace("_", " "))
+        if title == "Loss" and log_scale_loss:
+            ax.set_yscale("symlog", linthresh=1e-8)
+        ax.set(title=title, xlabel="Epoch")
+        ax.grid(alpha=0.2)
+        if ax.lines:
+            ax.legend()
+    fig.tight_layout()
     return fig
+
+
+def _retained_arrays(result):
+    if result.actuals is None or result.predictions is None:
+        raise ValueError("Plotting requires an evaluation with retained arrays")
+    actuals, predictions = np.asarray(result.actuals), np.asarray(result.predictions)
+    if actuals.ndim != 2 or actuals.shape != predictions.shape or 0 in actuals.shape:
+        raise ValueError("Plot arrays must have matching nonempty (rows, outputs) shapes")
+    if not np.isfinite(actuals).all() or not np.isfinite(predictions).all():
+        raise ValueError("Plot arrays must be finite")
+    return actuals, predictions
+
+
+def plot_evaluation(
+    result: EvaluationResult, *, timestamps=None, output=0, figsize=(14, 10), resample_freq=None
+):
+    actuals, predictions = _retained_arrays(result)
+    aggregation = ""
+    if resample_freq is not None:
+        if timestamps is None:
+            raise ValueError("Resampling requires timestamps")
+        result, timestamps = resample_evaluation(result, timestamps, resample_freq)
+        actuals, predictions = _retained_arrays(result)
+        aggregation = f"; {resample_freq} means"
+    if not 0 <= output < actuals.shape[1]:
+        raise ValueError("Output index is out of range")
+    x = np.asarray(result.target_indices if timestamps is None else timestamps)
+    if x.shape != (len(actuals),):
+        raise ValueError("Timestamps must match evaluation rows")
+    order = np.argsort(x)
+    actual, predicted = actuals[order, output], predictions[order, output]
+    x = x[order]
+    errors = actual - predicted
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    axes[0, 0].plot(x, actual, label="Actual")
+    axes[0, 0].plot(x, predicted, label="Predicted")
+    axes[0, 0].set_title(f"{result.target_name or 'Target'} — {result.units} units{aggregation}")
+    axes[0, 0].legend()
+    axes[0, 1].scatter(actual, predicted, alpha=0.6)
+    low, high = min(actual.min(), predicted.min()), max(actual.max(), predicted.max())
+    margin = max((high - low) * 0.05, 1e-6)
+    axes[0, 1].plot([low - margin, high + margin], [low - margin, high + margin], "k--")
+    axes[0, 1].set(xlabel="Actual", ylabel="Predicted")
+    axes[1, 0].hist(errors, bins=min(30, len(errors)))
+    axes[1, 0].set(xlabel="Actual minus predicted", ylabel="Count")
+    axes[1, 1].axis("off")
+    text = "Metrics (uniform average over outputs)" if actuals.shape[1] > 1 else "Metrics"
+    text += (
+        aggregation
+        + "\n\n"
+        + "\n".join(f"{key}: {value:.4f}" for key, value in result.metrics.items())
+    )
+    axes[1, 1].text(0.05, 0.5, text, va="center")
+    fig.tight_layout()
+    return fig
+
+
+def plot_uncertainty(
+    result: UncertaintyResult, *, actuals=None, timestamps=None, output=0, figsize=(12, 5)
+):
+    if result.mean.ndim != 2 or not len(result.mean) or not 0 <= output < result.mean.shape[1]:
+        raise ValueError("Uncertainty result must have nonempty (rows, outputs) arrays")
+    for array in (result.mean, result.std, result.lower_ci, result.upper_ci):
+        if array.shape != result.mean.shape or not np.isfinite(array).all():
+            raise ValueError("Uncertainty arrays must have matching finite shapes")
+    x = np.arange(len(result.mean)) if timestamps is None else np.asarray(timestamps)
+    if x.shape != (len(result.mean),):
+        raise ValueError("Timestamps must match prediction rows")
+    if actuals is not None:
+        actuals = np.asarray(actuals)
+        if actuals.ndim == 1:
+            actuals = actuals[:, None]
+        if actuals.shape != result.mean.shape:
+            raise ValueError("Actuals must match uncertainty result shape")
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(x, result.mean[:, output], label="Mean")
+    ax.fill_between(
+        x, result.lower_ci[:, output], result.upper_ci[:, output], alpha=0.25, label="Interval"
+    )
+    if actuals is not None:
+        ax.plot(x, actuals[:, output], label="Actual")
+    ax.set(xlabel="Observation", ylabel=f"Target ({result.units} units)")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def create_evaluation_dashboard(
+    result: EvaluationResult, *, timestamps=None, figsize=(14, 10), resample_freq=None
+):
+    """Dashboard entrypoint; pass a decoded EvaluationResult instead of scalers/raw arrays."""
+    return plot_evaluation(
+        result, timestamps=timestamps, figsize=figsize, resample_freq=resample_freq
+    )
