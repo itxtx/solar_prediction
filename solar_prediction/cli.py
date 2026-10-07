@@ -13,6 +13,7 @@ import pandas as pd
 
 from .config import get_config
 from .preprocessing import prepare_dataset
+from .evaluation import evaluate_forecaster, regression_metrics as _metrics
 from .checkpointing import load_forecaster, save_checkpoint
 from .gru import (
     WeatherGRU,
@@ -111,24 +112,6 @@ def _load_model(model_name: str, checkpoint: Path, device: str):
     return model, preprocessor
 
 
-def _metrics(actual: np.ndarray, predicted: np.ndarray) -> Dict[str, float]:
-    actual = np.asarray(actual, dtype=float).reshape(-1)
-    predicted = np.asarray(predicted, dtype=float).reshape(-1)
-    mse = float(np.mean((actual - predicted) ** 2))
-    mae = float(np.mean(np.abs(actual - predicted)))
-    denom = float(np.sum((actual - np.mean(actual)) ** 2))
-    r2 = 1.0 - float(np.sum((actual - predicted) ** 2)) / denom if denom > 0 else 0.0
-    capped_mape = float(
-        np.mean(np.clip(np.abs((actual - predicted) / (np.abs(actual) + 1e-8)), 0, 1.0)) * 100
-    )
-    return {
-        "rmse": float(np.sqrt(mse)),
-        "mae": mae,
-        "r2": r2,
-        "capped_mape": capped_mape,
-    }
-
-
 def _raw_target_series(data_path: Path) -> np.ndarray:
     df = _load_dataframe(data_path).copy()
     target_col = "GHI" if "GHI" in df.columns else "Radiation"
@@ -158,8 +141,14 @@ def _baseline_predictions(
 
     actual = target[target_indices]
     persistence = target[np.maximum(target_indices - horizon_steps, 0)]
-    seasonal_indices = target_indices - seasonal_lag
-    seasonal = np.where(seasonal_indices >= 0, target[seasonal_indices], persistence)
+    if seasonal_lag < 1:
+        raise ValueError("seasonal_lag must be >= 1")
+    # Use the latest seasonal cycle observable at the forecast origin.
+    cycles_back = (horizon_steps + seasonal_lag - 1) // seasonal_lag
+    seasonal_indices = target_indices - cycles_back * seasonal_lag
+    seasonal = persistence.copy()
+    available = seasonal_indices >= 0
+    seasonal[available] = target[seasonal_indices[available]]
 
     return actual, {
         "persistence": persistence,
@@ -194,11 +183,12 @@ def _print_metrics_table(metrics_by_model: Dict[str, Dict[str, float]]) -> None:
 
 
 def _evaluate_model(model, split, preprocessor, device, batch_size):
-    predictions = model.predict(split.X, device=device, batch_size=batch_size)
-    return _metrics(split.actuals, preprocessor.inverse_target(predictions))
+    return evaluate_forecaster(
+        model, split, preprocessor, device=device, batch_size=batch_size, return_predictions=False
+    ).metrics
 
 
-def _save_model(model, checkpoint, train_cfg, metrics, preprocessor):
+def _save_model(model, checkpoint, train_cfg, metrics, preprocessor, metrics_scope="test"):
     save_checkpoint(
         model,
         str(checkpoint),
@@ -207,6 +197,7 @@ def _save_model(model, checkpoint, train_cfg, metrics, preprocessor):
         model.history,
         metrics,
         preprocessor=preprocessor,
+        metrics_scope=metrics_scope,
     )
 
 
@@ -224,11 +215,13 @@ def command_train(args: argparse.Namespace) -> None:
     )
     model.fit(data.train.X, data.train.y, data.val.X, data.val.y, train_cfg, device=args.device)
 
-    metrics = _evaluate_model(model, data.test, data.preprocessor, args.device, args.batch_size)
+    metrics = _evaluate_model(model, data.val, data.preprocessor, args.device, args.batch_size)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = output_dir / f"{args.model}_model.pt"
-    _save_model(model, checkpoint, train_cfg, metrics, data.preprocessor)
+    _save_model(
+        model, checkpoint, train_cfg, metrics, data.preprocessor, metrics_scope="validation"
+    )
 
     metadata = {
         "model": args.model,
@@ -236,12 +229,14 @@ def command_train(args: argparse.Namespace) -> None:
         "data": str(args.data),
         "feature_columns": feature_cols,
         "metrics": metrics,
+        "metrics_scope": "validation",
         "transform_info": {
             key: value for key, value in transform_info.items() if key != "structural_transforms"
         },
     }
     _write_json(output_dir / f"{args.model}_metadata.json", metadata)
     print(f"Saved checkpoint: {checkpoint}")
+    print("Metrics scope: validation")
     _print_metrics_table({args.model: metrics})
 
 
@@ -296,6 +291,7 @@ def command_compare(args: argparse.Namespace) -> None:
                 "horizon_steps": args.horizon_steps,
                 "feature_columns": feature_cols,
                 "metrics": eval_metrics,
+                "metrics_scope": "test",
                 "transform_info": {
                     key: value
                     for key, value in transform_info.items()
@@ -328,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
 
-    train = subparsers.add_parser("train", help="Train an LSTM or GRU checkpoint")
+    train = subparsers.add_parser("train", help="Train a checkpoint and report validation metrics")
     train.add_argument("--model", choices=["lstm", "gru"], default="lstm")
     train.add_argument("--output", default="artifacts")
     add_common_model_args(train)
@@ -357,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare = subparsers.add_parser("compare", help="Compare baselines with LSTM and GRU")
     compare.add_argument("--output", default=None)
-    compare.add_argument("--seasonal-lag", type=int, default=288)
+    compare.add_argument("--seasonal-lag", type=_positive_int, default=288)
     add_common_model_args(compare)
     compare.set_defaults(func=command_compare)
 

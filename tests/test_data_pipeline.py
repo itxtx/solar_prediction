@@ -611,9 +611,7 @@ class TestDataPipelineEdgeCases:
         if X_train.size > 0:
             X_flat = X_train.reshape(-1, X_train.shape[-1])
             max_abs_value = np.max(np.abs(X_flat))
-            assert (
-                max_abs_value < 1000
-            ), f"Extreme values not properly scaled: max={max_abs_value}"
+            assert max_abs_value < 1000, f"Extreme values not properly scaled: max={max_abs_value}"
 
         print("Extreme values test passed!")
 

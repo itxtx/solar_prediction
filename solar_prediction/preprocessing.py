@@ -103,6 +103,8 @@ class WeatherPreprocessor:
         frame, target, _ = _initial_df_setup(data, cfg)
         if not np.isfinite(frame[target].to_numpy(dtype=float)).all():
             raise ValueError("Target observations must be finite; missing labels cannot be filled.")
+        # Preserve observations before any label clipping or structural transforms.
+        frame[f"{target}_history"] = frame[target]
         return _engineer_time_features(frame, self.feature_cfg, cfg), target
 
     def fit(self, train_data: pd.DataFrame) -> WeatherPreprocessor:
@@ -126,7 +128,7 @@ class WeatherPreprocessor:
             )
         self._add_indicator(frame)
         self.feature_columns = _select_final_features(
-            frame, self.feature_cfg, self.transformed_target
+            frame, self.feature_cfg, self.transformed_target, target
         )
         self.feature_medians = frame[self.feature_columns].iloc[feature_indices].median()
         self._fill_features(frame)

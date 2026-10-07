@@ -1,4 +1,5 @@
 import pickle
+import json
 
 import numpy as np
 import pandas as pd
@@ -9,25 +10,147 @@ from solar_prediction import cli
 from solar_prediction.checkpointing import load_forecaster, save_checkpoint
 from solar_prediction.config import SequenceConfig, get_config
 from solar_prediction.preprocessing import WeatherPreprocessor, prepare_dataset
+from solar_prediction.data_prep import _initial_df_setup, _engineer_time_features
+
+
+@pytest.mark.parametrize("timezone", [None, "Pacific/Honolulu"])
+def test_unix_sorting_preserves_local_solar_time(timezone):
+    cfg = get_config()
+    frame = pd.DataFrame(
+        {
+            "UNIXTime": [1472767208, 1472724008],
+            "Data": ["9/1/2016 12:00:00 AM"] * 2,
+            "Time": ["12:00:08", "00:00:08"],
+            "GHI": [500.0, 0.0],
+            "TimeSunRise": ["06:07:00"] * 2,
+            "TimeSunSet": ["18:38:00"] * 2,
+        }
+    )
+    if timezone:
+        frame = frame.drop(columns=["Data", "Time"])
+    input_cfg = cfg.input.model_copy(update={"timezone": timezone})
+    normalized, _, _ = _initial_df_setup(frame, input_cfg)
+    engineered = _engineer_time_features(normalized, cfg.features, input_cfg)
+    assert engineered.Timestamp.is_monotonic_increasing
+    assert engineered.HourOfDay.tolist() == [0, 12]
+    assert engineered.IsDaylight.tolist() == [0, 1]
+    assert engineered.Radiation.tolist() == [0, 500]
+
+
+@pytest.mark.parametrize(
+    "transforms",
+    [
+        {},
+        {"use_log_transform": True},
+        {
+            "use_power_transform": True,
+            "clip_original_target_before_power_transform": True,
+        },
+        {"use_piecewise_transform_target": True},
+    ],
+)
+def test_target_history_is_raw_and_precedes_forecast(frame, transforms):
+    data = prepare(frame, **transforms)
+    pp = data.preprocessor
+    col = pp.feature_columns.index("Radiation_history")
+    history = pp.scalers["Radiation_history"].inverse_transform(data.train.X[0, :, col, None])
+    np.testing.assert_allclose(history.ravel(), frame.GHI.iloc[:3], rtol=1e-5)
+    assert data.train.actuals[0, 0] == frame.GHI.iloc[4]
+    assert "Radiation" not in pp.feature_columns
+    end = data.transform_info["split_metadata"]["feature_fit_row_range"][1]
+    assert pp.scalers["Radiation_history"].mean_[0] == pytest.approx(frame.GHI.iloc[:end].mean())
+
+
+def test_target_history_can_be_disabled(frame):
+    cfg = get_config()
+    for log_transform in (False, True):
+        data = prepare_dataset(
+            frame,
+            cfg.input,
+            cfg.transformation.model_copy(update={"use_log_transform": log_transform}),
+            cfg.features.model_copy(update={"include_target_history": False}),
+            cfg.scaling,
+            cfg.sequences,
+        )
+        assert "Radiation_history" not in data.preprocessor.feature_columns
+        assert "Radiation" not in data.preprocessor.feature_columns
+
+
+@pytest.mark.parametrize("model_name", ["lstm", "gru"])
+def test_training_scores_only_validation(frame, tmp_path, monkeypatch, model_name):
+    from solar_prediction.checkpointing import load_checkpoint
+
+    data_path = tmp_path / "data.csv"
+    frame.to_csv(data_path, index=False)
+    evaluate = cli._evaluate_model
+    scored = []
+
+    def require_validation(model, split, pp, device, batch_size):
+        expected = pp.split_sequences(frame).val
+        np.testing.assert_array_equal(split.target_indices, expected.target_indices)
+        np.testing.assert_allclose(split.actuals, expected.actuals)
+        scored.append(True)
+        return evaluate(model, split, pp, device, batch_size)
+
+    monkeypatch.setattr(cli, "_evaluate_model", require_validation)
+    cli.main(
+        [
+            "train",
+            "--model",
+            model_name,
+            "--data",
+            str(data_path),
+            "--output",
+            str(tmp_path),
+            "--epochs",
+            "1",
+            "--hidden-dim",
+            "4",
+            "--quiet",
+        ]
+    )
+    assert scored == [True]
+    metadata = json.loads((tmp_path / f"{model_name}_metadata.json").read_text())
+    checkpoint, _ = load_checkpoint(str(tmp_path / f"{model_name}_model.pt"))
+    assert metadata["metrics_scope"] == checkpoint["metrics_scope"] == "validation"
+    assert metadata["metrics"] == checkpoint["metrics"]
 
 
 @pytest.fixture
 def frame():
-    return pd.DataFrame({"Time": pd.date_range("2023-01-01", periods=60, freq="h"),
-                         "GHI": np.linspace(1, 500, 60), "temp": np.arange(60, dtype=float)})
+    return pd.DataFrame(
+        {
+            "Time": pd.date_range("2023-01-01", periods=60, freq="h"),
+            "GHI": np.linspace(1, 500, 60),
+            "temp": np.arange(60, dtype=float),
+        }
+    )
 
 
 def prepare(frame, **transforms):
     cfg = get_config()
-    return prepare_dataset(frame, cfg.input, cfg.transformation.model_copy(update=transforms),
-                           cfg.features, cfg.scaling, SequenceConfig(window_size=3, horizon_steps=2))
+    return prepare_dataset(
+        frame,
+        cfg.input,
+        cfg.transformation.model_copy(update=transforms),
+        cfg.features,
+        cfg.scaling,
+        SequenceConfig(window_size=3, horizon_steps=2),
+    )
 
 
-@pytest.mark.parametrize("transforms", [
-    {}, {"use_log_transform": True}, {"use_power_transform": True},
-    {"use_piecewise_transform_target": True, "use_log_transform": True},
-])
-def test_saved_preprocessor_reuses_state_and_decodes_targets(frame, transforms, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "transforms",
+    [
+        {},
+        {"use_log_transform": True},
+        {"use_power_transform": True},
+        {"use_piecewise_transform_target": True, "use_log_transform": True},
+    ],
+)
+def test_saved_preprocessor_reuses_state_and_decodes_targets(
+    frame, transforms, tmp_path, monkeypatch
+):
     data = prepare(frame, **transforms)
     path = tmp_path / "preprocessor.pkl"
     data.preprocessor.save(path)
@@ -46,10 +169,13 @@ def test_saved_preprocessor_reuses_state_and_decodes_targets(frame, transforms, 
     assert pickle.dumps(loaded) == state
 
 
-@pytest.mark.parametrize("transforms", [
-    {"use_log_transform": True, "clip_log_transformed_target": True},
-    {"use_power_transform": True, "clip_original_target_before_power_transform": True},
-])
+@pytest.mark.parametrize(
+    "transforms",
+    [
+        {"use_log_transform": True, "clip_log_transformed_target": True},
+        {"use_power_transform": True, "clip_original_target_before_power_transform": True},
+    ],
+)
 def test_future_values_cannot_change_training_state(frame, transforms):
     data = prepare(frame, **transforms)
     changed = frame.copy()
@@ -83,8 +209,13 @@ def test_feature_boundary_causal_fill_and_missing_labels(frame):
 
 def test_history_provides_context_without_becoming_labels(frame):
     cfg = get_config()
-    pp = WeatherPreprocessor(cfg.input, cfg.transformation, cfg.features, cfg.scaling,
-                             SequenceConfig(window_size=3, horizon_steps=2)).fit(frame.iloc[:40])
+    pp = WeatherPreprocessor(
+        cfg.input,
+        cfg.transformation,
+        cfg.features,
+        cfg.scaling,
+        SequenceConfig(window_size=3, horizon_steps=2),
+    ).fit(frame.iloc[:40])
     result = pp.sequences(frame.iloc[40:], history=frame.iloc[36:40])
     np.testing.assert_array_equal(result.target_indices, np.arange(20))
     np.testing.assert_array_equal(result.actuals.ravel(), frame.GHI.iloc[40:])
@@ -95,26 +226,45 @@ def test_history_provides_context_without_becoming_labels(frame):
 
 
 @pytest.mark.parametrize("model_name", ["lstm", "gru"])
-def test_checkpoint_and_cli_evaluation_use_saved_preprocessor(frame, tmp_path, monkeypatch, capsys, model_name):
+def test_checkpoint_and_cli_evaluation_use_saved_preprocessor(
+    frame, tmp_path, monkeypatch, capsys, model_name
+):
     data = prepare(frame, use_log_transform=True, clip_log_transformed_target=True)
     model, train_cfg = cli._model_and_configs(model_name, data.train.X.shape[2], 1, 4, 16)
     path = tmp_path / "model.pt"
-    save_checkpoint(model, str(path), model.params, train_cfg, model.history, {},
-                    preprocessor=data.preprocessor)
+    save_checkpoint(
+        model, str(path), model.params, train_cfg, model.history, {}, preprocessor=data.preprocessor
+    )
     loaded_model, pp = load_forecaster(str(path))
     np.testing.assert_allclose(loaded_model.predict(data.test.X), model.predict(data.test.X))
     np.testing.assert_allclose(pp.transform(frame), data.preprocessor.transform(frame))
     data_path = tmp_path / "held_out.csv"
     frame.assign(GHI=frame.GHI * 2).to_csv(data_path, index=False)
+
     def forbid_fit(*args, **kwargs):
         raise AssertionError("CLI evaluation must not fit")
+
     monkeypatch.setattr(WeatherPreprocessor, "_fit_frame", forbid_fit)
     for scope in ("test", "all"):
-        cli.main(["evaluate", "--model", model_name, "--checkpoint", str(path),
-                  "--data", str(data_path), "--evaluation-scope", scope, "--quiet"])
+        cli.main(
+            [
+                "evaluate",
+                "--model",
+                model_name,
+                "--checkpoint",
+                str(path),
+                "--data",
+                str(data_path),
+                "--evaluation-scope",
+                scope,
+                "--quiet",
+            ]
+        )
     assert capsys.readouterr().out.count(f"{model_name},") == 2
     with pytest.raises(ValueError, match="saved checkpoint horizon"):
-        cli.main(["evaluate", "--model", model_name, "--checkpoint", str(path), "--horizon-steps", "1"])
+        cli.main(
+            ["evaluate", "--model", model_name, "--checkpoint", str(path), "--horizon-steps", "1"]
+        )
     save_checkpoint(model, str(path), model.params, train_cfg, model.history, {})
     with pytest.raises(ValueError, match="Retrain"):
         load_forecaster(str(path))

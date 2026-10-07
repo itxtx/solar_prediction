@@ -146,9 +146,9 @@ class TestLSTMModel:
         final_loss = model.history["train_loss"][-1]
 
         # Loss should decrease or not increase by more than 20% (due to tiny dataset)
-        assert final_loss <= initial_loss * 1.2, (
-            f"Loss increased too much: {initial_loss} -> {final_loss}"
-        )
+        assert (
+            final_loss <= initial_loss * 1.2
+        ), f"Loss increased too much: {initial_loss} -> {final_loss}"
 
         # Check that losses are finite
         assert all(np.isfinite(model.history["train_loss"]))
@@ -282,9 +282,9 @@ class TestGRUModel:
         final_loss = model.history["train_loss"][-1]
 
         # Loss should decrease or not increase by more than 20% (due to tiny dataset)
-        assert final_loss <= initial_loss * 1.2, (
-            f"Loss increased too much: {initial_loss} -> {final_loss}"
-        )
+        assert (
+            final_loss <= initial_loss * 1.2
+        ), f"Loss increased too much: {initial_loss} -> {final_loss}"
 
         # Check that losses are finite
         assert all(np.isfinite(model.history["train_loss"]))

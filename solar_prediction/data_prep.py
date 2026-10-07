@@ -169,6 +169,21 @@ def _initial_df_setup(
     # Work with a copy to avoid modifying the original
     df = df.copy()
 
+    # Keep absolute timestamps for sorting, but use local time for solar features.
+    if cfg.unix_time_col in df.columns:
+        timezone = getattr(cfg, "timezone", None)
+        local_date_col = getattr(cfg, "local_date_col", "Data")
+        if timezone:
+            df["LocalTimestamp"] = pd.to_datetime(
+                df[cfg.unix_time_col], unit="s", utc=True
+            ).dt.tz_convert(timezone)
+        elif local_date_col in df.columns and cfg.time_col in df.columns:
+            # The sample's Data field contains a date followed by redundant midnight.
+            local_date = pd.to_datetime(
+                df[local_date_col].astype(str).str.split().str[0]
+            ).dt.normalize()
+            df["LocalTimestamp"] = local_date + pd.to_timedelta(df[cfg.time_col])
+
     # Define the mapping from common input names to standardized internal names
     # This map should be comprehensive for columns used in feature engineering or as target
     rename_map = {
@@ -345,14 +360,15 @@ def _engineer_time_features(
         return df
 
     # Hour and Month (Cyclical)
-    df[STD_HOUR_OF_DAY] = df[STD_TIME_COL].dt.hour
-    df[STD_MONTH] = df[STD_TIME_COL].dt.month
+    local_time = df.get("LocalTimestamp", df[STD_TIME_COL])
+    df[STD_HOUR_OF_DAY] = local_time.dt.hour
+    df[STD_MONTH] = local_time.dt.month
 
     # Use centralized configuration for time constants
     minutes_in_day = feature_cfg.minutes_in_day
 
     # Vectorized time feature engineering using NumPy operations
-    time_values = df[STD_TIME_COL].dt
+    time_values = local_time.dt
     current_time_minutes = time_values.hour * 60 + time_values.minute + time_values.second / 60.0
 
     # Pre-compute the scaling factor for efficiency
@@ -732,7 +748,10 @@ def _get_base_feature_set(df_columns: pd.Index, feature_cfg: FeatureEngineeringC
 
 @benchmark(stage_name="select_final_features")
 def _select_final_features(
-    df: pd.DataFrame, feature_cfg: FeatureEngineeringConfig, target_col_after_transforms: str
+    df: pd.DataFrame,
+    feature_cfg: FeatureEngineeringConfig,
+    target_col_after_transforms: str,
+    original_target_col: Optional[str] = None,
 ) -> List[str]:
     """Selects the final list of feature columns to be used for modeling."""
     logger.debug("Selecting final feature columns.")
@@ -749,7 +768,13 @@ def _select_final_features(
             logger.info(f"Including low target indicator '{lic}' in features.")
 
     # Ensure the actual target column (after transforms, before scaling) is NOT in features
-    final_feature_list = [col for col in base_features if col != target_col_after_transforms]
+    final_feature_list = [
+        col
+        for col in base_features
+        if col not in (target_col_after_transforms, original_target_col)
+    ]
+    if original_target_col is not None and feature_cfg.include_target_history:
+        final_feature_list.append(f"{original_target_col}_history")
 
     # Remove duplicates that might have crept in
     final_feature_list = sorted(list(set(final_feature_list)))

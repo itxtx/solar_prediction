@@ -25,6 +25,7 @@ def save_checkpoint(
     metrics: Dict[str, float],
     version: str = "1.1",
     preprocessor: Any = None,
+    metrics_scope: Optional[str] = None,
 ) -> None:
     """
     Save model checkpoint with comprehensive metadata.
@@ -69,6 +70,7 @@ def save_checkpoint(
             "training_config": train_cfg_dict,
             "history": history,
             "metrics": metrics,
+            "metrics_scope": metrics_scope,
             "version": version,
             "timestamp": datetime.now().isoformat(),
             "model_type": _get_model_type(model),

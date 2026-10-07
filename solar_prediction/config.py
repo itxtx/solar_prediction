@@ -103,6 +103,7 @@ class FeatureEngineeringConfig(BaseModel):
     """Configuration for feature engineering."""
 
     # Feature creation options
+    include_target_history: bool = Field(True, description="Include observed raw target in windows")
     use_solar_elevation_proxy: bool = Field(
         True, description="Create solar elevation proxy feature"
     )
@@ -166,6 +167,8 @@ class DataInputConfig(BaseModel):
 
     # Time columns
     time_col: str = Field("Time", description="Primary timestamp column")
+    timezone: Optional[str] = Field(None, description="IANA timezone for UNIX-based solar features")
+    local_date_col: str = Field("Data", description="Local date accompanying a clock-only Time")
     unix_time_col: str = Field("UNIXTime", description="Fallback timestamp column")
     sunrise_col: str = Field("TimeSunRise", description="Sunrise time column")
     sunset_col: str = Field("TimeSunSet", description="Sunset time column")
