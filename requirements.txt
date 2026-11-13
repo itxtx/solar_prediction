@@ -1,20 +1,20 @@
 # Compatibility export for environments that do not use pyproject extras.
 # Preferred portfolio setup:
 #   pip install -e ".[dev,notebooks]"
-numpy>=1.24
-pandas>=1.5
-scipy>=1.10
-torch>=2.0
-scikit-learn>=1.2
-matplotlib>=3.7
-seaborn>=0.12
-optuna>=3.0
-pydantic>=2.0
-tqdm>=4.62
-psutil>=5.8
-pytest>=7
-pytest-cov>=4
-ruff>=0.4
-black>=24
-jupyter>=1.0
-ipykernel>=6.0
+numpy >= 1.24
+pandas >= 1.5
+scipy >= 1.10
+torch >= 2.0
+scikit - learn >= 1.2
+matplotlib >= 3.7
+seaborn >= 0.12
+optuna >= 3.0
+pydantic >= 2.0
+tqdm >= 4.62
+psutil >= 5.8
+pytest >= 7
+pytest - cov >= 4
+ruff >= 0.4
+black >= 24
+jupyter >= 1.0
+ipykernel >= 6.0

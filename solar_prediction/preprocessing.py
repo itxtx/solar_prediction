@@ -36,7 +36,6 @@ from .data_prep import (
     _compute_sequence_split_metadata,
 )
 
-
 # Columns that depend only on the clock and the sun's schedule, never on
 # measurements, so their values at the forecast target time are known in advance.
 # For solar_weather.csv, isSun/dayLength/sunlightTime are astronomical (isSun is 1
@@ -86,9 +85,7 @@ def add_target_time_features(
             name = f"Target{column}"
             frame[name] = frame[column].shift(-horizon_steps)
             added.append(name)
-    if STD_TIME_COL in frame.columns and pd.api.types.is_datetime64_any_dtype(
-        frame[STD_TIME_COL]
-    ):
+    if STD_TIME_COL in frame.columns and pd.api.types.is_datetime64_any_dtype(frame[STD_TIME_COL]):
         target_time = frame[STD_TIME_COL].shift(-horizon_steps)
         day_angle = 2 * np.pi * (target_time.dt.dayofyear - 1) / 365.25
         frame["TargetDayOfYearSin"] = np.sin(day_angle)
@@ -234,9 +231,7 @@ class WeatherPreprocessor:
         )
         if self._uses_target_time_features():
             self.feature_columns += [
-                column
-                for column in self.target_time_columns
-                if column not in self.feature_columns
+                column for column in self.target_time_columns if column not in self.feature_columns
             ]
         self.feature_medians = frame[self.feature_columns].iloc[feature_indices].median()
         self._fill_features(frame)

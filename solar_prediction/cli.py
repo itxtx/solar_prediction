@@ -94,9 +94,7 @@ def _prepare(
     target_time_features: bool = False,
 ):
     config = get_config()
-    feature_cfg = config.features.model_copy(
-        update={"target_time_features": target_time_features}
-    )
+    feature_cfg = config.features.model_copy(update={"target_time_features": target_time_features})
     updates = {"horizon_steps": horizon_steps}
     if window_size is not None:
         updates["window_size"] = window_size

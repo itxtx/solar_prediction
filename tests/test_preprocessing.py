@@ -484,9 +484,25 @@ def test_cli_train_target_time_flag_records_features(tmp_path):
     out = tmp_path / "run"
     cli.main(
         [
-            "train", "--model", "gru", "--data", str(data_path), "--epochs", "1",
-            "--hidden-dim", "4", "--batch-size", "16", "--window-size", "6",
-            "--horizon-steps", "8", "--target-time-features", "--output", str(out), "--quiet",
+            "train",
+            "--model",
+            "gru",
+            "--data",
+            str(data_path),
+            "--epochs",
+            "1",
+            "--hidden-dim",
+            "4",
+            "--batch-size",
+            "16",
+            "--window-size",
+            "6",
+            "--horizon-steps",
+            "8",
+            "--target-time-features",
+            "--output",
+            str(out),
+            "--quiet",
         ]
     )
     metadata = json.loads((out / "gru_metadata.json").read_text())
