@@ -37,6 +37,20 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return parsed
+
+
+def _unit_float(value: str) -> float:
+    parsed = float(value)
+    if not 0 <= parsed < 1:
+        raise argparse.ArgumentTypeError("must be in [0, 1)")
+    return parsed
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -45,27 +59,69 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _model_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "epochs": args.epochs,
+        "hidden_dim": args.hidden_dim,
+        "batch_size": args.batch_size,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "learning_rate": args.learning_rate,
+        "patience": args.patience,
+    }
+
+
+def _run_hyperparameters(args: argparse.Namespace, preprocessor) -> Dict[str, Any]:
+    return {
+        **_model_kwargs(args),
+        "window_size": preprocessor.sequence_cfg.window_size,
+        "target_time_features": preprocessor._uses_target_time_features(),
+        "horizon_steps": preprocessor.sequence_cfg.horizon_steps,
+        "seed": args.seed,
+    }
+
+
 def _load_dataframe(data_path: Path) -> pd.DataFrame:
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
     return pd.read_csv(data_path)
 
 
-def _prepare(data_path: Path, horizon_steps: int = 1):
+def _prepare(
+    data_path: Path,
+    horizon_steps: int = 1,
+    window_size: int | None = None,
+    target_time_features: bool = False,
+):
     config = get_config()
-    sequence_cfg = config.sequences.model_copy(update={"horizon_steps": horizon_steps})
+    feature_cfg = config.features.model_copy(
+        update={"target_time_features": target_time_features}
+    )
+    updates = {"horizon_steps": horizon_steps}
+    if window_size is not None:
+        updates["window_size"] = window_size
+    sequence_cfg = config.sequences.model_copy(update=updates)
     return prepare_dataset(
         _load_dataframe(data_path),
         config.input,
         config.transformation,
-        config.features,
+        feature_cfg,
         config.scaling,
         sequence_cfg,
     )
 
 
 def _model_and_configs(
-    model_name: str, input_dim: int, epochs: int, hidden_dim: int, batch_size: int
+    model_name: str,
+    input_dim: int,
+    epochs: int,
+    hidden_dim: int,
+    batch_size: int,
+    *,
+    num_layers: int = 1,
+    dropout: float = 0.1,
+    learning_rate: float = 0.001,
+    patience: int = 10,
 ):
     factories = {
         "lstm": (WeatherLSTM, create_model_hyperparameters_from_config),
@@ -74,7 +130,11 @@ def _model_and_configs(
     if model_name not in factories:
         raise ValueError(f"Unsupported model: {model_name}")
     model_class, params_factory = factories[model_name]
-    architecture = {"hidden_dim": hidden_dim, "num_layers": 1, "dropout_prob": 0.1}
+    architecture = {
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "dropout_prob": dropout,
+    }
     if model_name == "gru":
         architecture["bidirectional"] = False
     model = model_class(params_factory(input_dim=input_dim, config_override=architecture))
@@ -83,8 +143,8 @@ def _model_and_configs(
         {
             "epochs": epochs,
             "batch_size": batch_size,
-            "learning_rate": 0.001,
-            "patience": max(epochs + 1, 3),
+            "learning_rate": learning_rate,
+            "patience": patience,
             "scheduler_type": "cosine",
         },
     )
@@ -145,15 +205,16 @@ def _save_model(model, checkpoint, train_cfg, metrics, preprocessor, metrics_sco
 def command_train(args: argparse.Namespace) -> None:
     _seed_everything(args.seed)
     output_dir = Path(args.output)
-    data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
+    data = _prepare(
+        Path(args.data),
+        horizon_steps=args.horizon_steps,
+        window_size=args.window_size,
+        target_time_features=args.target_time_features,
+    )
     feature_cols, transform_info = data.preprocessor.feature_columns, data.transform_info
 
     model, train_cfg = _model_and_configs(
-        args.model,
-        input_dim=data.train.X.shape[2],
-        epochs=args.epochs,
-        hidden_dim=args.hidden_dim,
-        batch_size=args.batch_size,
+        args.model, input_dim=data.train.X.shape[2], **_model_kwargs(args)
     )
     model.fit(data.train.X, data.train.y, data.val.X, data.val.y, train_cfg, device=args.device)
 
@@ -170,6 +231,8 @@ def command_train(args: argparse.Namespace) -> None:
         "checkpoint": str(checkpoint),
         "data": str(args.data),
         "seed": args.seed,
+        "horizon_steps": args.horizon_steps,
+        "hyperparameters": _run_hyperparameters(args, data.preprocessor),
         "feature_columns": feature_cols,
         "metrics": metrics,
         "metrics_scope": "validation",
@@ -201,7 +264,12 @@ def command_evaluate(args: argparse.Namespace) -> None:
 
 
 def command_compare(args: argparse.Namespace) -> None:
-    data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
+    data = _prepare(
+        Path(args.data),
+        horizon_steps=args.horizon_steps,
+        window_size=args.window_size,
+        target_time_features=args.target_time_features,
+    )
     feature_cols, transform_info = data.preprocessor.feature_columns, data.transform_info
     output_dir = Path(args.output) if args.output else None
     if output_dir:
@@ -219,11 +287,7 @@ def command_compare(args: argparse.Namespace) -> None:
     for model_name in ("lstm", "gru"):
         _seed_everything(args.seed)
         model, train_cfg = _model_and_configs(
-            model_name,
-            input_dim=data.train.X.shape[2],
-            epochs=args.epochs,
-            hidden_dim=args.hidden_dim,
-            batch_size=args.batch_size,
+            model_name, input_dim=data.train.X.shape[2], **_model_kwargs(args)
         )
         model.fit(data.train.X, data.train.y, data.val.X, data.val.y, train_cfg, device=args.device)
         eval_metrics = _evaluate_model(
@@ -240,6 +304,7 @@ def command_compare(args: argparse.Namespace) -> None:
                 "data": str(args.data),
                 "seed": args.seed,
                 "horizon_steps": args.horizon_steps,
+                "hyperparameters": _run_hyperparameters(args, data.preprocessor),
                 "feature_columns": feature_cols,
                 "metrics": eval_metrics,
                 "metrics_scope": "test",
@@ -267,6 +332,37 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--epochs", type=int, default=2)
         subparser.add_argument("--hidden-dim", type=int, default=16)
         subparser.add_argument("--batch-size", type=int, default=32)
+        subparser.add_argument(
+            "--num-layers", type=_positive_int, default=1, help="Stacked recurrent layers"
+        )
+        subparser.add_argument(
+            "--dropout",
+            type=_unit_float,
+            default=0.1,
+            help="Dropout before the output head (and between layers when --num-layers > 1)",
+        )
+        subparser.add_argument(
+            "--learning-rate", type=_positive_float, default=0.001, help="Adam learning rate"
+        )
+        subparser.add_argument(
+            "--patience",
+            type=_positive_int,
+            default=10,
+            help="Stop after this many epochs without validation-loss improvement",
+        )
+        subparser.add_argument(
+            "--window-size",
+            type=_positive_int,
+            default=None,
+            help="Input rows per sequence; defaults to the config value "
+            "(12 rows = 3 hours of 15-minute data)",
+        )
+        subparser.add_argument(
+            "--target-time-features",
+            action="store_true",
+            help="Add calendar/sun-schedule features at the forecast target time and the "
+            "target observed whole days before it",
+        )
         subparser.add_argument(
             "--horizon-steps",
             type=_positive_int,

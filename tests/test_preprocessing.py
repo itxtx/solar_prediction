@@ -351,3 +351,145 @@ def test_daylight_position_night_zero_and_daylength_minutes():
     norm_pl, _, _ = _initial_df_setup(pl_df, cfg.input)
     eng_pl = _engineer_time_features(norm_pl, cfg.features, cfg.input)
     assert eng_pl["DaylightMinutes"].tolist() == pytest.approx([960.0, 960.0])
+
+
+def _target_time_frame(days=6):
+    """Hourly frame with astronomical sun columns like solar_weather.csv."""
+    timestamps = pd.date_range("2023-06-01", periods=24 * days, freq="h")
+    hour = timestamps.hour.to_numpy()
+    is_sun = ((hour >= 5) & (hour <= 20)).astype(int)
+    rng = np.random.default_rng(0)
+    ghi = is_sun * np.sin(np.clip((hour - 5) / 15, 0, 1) * np.pi) * 600
+    ghi = ghi * rng.uniform(0.5, 1.0, len(hour))
+    return pd.DataFrame(
+        {
+            "Time": timestamps,
+            "GHI": ghi,
+            "temp": rng.normal(15, 3, len(hour)),
+            "pressure": rng.normal(1013, 2, len(hour)),
+            "humidity": rng.uniform(40, 90, len(hour)),
+            "wind_speed": rng.uniform(0, 6, len(hour)),
+            "clouds_all": rng.uniform(0, 100, len(hour)),
+            "rain_1h": 0.0,
+            "snow_1h": 0.0,
+            "isSun": is_sun,
+            "dayLength": 960,
+            "SunlightTime/daylength": np.where(is_sun, (hour - 5) / 16, 0.0),
+        }
+    )
+
+
+def _prepare_target_time(frame, window, horizon, enabled=True):
+    cfg = get_config()
+    return prepare_dataset(
+        frame,
+        cfg.input,
+        cfg.transformation,
+        cfg.features.model_copy(update={"target_time_features": enabled}),
+        cfg.scaling,
+        SequenceConfig(window_size=window, horizon_steps=horizon),
+    )
+
+
+def _feature(data, split, column):
+    pp = data.preprocessor
+    col = pp.feature_columns.index(column)
+    values = getattr(data, split).X[:, :, col]
+    return pp.scalers[column].inverse_transform(values.reshape(-1, 1)).reshape(values.shape)
+
+
+@pytest.mark.parametrize("horizon", [1, 5, 24, 30])
+def test_target_time_features_describe_the_target_row(horizon):
+    frame = _target_time_frame()
+    window = 4
+    data = _prepare_target_time(frame, window, horizon)
+    pp = data.preprocessor
+    assert pp.rows_per_day == 24
+    for column in (
+        "TargetTimeMinutesSin",
+        "TargetIsDaylight",
+        "TargetDayOfYearSin",
+        "Radiation_lag_target_day",
+    ):
+        assert column in pp.feature_columns
+    target_rows = data.train.target_indices
+    last_rows = target_rows - horizon
+    hours = frame.Time.dt.hour + frame.Time.dt.minute / 60
+    np.testing.assert_allclose(
+        _feature(data, "train", "TargetTimeMinutesSin")[:, -1],
+        np.sin(2 * np.pi * hours.iloc[target_rows] / 24),
+        atol=1e-4,
+    )
+    np.testing.assert_array_equal(
+        _feature(data, "train", "TargetIsDaylight")[:, -1].round(),
+        frame.isSun.iloc[target_rows],
+    )
+    days_back = -(-horizon // 24)
+    lag_rows = target_rows - 24 * days_back
+    assert (lag_rows <= last_rows).all()
+    usable = lag_rows >= 0
+    np.testing.assert_allclose(
+        _feature(data, "train", "Radiation_lag_target_day")[usable, -1],
+        frame.GHI.iloc[lag_rows[usable]],
+        rtol=1e-4,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("horizon", [1, 6, 24])
+def test_target_time_features_never_read_measurements_after_window(horizon):
+    frame = _target_time_frame()
+    window = 6
+    data = _prepare_target_time(frame, window, horizon)
+    pp = data.preprocessor
+    baseline = pp.sequences(frame).X
+    measured = ["GHI", "temp", "pressure", "humidity", "wind_speed", "clouds_all"]
+    for cutoff in (40, 80, 110):
+        changed = frame.copy()
+        changed.loc[cutoff + 1 :, measured] = changed.loc[cutoff + 1 :, measured] * 1.7 + 5
+        perturbed = pp.sequences(changed).X
+        # Window i covers rows i .. i + window - 1; those ending at or before the
+        # cutoff must be identical, because only measurements after it changed.
+        unaffected = cutoff - window + 2
+        np.testing.assert_array_equal(perturbed[:unaffected], baseline[:unaffected])
+        assert not np.array_equal(perturbed[unaffected:], baseline[unaffected:])
+
+
+def test_target_time_features_are_off_by_default_and_saved_with_preprocessor(tmp_path):
+    frame = _target_time_frame()
+    plain = _prepare_target_time(frame, 4, 3, enabled=False)
+    assert not any(c.startswith("Target") for c in plain.preprocessor.feature_columns)
+    assert "Radiation_lag_target_day" not in plain.preprocessor.feature_columns
+
+    data = _prepare_target_time(frame, 4, 3)
+    path = tmp_path / "pp.pkl"
+    data.preprocessor.save(path)
+    loaded = WeatherPreprocessor.load(path)
+    np.testing.assert_array_equal(loaded.sequences(frame).X, data.preprocessor.sequences(frame).X)
+
+
+def test_old_pickled_preprocessor_without_option_still_transforms(frame):
+    data = prepare(frame)
+    pp = data.preprocessor
+    for attr in ("rows_per_day", "target_time_columns"):
+        pp.__dict__.pop(attr, None)
+    object.__getattribute__(pp.feature_cfg, "__dict__").pop("target_time_features", None)
+    restored = pickle.loads(pickle.dumps(pp))
+    np.testing.assert_array_equal(restored.sequences(frame).X, pp.sequences(frame).X)
+
+
+def test_cli_train_target_time_flag_records_features(tmp_path):
+    data_path = tmp_path / "frame.csv"
+    _target_time_frame().to_csv(data_path, index=False)
+    out = tmp_path / "run"
+    cli.main(
+        [
+            "train", "--model", "gru", "--data", str(data_path), "--epochs", "1",
+            "--hidden-dim", "4", "--batch-size", "16", "--window-size", "6",
+            "--horizon-steps", "8", "--target-time-features", "--output", str(out), "--quiet",
+        ]
+    )
+    metadata = json.loads((out / "gru_metadata.json").read_text())
+    assert metadata["hyperparameters"]["target_time_features"] is True
+    assert "TargetSolarElevation" in metadata["feature_columns"]
+    assert "Radiation_lag_target_day" in metadata["feature_columns"]

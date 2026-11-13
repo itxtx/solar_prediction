@@ -104,6 +104,14 @@ class FeatureEngineeringConfig(BaseModel):
 
     # Feature creation options
     include_target_history: bool = Field(True, description="Include observed raw target in windows")
+    target_time_features: bool = Field(
+        False,
+        description=(
+            "Add features describing the forecast target time: calendar and sun-schedule "
+            "columns shifted to row t+h, plus the target observed one or more whole days "
+            "before the target time"
+        ),
+    )
     use_solar_elevation_proxy: bool = Field(
         True, description="Create solar elevation proxy feature"
     )

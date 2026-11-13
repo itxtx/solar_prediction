@@ -20,6 +20,13 @@ from .config import (
 )
 from .data_prep import (
     STD_RADIATION_COL,
+    STD_TIME_COL,
+    STD_TIME_MINUTES_SIN,
+    STD_TIME_MINUTES_COS,
+    STD_IS_DAYLIGHT,
+    STD_DAYLIGHT_POSITION,
+    STD_SOLAR_ELEVATION,
+    STD_DAYLIGHT_MINUTES,
     _resolve_input_config,
     _initial_df_setup,
     _engineer_time_features,
@@ -28,6 +35,72 @@ from .data_prep import (
     _scale_data,
     _compute_sequence_split_metadata,
 )
+
+
+# Columns that depend only on the clock and the sun's schedule, never on
+# measurements, so their values at the forecast target time are known in advance.
+# For solar_weather.csv, isSun/dayLength/sunlightTime are astronomical (isSun is 1
+# before GHI rises above zero), so IsDaylight and DaylightPosition qualify.
+TARGET_TIME_SOURCE_COLUMNS = (
+    STD_TIME_MINUTES_SIN,
+    STD_TIME_MINUTES_COS,
+    STD_IS_DAYLIGHT,
+    STD_DAYLIGHT_POSITION,
+    STD_SOLAR_ELEVATION,
+    STD_DAYLIGHT_MINUTES,
+)
+
+
+def infer_rows_per_day(timestamps: pd.Series) -> int | None:
+    """Rows per day from the median sampling interval, or None if not inferable."""
+    if timestamps is None or len(timestamps) < 2:
+        return None
+    step = pd.Series(pd.to_datetime(timestamps)).diff().median()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        return None
+    rows = pd.Timedelta(days=1) / step
+    if rows < 1 or abs(rows - round(rows)) > 1e-6:
+        return None
+    return int(round(rows))
+
+
+def add_target_time_features(
+    frame: pd.DataFrame, target: str, horizon_steps: int, rows_per_day: int | None
+) -> list[str]:
+    """Add columns that describe row ``t + horizon`` while staying known at row ``t``.
+
+    * ``Target<col>``: deterministic calendar/sun columns shifted back by the
+      horizon, so the last window row carries the target row's values.
+    * ``TargetDayOfYearSin/Cos``: seasonal position of the target timestamp.
+    * ``<target>_lag_target_day``: the observed target ``k`` whole days before
+      the target time, with ``k = ceil(horizon / rows_per_day)`` so the lagged
+      row is never later than ``t``.
+
+    Rows near the end of the series have no target-row values; they only appear
+    in windows whose own target lies beyond the data, and feature filling
+    handles them. Returns the added column names.
+    """
+    added = []
+    for column in TARGET_TIME_SOURCE_COLUMNS:
+        if column in frame.columns:
+            name = f"Target{column}"
+            frame[name] = frame[column].shift(-horizon_steps)
+            added.append(name)
+    if STD_TIME_COL in frame.columns and pd.api.types.is_datetime64_any_dtype(
+        frame[STD_TIME_COL]
+    ):
+        target_time = frame[STD_TIME_COL].shift(-horizon_steps)
+        day_angle = 2 * np.pi * (target_time.dt.dayofyear - 1) / 365.25
+        frame["TargetDayOfYearSin"] = np.sin(day_angle)
+        frame["TargetDayOfYearCos"] = np.cos(day_angle)
+        added += ["TargetDayOfYearSin", "TargetDayOfYearCos"]
+    history = f"{target}_history"
+    if rows_per_day and history in frame.columns:
+        days_back = -(-horizon_steps // rows_per_day)
+        name = f"{target}_lag_target_day"
+        frame[name] = frame[history].shift(days_back * rows_per_day - horizon_steps)
+        added.append(name)
+    return added
 
 
 @dataclass
@@ -93,6 +166,8 @@ class WeatherPreprocessor:
         )
         self.domain_cfg = deepcopy(get_config().data)
         self.scalers = {}
+        self.rows_per_day = None
+        self.target_time_columns = []
 
     def _normalize(self, data):
         if data.empty:
@@ -105,7 +180,18 @@ class WeatherPreprocessor:
             raise ValueError("Target observations must be finite; missing labels cannot be filled.")
         # Preserve observations before any label clipping or structural transforms.
         frame[f"{target}_history"] = frame[target]
-        return _engineer_time_features(frame, self.feature_cfg, cfg), target
+        frame = _engineer_time_features(frame, self.feature_cfg, cfg)
+        if self._uses_target_time_features():
+            if getattr(self, "rows_per_day", None) is None:
+                self.rows_per_day = infer_rows_per_day(frame.get(STD_TIME_COL))
+            self.target_time_columns = add_target_time_features(
+                frame, target, self.sequence_cfg.horizon_steps, self.rows_per_day
+            )
+        return frame, target
+
+    def _uses_target_time_features(self) -> bool:
+        # Preprocessors pickled before this option existed lack the field.
+        return bool(getattr(self.feature_cfg, "target_time_features", False))
 
     def fit(self, train_data: pd.DataFrame) -> WeatherPreprocessor:
         """Learn from an explicitly supplied training frame only."""
@@ -146,6 +232,12 @@ class WeatherPreprocessor:
         self.feature_columns = _select_final_features(
             frame, self.feature_cfg, self.transformed_target, target
         )
+        if self._uses_target_time_features():
+            self.feature_columns += [
+                column
+                for column in self.target_time_columns
+                if column not in self.feature_columns
+            ]
         self.feature_medians = frame[self.feature_columns].iloc[feature_indices].median()
         self._fill_features(frame)
         if not np.isfinite(frame[self.transformed_target].to_numpy(dtype=float)).all():

@@ -240,3 +240,101 @@ def test_hf_hub_helpers_and_notebooks_use_hf(tmp_path, monkeypatch):
         assert "google.colab import drive" not in text
         assert "download_dataset_file" in text
         assert "upload_artifacts_folder" in text
+
+
+def _tiny_frame(rows=80):
+    return pd.DataFrame(
+        {
+            "Time": pd.date_range("2023-01-01", periods=rows, freq="h"),
+            "GHI": np.maximum(0, np.sin(np.linspace(0, 6 * np.pi, rows)) * 500),
+            "temp": np.linspace(5, 25, rows),
+            "pressure": [1013.0] * rows,
+            "humidity": np.linspace(80, 40, rows),
+            "wind_speed": [3.0] * rows,
+            "clouds_all": np.linspace(80, 20, rows),
+            "rain_1h": [0.0] * rows,
+            "snow_1h": [0.0] * rows,
+        }
+    )
+
+
+def test_cli_train_applies_architecture_and_sequence_flags(tmp_path):
+    import torch
+
+    data_path = tmp_path / "sample.csv"
+    _tiny_frame().to_csv(data_path, index=False)
+    output_dir = tmp_path / "run"
+    main(
+        [
+            "train",
+            "--model",
+            "gru",
+            "--data",
+            str(data_path),
+            "--epochs",
+            "1",
+            "--hidden-dim",
+            "4",
+            "--batch-size",
+            "16",
+            "--num-layers",
+            "2",
+            "--dropout",
+            "0.2",
+            "--learning-rate",
+            "0.0005",
+            "--patience",
+            "3",
+            "--window-size",
+            "7",
+            "--horizon-steps",
+            "2",
+            "--output",
+            str(output_dir),
+            "--quiet",
+        ]
+    )
+    metadata = json.loads((output_dir / "gru_metadata.json").read_text())
+    assert metadata["hyperparameters"] == {
+        "epochs": 1,
+        "hidden_dim": 4,
+        "batch_size": 16,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "learning_rate": 0.0005,
+        "patience": 3,
+        "window_size": 7,
+        "target_time_features": False,
+        "horizon_steps": 2,
+        "seed": 42,
+    }
+    assert metadata["transform_info"]["split_metadata"]["window_size"] == 7
+
+    from solar_prediction.checkpointing import load_forecaster
+
+    model, preprocessor = load_forecaster(str(output_dir / "gru_model.pt"), "cpu")
+    assert model.gru.num_layers == 2
+    assert model.gru.dropout == pytest.approx(0.2)
+    assert preprocessor.sequence_cfg.window_size == 7
+    assert isinstance(model, torch.nn.Module)
+
+
+def test_model_and_configs_uses_real_early_stopping_patience():
+    from solar_prediction.cli import _model_and_configs
+
+    _, train_cfg = _model_and_configs("gru", 5, epochs=100, hidden_dim=4, batch_size=8)
+    assert train_cfg.patience == 10
+    assert train_cfg.patience < train_cfg.epochs
+    _, train_cfg = _model_and_configs(
+        "lstm", 5, 100, 4, 8, patience=4, learning_rate=0.01, num_layers=2, dropout=0.0
+    )
+    assert (train_cfg.patience, train_cfg.learning_rate) == (4, 0.01)
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [("--dropout", "1.0"), ("--dropout", "-0.1"), ("--learning-rate", "0"), ("--window-size", "0")],
+)
+def test_cli_rejects_invalid_model_flags(flag, value):
+    with pytest.raises(SystemExit):
+        main(["train", flag, value])
