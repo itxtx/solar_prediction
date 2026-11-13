@@ -49,6 +49,35 @@ def download_dataset_file(
     return Path(downloaded)
 
 
+def download_artifacts_folder(
+    repo_id: str,
+    path_in_repo: str,
+    *,
+    local_dir: str | Path = "artifacts",
+    token: str | None = None,
+) -> Path | None:
+    """Restore ``path_in_repo`` from a model repo into ``local_dir/path_in_repo``.
+
+    Used to resume sweeps after a lost runtime. Returns None when the repo or
+    folder does not exist yet.
+    """
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            allow_patterns=[f"{path_in_repo}/**"],
+            local_dir=str(local_dir),
+            token=resolve_hf_token(token),
+        )
+    except Exception as exc:  # Missing repo/permissions: start the sweep fresh.
+        print(f"Nothing restored from {repo_id}/{path_in_repo}: {exc}")
+        return None
+    restored = Path(local_dir) / path_in_repo
+    return restored if restored.exists() else None
+
+
 def upload_artifacts_folder(
     folder_path: str | Path,
     repo_id: str,

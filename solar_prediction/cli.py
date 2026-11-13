@@ -81,6 +81,22 @@ def _run_hyperparameters(args: argparse.Namespace, preprocessor) -> Dict[str, An
     }
 
 
+def _git_commit() -> str | None:
+    """Commit of the installed source tree, for tracing artifacts back to code."""
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _load_dataframe(data_path: Path) -> pd.DataFrame:
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
@@ -231,6 +247,7 @@ def command_train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "horizon_steps": args.horizon_steps,
         "hyperparameters": _run_hyperparameters(args, data.preprocessor),
+        "git_commit": _git_commit(),
         "feature_columns": feature_cols,
         "metrics": metrics,
         "metrics_scope": "validation",
@@ -303,6 +320,7 @@ def command_compare(args: argparse.Namespace) -> None:
                 "seed": args.seed,
                 "horizon_steps": args.horizon_steps,
                 "hyperparameters": _run_hyperparameters(args, data.preprocessor),
+                "git_commit": _git_commit(),
                 "feature_columns": feature_cols,
                 "metrics": eval_metrics,
                 "metrics_scope": "test",

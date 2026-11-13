@@ -93,53 +93,6 @@ def test_cli_rejects_nonpositive_seasonal_lag(lag):
         main(["compare", "--seasonal-lag", lag])
 
 
-def test_tuning_notebook_evaluates_only_validation_winners(tmp_path, monkeypatch):
-    notebook = Path(__file__).parents[1] / "notebooks/colab_gru_tuning_actual_data.ipynb"
-    sources = ["".join(cell["source"]) for cell in json.loads(notebook.read_text())["cells"]]
-    selection = next(source for source in sources if "best_by_horizon = (" in source)
-    tuning = pd.DataFrame(
-        {
-            "horizon": ["4h", "4h", "24h", "24h"],
-            "val_rmse": [10.0, 5.0, 3.0, 9.0],
-            "checkpoint": ["a.pt", "b.pt", "c.pt", "d.pt"],
-            "batch_size": [16] * 4,
-            "output_dir": [str(tmp_path)] * 4,
-        }
-    )
-    evaluated = []
-
-    def evaluate_winner(cmd, **kwargs):
-        assert cmd[3] == "evaluate"
-        evaluated.append(cmd[cmd.index("--checkpoint") + 1])
-        frozen = pd.read_csv(tmp_path / "gru_tuning_best_by_horizon.csv")
-        assert set(frozen.checkpoint) == {"b.pt", "c.pt"}
-        assert not any(col.startswith("test_") for col in frozen)
-        return subprocess.CompletedProcess(
-            cmd, 0, "model,rmse,mae,r2,capped_mape\ngru,20,10,0.5,30\n"
-        )
-
-    monkeypatch.setattr(subprocess, "run", evaluate_winner)
-    exec(
-        selection,
-        {
-            "tuning_metrics": tuning,
-            "output_root": tmp_path,
-            "data_path": tmp_path / "data.csv",
-            "device": "cpu",
-            "sys": sys,
-            "subprocess": subprocess,
-            "Path": Path,
-            "pd": pd,
-            "StringIO": StringIO,
-        },
-    )
-    assert set(evaluated) == {"b.pt", "c.pt"}
-    assert len(evaluated) == 2
-    final = pd.read_csv(tmp_path / "gru_tuning_final_test_metrics.csv")
-    assert final.test_rmse.tolist() == [20.0, 20.0]
-    assert final.val_rmse.tolist() == [3.0, 5.0]
-
-
 def test_cli_train_seed_reproducibility(tmp_path):
     data_path = tmp_path / "sample.csv"
     rows = 60

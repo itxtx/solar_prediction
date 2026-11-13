@@ -26,7 +26,7 @@ For a no-local-training check, open `notebooks/colab_smoke_check.ipynb` in Colab
 
 - `notebooks/colab_full_run_actual_data.ipynb`: single-horizon baseline and model comparison.
 - `notebooks/colab_horizon_sweep_actual_data.ipynb`: 15-minute, 1-hour, 4-hour, and 24-hour forecast horizon sweep.
-- `notebooks/colab_gru_tuning_actual_data.ipynb`: validation-only GRU hyperparameter selection on 4-hour and 24-hour horizons followed by one-shot test evaluation of the winners.
+- `notebooks/colab_gru_tuning_actual_data.ipynb`: resumable two-stage GRU sweep on 4-hour and 24-hour horizons over 3 seeds. Stage 1 varies the input window and `--target-time-features`; stage 2 varies hidden size, layers, and learning rate on the stage-1 winner. Winners are chosen by mean validation RMSE and frozen before a one-shot test evaluation against persistence and seasonal-naive baselines, over all hours and daylight hours only. Finished runs are uploaded as they complete and restored from the Hub on rerun.
 
 The comparison command prints a CSV-style metrics table:
 
