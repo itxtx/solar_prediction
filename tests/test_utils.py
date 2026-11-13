@@ -207,3 +207,35 @@ class TestUtilityEdgeCases:
         # Should be identical
         for scalar, vectorized in zip(scalar_results, vectorized_results):
             assert abs(scalar - vectorized) < 1e-10
+
+    def test_config_yaml_roundtrip_and_benchmark_bare_filename(self, tmp_path, monkeypatch):
+        from solar_prediction.config import (
+            SolarPredictionConfig,
+            load_config_from_file,
+            save_config_to_file,
+        )
+        from solar_prediction.benchmark import (
+            BenchmarkResult,
+            BenchmarkTracker,
+            save_benchmark_results,
+            get_benchmark_tracker,
+        )
+
+        cfg = SolarPredictionConfig()
+        yaml_path = tmp_path / "config.yaml"
+        save_config_to_file(cfg, yaml_path)
+        loaded = load_config_from_file(yaml_path)
+        assert loaded.plotting.default_figsize == cfg.plotting.default_figsize
+
+        monkeypatch.chdir(tmp_path)
+        tracker = BenchmarkTracker()
+        tracker.set_csv_file("bare_benchmark.csv")
+        tracker.add_result(BenchmarkResult(function_name="fn", stage_name="stage", execution_time=0.01))
+        assert (tmp_path / "bare_benchmark.csv").exists()
+
+        get_benchmark_tracker().add_result(
+            BenchmarkResult(function_name="fn", stage_name="stage", execution_time=0.01)
+        )
+        save_benchmark_results("saved_bare.csv")
+        assert (tmp_path / "saved_bare.csv").exists()
+

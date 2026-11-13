@@ -91,19 +91,24 @@ def _compute_sequence_split_metadata(n_rows: int, sequence_cfg: SequenceConfig) 
         )
 
     n_sequences = n_rows - sequence_cfg.window_size - sequence_cfg.horizon_steps + 1
+    purge = max(sequence_cfg.horizon_steps - 1, 0)
     n_test = int(math.ceil(sequence_cfg.test_size * n_sequences))
-    n_train_val = n_sequences - n_test
+    n_train_val = n_sequences - n_test - purge
     if n_train_val <= 0:
-        raise ValueError("No train/validation sequences remain after test split.")
+        raise ValueError("No train/validation sequences remain after test split and horizon purge.")
 
-    n_val = (
-        int(math.ceil(sequence_cfg.val_size_from_train_val * n_train_val))
-        if sequence_cfg.val_size_from_train_val > 0 and n_train_val > 1
-        else 0
-    )
-    n_train = n_train_val - n_val
+    if sequence_cfg.val_size_from_train_val > 0 and n_train_val - purge > 1:
+        n_val = int(math.ceil(sequence_cfg.val_size_from_train_val * (n_train_val - purge)))
+        n_train = n_train_val - purge - n_val
+    else:
+        n_val = 0
+        n_train = n_train_val
     if n_train <= 0:
-        raise ValueError("No training sequences remain after validation split.")
+        raise ValueError("No training sequences remain after validation split and horizon purge.")
+
+    val_start = n_train + (purge if n_val > 0 else 0)
+    val_end = val_start + n_val
+    test_start = val_end + purge
 
     window_size = sequence_cfg.window_size
     feature_fit_end = window_size + n_train - 1
@@ -114,13 +119,14 @@ def _compute_sequence_split_metadata(n_rows: int, sequence_cfg: SequenceConfig) 
         "n_rows": n_rows,
         "window_size": window_size,
         "horizon_steps": sequence_cfg.horizon_steps,
+        "purge_sequences": purge,
         "n_sequences": n_sequences,
         "n_train_sequences": n_train,
         "n_val_sequences": n_val,
         "n_test_sequences": n_test,
         "train_sequence_range": (0, n_train),
-        "val_sequence_range": (n_train, n_train + n_val),
-        "test_sequence_range": (n_train + n_val, n_sequences),
+        "val_sequence_range": (val_start, val_end),
+        "test_sequence_range": (test_start, n_sequences),
         "feature_fit_row_range": (0, feature_fit_end),
         "target_fit_row_range": (target_fit_start, target_fit_end),
         "feature_fit_indices": np.arange(0, feature_fit_end, dtype=int),
@@ -409,8 +415,9 @@ def _engineer_time_features(
                 negative_mask, time_since_sunrise + minutes_in_day, time_since_sunrise
             )
 
-            # Vectorized daylight position calculation
-            df[STD_DAYLIGHT_POSITION] = np.clip(time_since_sunrise / daylight_duration_safe, 0, 1)
+            # Vectorized daylight position calculation (0 at night and sunrise, 1 at sunset)
+            daylight_pos = np.clip(time_since_sunrise / daylight_duration_safe, 0, 1)
+            df[STD_DAYLIGHT_POSITION] = np.where(df[STD_IS_DAYLIGHT] > 0, daylight_pos, 0.0)
             df[STD_DAYLIGHT_POSITION] = df[STD_DAYLIGHT_POSITION].fillna(0)
 
             df[STD_TIME_SINCE_SUNRISE] = time_since_sunrise
@@ -426,9 +433,10 @@ def _engineer_time_features(
             )
     # Fallback to raw columns if they exist and parsed ones are missing
     elif input_cfg.daylength_col_raw in df.columns and STD_DAYLIGHT_MINUTES not in df.columns:
-        df[STD_DAYLIGHT_MINUTES] = (
-            pd.to_numeric(df[input_cfg.daylength_col_raw], errors="coerce") * 60
-        )  # Assuming dayLength is in hours
+        raw_daylength = pd.to_numeric(df[input_cfg.daylength_col_raw], errors="coerce")
+        # Convert hours to minutes only if values are on an hour scale (<= 24);
+        # datasets like solar_weather.csv already store dayLength in minutes (450-1020).
+        df[STD_DAYLIGHT_MINUTES] = np.where(raw_daylength <= 24.0, raw_daylength * 60.0, raw_daylength)
 
     if input_cfg.is_sun_col_raw in df.columns and STD_IS_DAYLIGHT not in df.columns:
         df[STD_IS_DAYLIGHT] = df[input_cfg.is_sun_col_raw].astype(float)
@@ -501,16 +509,14 @@ def _apply_target_transformations(
         moderate_mask = (radiation_values >= cfg.piecewise_night_threshold) & (
             radiation_values < cfg.piecewise_moderate_threshold
         )
-        # Value at the end of night_mask (just before piecewise_night_threshold)
-        val_at_night_thresh_end = np.log1p(cfg.piecewise_night_threshold - 1e-6)  # Approx
+        val_at_night_thresh_end = np.log1p(cfg.piecewise_night_threshold)
         transformed[moderate_mask] = val_at_night_thresh_end + cfg.piecewise_moderate_slope * (
             radiation_values[moderate_mask] - cfg.piecewise_night_threshold
         )
 
         high_mask = radiation_values >= cfg.piecewise_moderate_threshold
-        # Value at the end of moderate_mask
         val_at_moderate_thresh_end = val_at_night_thresh_end + cfg.piecewise_moderate_slope * (
-            cfg.piecewise_moderate_threshold - cfg.piecewise_night_threshold - 1e-6
+            cfg.piecewise_moderate_threshold - cfg.piecewise_night_threshold
         )
         transformed[high_mask] = val_at_moderate_thresh_end + cfg.piecewise_high_slope * (
             radiation_values[high_mask] - cfg.piecewise_moderate_threshold
@@ -758,14 +764,15 @@ def _select_final_features(
 
     base_features = _get_base_feature_set(df.columns, feature_cfg)
 
-    # Add low target indicator if it was created (its name depends on original standardized target)
-    # This logic is a bit indirect here. It's better if _engineer_other_domain_features returns the name.
-    # Assuming it follows a pattern like f"{STD_SOME_TARGET}_is_low"
-    possible_low_indicator_cols = [col for col in df.columns if col.endswith("_is_low")]
-    for lic in possible_low_indicator_cols:
-        if lic not in base_features:
-            base_features.append(lic)
-            logger.info(f"Including low target indicator '{lic}' in features.")
+    # Add low target indicator if it was created and target history is allowed in features
+    if feature_cfg.include_target_history:
+        possible_low_indicator_cols = [col for col in df.columns if col.endswith("_is_low")]
+        for lic in possible_low_indicator_cols:
+            if lic not in base_features:
+                base_features.append(lic)
+                logger.info(f"Including low target indicator '{lic}' in features.")
+    else:
+        base_features = [col for col in base_features if not col.endswith("_is_low")]
 
     # Ensure the actual target column (after transforms, before scaling) is NOT in features
     final_feature_list = [
@@ -820,8 +827,8 @@ def _scale_data(
             scaled_df_data[col] = np.nan
             continue
 
-        feature_values = df[col].ffill().bfill().values.reshape(-1, 1)  # Fill NaNs before scaling
-        feature_fit_values = df[col].ffill().bfill().iloc[feature_fit_indices].values.reshape(-1, 1)
+        feature_values = df[col].ffill().values.reshape(-1, 1)  # Fill NaNs causally before scaling
+        feature_fit_values = df[col].ffill().iloc[feature_fit_indices].values.reshape(-1, 1)
         scaler = FeatureScalerClass()
         scaler.fit(feature_fit_values)
         scaled_df_data[col] = scaler.transform(feature_values).flatten()
@@ -855,9 +862,9 @@ def _scale_data(
         TargetScalerClass = StandardScaler if scaling_cfg.standardize_features else MinMaxScaler
         logger.info(f"Using {TargetScalerClass.__name__} for target '{target_col_to_scale}'.")
 
-    target_values = df[target_col_to_scale].ffill().bfill().values.reshape(-1, 1)
+    target_values = df[target_col_to_scale].ffill().values.reshape(-1, 1)
     target_fit_values = (
-        df[target_col_to_scale].ffill().bfill().iloc[target_fit_indices].values.reshape(-1, 1)
+        df[target_col_to_scale].ffill().iloc[target_fit_indices].values.reshape(-1, 1)
     )
     target_scaler_instance = TargetScalerClass()
 

@@ -138,3 +138,46 @@ def test_tuning_notebook_evaluates_only_validation_winners(tmp_path, monkeypatch
     final = pd.read_csv(tmp_path / "gru_tuning_final_test_metrics.csv")
     assert final.test_rmse.tolist() == [20.0, 20.0]
     assert final.val_rmse.tolist() == [3.0, 5.0]
+
+
+def test_cli_train_seed_reproducibility(tmp_path):
+    data_path = tmp_path / "sample.csv"
+    rows = 60
+    df = pd.DataFrame(
+        {
+            "Time": pd.date_range("2023-01-01", periods=rows, freq="h"),
+            "GHI": np.maximum(0, np.sin(np.linspace(0, 4 * np.pi, rows)) * 500),
+            "temp": np.linspace(5, 25, rows),
+        }
+    )
+    df.to_csv(data_path, index=False)
+
+    out1 = tmp_path / "run1"
+    out2 = tmp_path / "run2"
+    for out in (out1, out2):
+        main(
+            [
+                "train",
+                "--model",
+                "gru",
+                "--data",
+                str(data_path),
+                "--epochs",
+                "2",
+                "--hidden-dim",
+                "4",
+                "--batch-size",
+                "8",
+                "--seed",
+                "123",
+                "--output",
+                str(out),
+                "--quiet",
+            ]
+        )
+
+    meta1 = json.loads((out1 / "gru_metadata.json").read_text())
+    meta2 = json.loads((out2 / "gru_metadata.json").read_text())
+    assert meta1["seed"] == 123
+    assert meta1["metrics"] == meta2["metrics"]
+

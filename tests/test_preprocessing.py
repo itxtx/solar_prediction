@@ -73,7 +73,9 @@ def test_target_history_can_be_disabled(frame):
             cfg.sequences,
         )
         assert "Radiation_history" not in data.preprocessor.feature_columns
+        assert "Radiation_is_low" not in data.preprocessor.feature_columns
         assert "Radiation" not in data.preprocessor.feature_columns
+        assert data.preprocessor.low_threshold is None
 
 
 @pytest.mark.parametrize("model_name", ["lstm", "gru"])
@@ -268,3 +270,85 @@ def test_checkpoint_and_cli_evaluation_use_saved_preprocessor(
     save_checkpoint(model, str(path), model.params, train_cfg, model.history, {})
     with pytest.raises(ValueError, match="Retrain"):
         load_forecaster(str(path))
+
+
+def test_multi_horizon_split_purges_overlapping_targets(frame):
+    cfg = get_config()
+    window, horizon = 3, 4
+    data = prepare_dataset(
+        frame,
+        cfg.input,
+        cfg.transformation,
+        cfg.features,
+        cfg.scaling,
+        SequenceConfig(window_size=window, horizon_steps=horizon),
+    )
+    train_last_target = data.train.target_indices[-1]
+    val_first_origin = data.val.target_indices[0] - horizon
+    assert val_first_origin >= train_last_target
+
+    val_last_target = data.val.target_indices[-1]
+    test_first_origin = data.test.target_indices[0] - horizon
+    assert test_first_origin >= val_last_target
+
+
+def test_log_and_piecewise_transforms_roundtrip_zero_and_thresholds():
+    cfg = get_config()
+    df = pd.DataFrame(
+        {
+            "Time": pd.date_range("2023-01-01", periods=60, freq="h"),
+            "GHI": np.concatenate(
+                [
+                    np.zeros(15),
+                    np.array([9.999, 10.0, 10.001, 199.999, 200.0, 200.001]),
+                    np.linspace(1.0, 500.0, 39),
+                ]
+            ),
+            "temp": np.linspace(10.0, 30.0, 60),
+        }
+    )
+    for updates in (
+        {"use_log_transform": True},
+        {"use_piecewise_transform_target": True},
+    ):
+        data = prepare_dataset(
+            df,
+            cfg.input,
+            cfg.transformation.model_copy(update=updates),
+            cfg.features,
+            cfg.scaling,
+            SequenceConfig(window_size=3, horizon_steps=1),
+        )
+        decoded = data.preprocessor.inverse_target(data.train.y)
+        np.testing.assert_allclose(decoded, data.train.actuals, atol=1e-5, rtol=1e-5)
+
+
+def test_daylight_position_night_zero_and_daylength_minutes():
+    cfg = get_config()
+    hi_df = pd.DataFrame(
+        {
+            "UNIXTime": [1472724008, 1472767208],
+            "Data": ["9/1/2016 12:00:00 AM"] * 2,
+            "Time": ["00:00:08", "12:00:08"],
+            "GHI": [0.0, 500.0],
+            "TimeSunRise": ["06:00:00"] * 2,
+            "TimeSunSet": ["18:00:00"] * 2,
+        }
+    )
+    norm_hi, _, _ = _initial_df_setup(hi_df, cfg.input)
+    eng_hi = _engineer_time_features(norm_hi, cfg.features, cfg.input)
+    assert eng_hi["DaylightPosition"].iloc[0] == pytest.approx(0.0)
+    assert eng_hi["DaylightPosition"].iloc[1] == pytest.approx(0.5, abs=1e-3)
+
+    pl_df = pd.DataFrame(
+        {
+            "Time": pd.date_range("2023-06-01", periods=2, freq="h"),
+            "GHI": [0.0, 300.0],
+            "dayLength": [960.0, 16.0],
+            "sunlightTime": [0.0, 480.0],
+        }
+    )
+    norm_pl, _, _ = _initial_df_setup(pl_df, cfg.input)
+    eng_pl = _engineer_time_features(norm_pl, cfg.features, cfg.input)
+    assert eng_pl["DaylightMinutes"].tolist() == pytest.approx([960.0, 960.0])
+

@@ -77,7 +77,7 @@ class DataTransformationConfig(BaseModel):
     )
 
     # Log transformation
-    min_radiation_for_log: float = Field(0.1, description="Floor before log(GHI)")
+    min_radiation_for_log: float = Field(0.0, description="Floor before log(GHI)")
     log_transform_offset: float = Field(1e-6, description="Epsilon for log(x + epsilon)")
     clip_log_transformed_target: bool = Field(False, description="Clip log-transformed target")
     log_clip_lower_percentile: float = Field(1.0, description="Lower percentile for log clipping")
@@ -544,7 +544,7 @@ def save_config_to_file(config: SolarPredictionConfig, config_path: Union[str, P
     config_path = Path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    config_dict = config.dict()
+    config_dict = config.model_dump(mode="json")
 
     with open(config_path, "w") as f:
         if config_path.suffix.lower() in [".yml", ".yaml"]:

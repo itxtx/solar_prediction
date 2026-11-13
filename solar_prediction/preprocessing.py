@@ -111,8 +111,14 @@ class WeatherPreprocessor:
         """Learn from an explicitly supplied training frame only."""
         self.input_cfg = deepcopy(_resolve_input_config(train_data, self.input_cfg))
         frame, target = self._normalize(train_data)
-        indices = np.arange(len(frame))
-        self._fit_frame(frame, target, indices, indices)
+        window, horizon = self.sequence_cfg.window_size, self.sequence_cfg.horizon_steps
+        if len(frame) >= window + horizon:
+            feature_indices = np.arange(0, len(frame) - horizon + 1)
+            target_indices = np.arange(window + horizon - 1, len(frame))
+        else:
+            feature_indices = np.arange(len(frame))
+            target_indices = np.arange(len(frame))
+        self._fit_frame(frame, target, feature_indices, target_indices)
         return self
 
     def observed_targets(self, data: pd.DataFrame) -> np.ndarray:
@@ -121,17 +127,22 @@ class WeatherPreprocessor:
         return frame[target].to_numpy(dtype=float)
 
     def _fit_frame(self, frame, target, feature_indices, target_indices):
+        frame = frame.copy()
         self.target_column = target
-        frame, self.transformed_target, self.structural_transforms = _apply_target_transformations(
-            frame.copy(), target, self.transform_cfg, target_indices
-        )
         training_values = frame[target].iloc[feature_indices]
         self.low_threshold = None
-        if self.feature_cfg.create_low_target_indicator and training_values.nunique() > 1:
+        if (
+            self.feature_cfg.include_target_history
+            and self.feature_cfg.create_low_target_indicator
+            and training_values.nunique() > 1
+        ):
             self.low_threshold = training_values.quantile(
                 self.feature_cfg.low_target_indicator_quantile
             )
         self._add_indicator(frame)
+        frame, self.transformed_target, self.structural_transforms = _apply_target_transformations(
+            frame, target, self.transform_cfg, target_indices
+        )
         self.feature_columns = _select_final_features(
             frame, self.feature_cfg, self.transformed_target, target
         )
@@ -187,6 +198,7 @@ class WeatherPreprocessor:
         frame, target = self._normalize(data)
         if target != self.target_column:
             raise ValueError(f"Expected target '{self.target_column}', got '{target}'.")
+        self._add_indicator(frame)
         frame, _, _ = _apply_target_transformations(
             frame,
             target,
@@ -194,7 +206,6 @@ class WeatherPreprocessor:
             np.array([], dtype=int),
             fitted_transforms=self.structural_transforms,
         )
-        self._add_indicator(frame)
         self._fill_features(frame)
         columns = self.feature_columns + [self.transformed_target]
         if not np.isfinite(frame[columns].to_numpy(dtype=float)).all():
@@ -324,8 +335,8 @@ def decode_target(
         elif transform["type"] == "piecewise":
             params = transform["params"]
             night, moderate = params["night_thresh"], params["moderate_thresh"]
-            night_end = np.log1p(night - 1e-6)
-            moderate_end = night_end + params["moderate_slope"] * (moderate - night - 1e-6)
+            night_end = np.log1p(night)
+            moderate_end = night_end + params["moderate_slope"] * (moderate - night)
             decoded = np.empty_like(result)
             low = result <= night_end
             mid = (result > night_end) & (result <= moderate_end)

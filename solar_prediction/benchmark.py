@@ -52,7 +52,7 @@ class BenchmarkTracker:
         self._csv_file = csv_file
         # Create CSV with headers if it doesn't exist
         if not os.path.exists(csv_file):
-            os.makedirs(os.path.dirname(csv_file), exist_ok=True)
+            Path(csv_file).parent.mkdir(parents=True, exist_ok=True)
             with open(csv_file, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(
@@ -293,7 +293,7 @@ def save_benchmark_results(filename: str):
         return
 
     # Ensure directory exists
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
 
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)

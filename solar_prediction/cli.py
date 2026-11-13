@@ -6,10 +6,12 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import random
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
+import torch
 
 from .config import get_config
 from .preprocessing import prepare_dataset
@@ -33,6 +35,14 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
     return parsed
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _load_dataframe(data_path: Path) -> pd.DataFrame:
@@ -133,6 +143,7 @@ def _save_model(model, checkpoint, train_cfg, metrics, preprocessor, metrics_sco
 
 
 def command_train(args: argparse.Namespace) -> None:
+    _seed_everything(args.seed)
     output_dir = Path(args.output)
     data = _prepare(Path(args.data), horizon_steps=args.horizon_steps)
     feature_cols, transform_info = data.preprocessor.feature_columns, data.transform_info
@@ -158,6 +169,7 @@ def command_train(args: argparse.Namespace) -> None:
         "model": args.model,
         "checkpoint": str(checkpoint),
         "data": str(args.data),
+        "seed": args.seed,
         "feature_columns": feature_cols,
         "metrics": metrics,
         "metrics_scope": "validation",
@@ -205,6 +217,7 @@ def command_compare(args: argparse.Namespace) -> None:
     metrics_by_model = {name: _metrics(actual, pred) for name, pred in baselines.items()}
 
     for model_name in ("lstm", "gru"):
+        _seed_everything(args.seed)
         model, train_cfg = _model_and_configs(
             model_name,
             input_dim=data.train.X.shape[2],
@@ -225,6 +238,7 @@ def command_compare(args: argparse.Namespace) -> None:
                 "model": model_name,
                 "checkpoint": str(checkpoint),
                 "data": str(args.data),
+                "seed": args.seed,
                 "horizon_steps": args.horizon_steps,
                 "feature_columns": feature_cols,
                 "metrics": eval_metrics,
@@ -258,6 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
             type=_positive_int,
             default=1,
             help="Forecast horizon in rows after the input window",
+        )
+        subparser.add_argument(
+            "--seed",
+            type=int,
+            default=42,
+            help="Random seed for reproducible training",
         )
         subparser.add_argument("--quiet", action="store_true", help="Suppress INFO logs")
 

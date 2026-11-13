@@ -99,11 +99,11 @@ def example_unified_api_usage():
         logger.info("Processing data with unified API...")
         result = prepare_weather_data_chunked(
             data_source=str(data_path),  # File path
-            input_cfg=config.data_input,
-            transform_cfg=config.data_transformation,
+            input_cfg=config.input,
+            transform_cfg=config.transformation,
             feature_cfg=config.features,
             scaling_cfg=config.scaling,
-            sequence_cfg=config.sequence,
+            sequence_cfg=config.sequences,
             chunked_config=chunked_config,
             max_chunks=2  # Limit to 2 chunks for demonstration
         )
