@@ -161,6 +161,7 @@ def collect_runs(root: Path, model: str = "gru") -> pd.DataFrame:
         if not params:
             continue  # Runs from before hyperparameters were recorded.
         row = {
+            "model": model,
             "horizon": path.parents[2].name,
             "run_name": path.parents[1].name,
             "seed": params["seed"],
@@ -205,17 +206,20 @@ def _python(value):
     return value.item() if isinstance(value, np.generic) else value
 
 
-def evaluate_test(
-    checkpoint: str | Path, data_path: str | Path, *, seasonal_lag: int, device="cpu"
-):
-    """Test metrics for a checkpoint and the naive baselines on the same targets.
+BASELINES = ("persistence", "seasonal_naive")
 
-    Returns ``{"all": {...}, "daylight": {...}}``; each maps model/baseline names
-    to metric dicts. Daylight rows are those whose target row has IsDaylight=1
-    (astronomical), falling back to observed target > 0 if unavailable.
+
+def test_predictions(
+    checkpoint: str | Path, data_path: str | Path, *, seasonal_lag: int, device="cpu"
+) -> pd.DataFrame:
+    """Decoded test-split forecasts of a checkpoint and the naive baselines.
+
+    One row per test target: ``timestamp``, ``target_index``, ``actual``,
+    ``daylight`` (target row has IsDaylight=1, which is astronomical; falls
+    back to observed target > 0), ``model``, ``persistence``, ``seasonal_naive``.
     """
     from .checkpointing import load_forecaster
-    from .evaluation import baseline_predictions, evaluate_forecaster, regression_metrics
+    from .evaluation import baseline_predictions, evaluate_forecaster
 
     model, preprocessor = load_forecaster(str(checkpoint), device)
     raw = pd.read_csv(data_path)
@@ -228,18 +232,112 @@ def evaluate_test(
         horizon_steps=preprocessor.sequence_cfg.horizon_steps,
         seasonal_lag=seasonal_lag,
     )
-    predictions = {"model": result.predictions.ravel(), **baselines}
     frame, _ = preprocessor._normalize(raw)
     if "IsDaylight" in frame:
         daylight = frame["IsDaylight"].to_numpy()[test.target_indices] > 0.5
     else:
         daylight = actual > 0
+    timestamps = (
+        frame["Timestamp"].to_numpy()[test.target_indices]
+        if "Timestamp" in frame
+        else np.full(len(actual), np.datetime64("NaT"))
+    )
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "target_index": test.target_indices,
+            "actual": actual,
+            "daylight": daylight,
+            "model": result.predictions.ravel(),
+            **baselines,
+        }
+    )
+
+
+def prediction_metrics(predictions: pd.DataFrame, columns=("model", *BASELINES)):
+    """``{"all": {...}, "daylight": {...}}`` mapping each column to its metrics."""
+    from .evaluation import regression_metrics
+
+    daylight = predictions["daylight"].to_numpy(dtype=bool)
+    actual = predictions["actual"].to_numpy()
     return {
         scope: {
-            name: regression_metrics(actual[mask], pred[mask]) for name, pred in predictions.items()
+            name: regression_metrics(actual[mask], predictions[name].to_numpy()[mask])
+            for name in columns
         }
-        for scope, mask in (("all", np.ones_like(daylight, dtype=bool)), ("daylight", daylight))
+        for scope, mask in (("all", np.ones_like(daylight)), ("daylight", daylight))
     }
+
+
+def evaluate_test(
+    checkpoint: str | Path, data_path: str | Path, *, seasonal_lag: int, device="cpu"
+):
+    """Test metrics for a checkpoint and the naive baselines on the same targets.
+
+    Returns ``{"all": {...}, "daylight": {...}}``; each maps ``model`` and the
+    baseline names to metric dicts.
+    """
+    return prediction_metrics(
+        test_predictions(checkpoint, data_path, seasonal_lag=seasonal_lag, device=device)
+    )
+
+
+def runs_test_metrics(runs: pd.DataFrame, data_path, *, seasonal_lag, device):
+    """Score every run in ``runs`` on test; keep forecasts of each group's first seed.
+
+    ``runs`` needs ``horizon``, ``horizon_steps``, ``model``, ``seed`` and
+    ``checkpoint`` columns (as from :func:`collect_runs`). Returns long-form
+    metrics (``model`` is the network name or a baseline name) and a dict
+    ``{horizon: DataFrame}`` of first-seed test forecasts with one column per
+    network plus ``actual``, ``daylight`` and the baselines.
+    """
+    rows, forecasts = [], {}
+    for (horizon, steps, network), group in runs.groupby(
+        ["horizon", "horizon_steps", "model"], sort=False
+    ):
+        for _, run in group.sort_values("seed").iterrows():
+            predictions = test_predictions(
+                run.checkpoint, data_path, seasonal_lag=seasonal_lag, device=device
+            )
+            if run.seed == group.seed.min():
+                merged = forecasts.get(horizon)
+                if merged is None:
+                    merged = predictions.drop(columns="model")
+                elif not np.array_equal(merged.target_index, predictions.target_index):
+                    raise ValueError(f"Networks for {horizon} were scored on different targets")
+                merged[network] = predictions["model"].to_numpy()
+                forecasts[horizon] = merged
+            scores = prediction_metrics(predictions)
+            for scope, by_name in scores.items():
+                for name, metrics in by_name.items():
+                    rows.append(
+                        {
+                            "horizon": horizon,
+                            "horizon_steps": steps,
+                            "model": network if name == "model" else name,
+                            "seed": run.seed,
+                            "scope": scope,
+                            **{f"test_{m}": metrics[m] for m in METRICS},
+                        }
+                    )
+    metrics = pd.DataFrame(rows)
+    # Baselines do not depend on the network or seed; keep one copy each.
+    return metrics.drop_duplicates(["horizon", "model", "scope", "seed"]), forecasts
+
+
+def summarize_test(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Mean/std of test metrics per (horizon, scope, model) over seeds."""
+    return (
+        metrics.groupby(["horizon", "horizon_steps", "scope", "model"])
+        .agg(
+            n_seeds=("seed", "nunique"),
+            **{f"test_{m}_mean": (f"test_{m}", "mean") for m in METRICS},
+            **{f"test_{m}_std": (f"test_{m}", "std") for m in METRICS},
+        )
+        .reset_index()
+        .sort_values(["horizon_steps", "scope", "test_rmse_mean"])
+        .reset_index(drop=True)
+    )
 
 
 def winner_test_metrics(
@@ -279,5 +377,9 @@ __all__ = [
     "best_config",
     "config_from_row",
     "evaluate_test",
+    "test_predictions",
+    "prediction_metrics",
+    "runs_test_metrics",
+    "summarize_test",
     "winner_test_metrics",
 ]
