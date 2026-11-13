@@ -181,3 +181,64 @@ def test_cli_train_seed_reproducibility(tmp_path):
     assert meta1["seed"] == 123
     assert meta1["metrics"] == meta2["metrics"]
 
+
+def test_hf_hub_helpers_and_notebooks_use_hf(tmp_path, monkeypatch):
+    import types
+    from solar_prediction import hf_hub
+
+    monkeypatch.setenv("HF_TOKEN", "hf_test_token")
+    assert hf_hub.resolve_hf_token() == "hf_test_token"
+    assert hf_hub.resolve_hf_token("explicit_token") == "explicit_token"
+
+    calls = {}
+
+    def fake_hf_hub_download(**kwargs):
+        calls["download"] = kwargs
+        out = Path(kwargs["local_dir"]) / kwargs["filename"]
+        out.write_text("Time,GHI\n2023-01-01,0.0\n")
+        return str(out)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            calls["api_token"] = token
+
+        def create_repo(self, **kwargs):
+            calls["create_repo"] = kwargs
+
+        def upload_folder(self, **kwargs):
+            calls["upload_folder"] = kwargs
+            return "https://huggingface.co/itxtx/solar-prediction-artifacts/tree/main"
+
+    fake_module = types.SimpleNamespace(hf_hub_download=fake_hf_hub_download, HfApi=FakeHfApi)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+
+    downloaded = hf_hub.download_dataset_file(
+        "itxtx/solar-prediction-data",
+        "solar_weather.csv",
+        local_dir=tmp_path / "data",
+    )
+    assert downloaded.exists()
+    assert calls["download"]["repo_type"] == "dataset"
+    assert calls["download"]["token"] == "hf_test_token"
+
+    artifacts_dir = tmp_path / "artifacts" / "run1"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "metrics.json").write_text("{}")
+
+    url = hf_hub.upload_artifacts_folder(
+        artifacts_dir,
+        "itxtx/solar-prediction-artifacts",
+        path_in_repo="run1",
+    )
+    assert "huggingface.co" in url
+    assert calls["create_repo"]["repo_type"] == "model"
+    assert calls["upload_folder"]["path_in_repo"] == "run1"
+
+    notebooks_dir = Path(__file__).parents[1] / "notebooks"
+    for nb_path in sorted(notebooks_dir.glob("*.ipynb")):
+        text = nb_path.read_text()
+        assert "google.colab import drive" not in text
+        assert "download_dataset_file" in text
+        assert "upload_artifacts_folder" in text
+
+
