@@ -10,6 +10,7 @@ Reproducible solar Global Horizontal Irradiance (GHI) forecasting with a leakage
 - Baseline comparison against persistence and seasonal naive forecasts.
 - LSTM and GRU sequence models with checkpoint save/load support.
 - A script-first workflow for reproducible training, evaluation, and comparison.
+- Resumable, multi-seed Colab sweeps with validation-only model selection and daylight-only test metrics.
 - A small Colab smoke notebook for verification without local training.
 
 ## Quick Start
@@ -24,8 +25,8 @@ solar-predict compare --data data/sample/SolarPrediction_sample.csv --epochs 1 -
 
 For a no-local-training check, open `notebooks/colab_smoke_check.ipynb` in Colab (which clones this GitHub repo directly, no Google Drive required). For the full dataset, the Colab notebooks download `solar_weather.csv` from a Hugging Face Dataset repo (`itxtx/solar-prediction-data` by default) and upload checkpoints, metrics, and plots to a Hugging Face Model repo (`itxtx/solar-prediction-artifacts` by default) using `HF_TOKEN`:
 
-- `notebooks/colab_full_run_actual_data.ipynb`: single-horizon baseline and model comparison.
-- `notebooks/colab_horizon_sweep_actual_data.ipynb`: 15-minute, 1-hour, 4-hour, and 24-hour forecast horizon sweep.
+- `notebooks/colab_full_run_actual_data.ipynb`: single-horizon baseline and model comparison (older single-seed workflow).
+- `notebooks/colab_horizon_sweep_actual_data.ipynb`: GRU and LSTM at 15-minute, 1-hour, 4-hour, and 24-hour horizons over 3 seeds with one shared configuration, scored on test against both baselines over all hours and daylight hours only. Saves test forecasts and the report plots below. Resumable like the tuning notebook.
 - `notebooks/colab_gru_tuning_actual_data.ipynb`: resumable two-stage GRU sweep on 4-hour and 24-hour horizons over 3 seeds. Stage 1 varies the input window and `--target-time-features`; stage 2 varies hidden size, layers, and learning rate on the stage-1 winner. Winners are chosen by mean validation RMSE and frozen before a one-shot test evaluation against persistence and seasonal-naive baselines, over all hours and daylight hours only. Finished runs are uploaded as they complete and restored from the Hub on rerun.
 
 The comparison command prints a CSV-style metrics table:
@@ -47,37 +48,71 @@ solar-predict evaluate --model lstm --checkpoint artifacts/lstm_model.pt --data 
 
 Generated checkpoints and metrics are written to `artifacts/`, which is intentionally ignored by Git.
 
-## Full-Data Colab Results
+`train` and `compare` also accept:
 
-The full-data Colab sweep below used `data/solar_weather.csv`, 15-minute rows, `epochs=50`, `hidden_dim=32`, `batch_size=256`, and `seasonal_lag=96`. Results are preliminary single-run checks rather than a final benchmark.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--horizon-steps` | 1 | Forecast this many rows after the end of the input window |
+| `--window-size` | config (12) | Input rows per sequence; 12 rows is 3 hours of 15-minute data |
+| `--target-time-features` | off | Add calendar and sun-schedule features at the target time, plus the target observed whole days before it |
+| `--num-layers` | 1 | Stacked recurrent layers |
+| `--dropout` | 0.1 | Dropout before the output head (and between layers when there are 2 or more) |
+| `--learning-rate` | 0.001 | Adam learning rate |
+| `--patience` | 10 | Early stopping: stop after this many epochs without validation improvement; `--epochs` is the cap |
 
-| Horizon | Best baseline RMSE / R2 | LSTM RMSE / R2 | GRU RMSE / R2 | Takeaway |
-| --- | ---: | ---: | ---: | --- |
-| 15 min | 8.41 / 0.976 | 16.79 / 0.903 | 16.48 / 0.906 | Persistence is the right baseline to beat; one-step forecasting is mostly copying the latest value. |
-| 1 h | 21.03 / 0.847 | 17.85 / 0.890 | 17.44 / 0.895 | GRU/LSTM start to outperform persistence. |
-| 4 h | 30.09 / 0.688 | 20.28 / 0.858 | 19.89 / 0.864 | Recurrent models clearly beat persistence and seasonal naive. |
-| 24 h | 30.09 / 0.688 | 24.26 / 0.797 | 23.61 / 0.808 | GRU/LSTM beat same-time-yesterday forecasting. |
+Each run's metadata records these hyperparameters and the git commit.
+
+## Full-Data Results
+
+Test-split results on `solar_weather.csv` (15-minute rows, 2017-01 to 2022-08, chronological 60/20/20 split) from `colab_horizon_sweep_actual_data.ipynb`. Every network uses the same configuration: a 12-row (3-hour) window, target-time features, hidden size 32, one layer, early stopping. Values are mean ± standard deviation over 3 seeds; RMSE is in the dataset's GHI units.
+
+**Daylight hours only** (target time between sunrise and sunset):
+
+| Horizon | Best baseline RMSE / R² | GRU RMSE / R² | LSTM RMSE / R² | GRU skill |
+| --- | ---: | ---: | ---: | ---: |
+| 15 min | 11.48 / 0.961 (persistence) | **9.53 ± 0.01** / 0.973 | 10.15 ± 0.12 / 0.970 | 17% |
+| 1 h | 28.63 / 0.758 (persistence) | **19.18 ± 0.08** / 0.892 | 19.50 ± 0.16 / 0.888 | 33% |
+| 4 h | 41.08 / 0.502 (seasonal naive) | **26.57 ± 0.17** / 0.792 | 26.84 ± 0.32 / 0.788 | 35% |
+| 24 h | 41.08 / 0.502 (both equal) | 32.10 ± 0.25 / 0.696 | **31.88 ± 0.31** / 0.700 | 22% |
+
+**All hours:**
+
+| Horizon | Best baseline RMSE / R² | GRU RMSE / R² | LSTM RMSE / R² |
+| --- | ---: | ---: | ---: |
+| 15 min | 8.41 / 0.976 | **6.98 ± 0.00** / 0.983 | 7.61 ± 0.11 / 0.980 |
+| 1 h | 21.03 / 0.847 | **14.05 ± 0.06** / 0.932 | 14.40 ± 0.05 / 0.928 |
+| 4 h | 30.09 / 0.688 | **19.48 ± 0.12** / 0.869 | 19.76 ± 0.23 / 0.865 |
+| 24 h | 30.09 / 0.688 | 23.53 ± 0.18 / 0.809 | **23.44 ± 0.27** / 0.811 |
+
+Skill is the reduction in RMSE relative to the best naive baseline at that horizon.
 
 ### Key Takeaways
 
-On held-out full-data Colab runs, the best GRU reduced RMSE by about 34% versus the strongest naive baseline at the 4-hour horizon and about 21% at the 24-hour horizon, reaching R2 of 0.865 and 0.807 respectively.
+- **Both networks beat the best naive baseline at every horizon.** The gain is largest at 1–4 hours (about 33–35% lower daylight RMSE). It is smaller at 15 minutes, where persistence is already strong, and at 24 hours, where past observations say little about tomorrow's clouds.
+- **GRU and LSTM are nearly tied.** The GRU is slightly better up to 4 hours, the LSTM slightly better at 24 hours, and the gaps are only a few seed standard deviations.
+- **Night hours flatter the all-hours metrics.** About half the targets are night zeros, so all-hours R² is 0.08–0.11 higher than daylight R² at 4 and 24 hours. Daylight metrics are the honest comparison.
+- **Configuration barely matters.** The two-stage GRU sweep (`colab_gru_tuning_actual_data.ipynb`, 4-hour and 24-hour horizons, 3 seeds) tried 3-, 12-, and 24-hour windows, target-time features on and off, hidden size 32/64, 1–2 layers, and two learning rates. All 26 configurations landed within about 2% of each other on validation RMSE (19.76–20.14 at 4 hours, 23.71–23.94 at 24 hours). Target-time features helped by 0.4–0.6% with the 12-row window; longer windows did not help.
+- **The limit is information, not the model.** Past weather observations cannot see clouds hours ahead. Further gains need inputs about the future, such as numerical weather forecasts, or a better target, such as the clear-sky index.
+- **Plain persistence is weak at 4 hours.** It copies the value from 4 hours earlier, which is out of phase with the daily cycle (all-hours R² −0.04). Skill is therefore measured against the best baseline at each horizon, which at 4 hours is seasonal naive.
+- **The networks smooth peaks.** Trained on squared error, they predict close to the expected value, so they undershoot clear-day peaks and miss sharp cloudy-day spikes (see the example forecasts).
 
-| Horizon | Best GRU | Strongest naive baseline | RMSE improvement |
-| --- | ---: | ---: | ---: |
-| 4 h | RMSE 19.77, MAE 10.37, R2 0.865 | RMSE 30.09, R2 0.688 | ~34% |
-| 24 h | RMSE 23.64, MAE 12.66, R2 0.807 | RMSE 30.09, R2 0.688 | ~21% |
+`capped_mape` is reported by the CLI, but solar irradiance has many near-zero/night values, so RMSE, MAE, and R² are the headline metrics.
 
-A small GRU tuning sweep found only marginal gains over the compact default model. `hidden_dim=64` helped slightly, while larger hidden dimensions and longer training did not reliably improve performance. This suggests the main improvement came from reframing the task as multi-horizon forecasting rather than from model complexity.
+![Test RMSE by horizon, all hours and daylight](plots/test_rmse_by_horizon.png)
 
-These are encouraging all-hours metrics, but the next stricter check is daylight-only evaluation because nighttime periods are easier and can make long-horizon solar forecasts look better than they are.
+![Skill over the best naive baseline by horizon](plots/skill_by_horizon.png)
 
-`capped_mape` is reported by the CLI, but solar irradiance has many near-zero/night values, so RMSE, MAE, and R2 are better headline metrics for these runs.
+![Example forecasts for a clear and a cloudy week at 4 and 24 hours](plots/example_forecasts.png)
 
-![Horizon sweep comparison](plots/download_barchart.png)
+![Daylight test RMSE by hour of day](plots/daylight_rmse_by_hour.png)
 
-![GRU forecast compared with actual GHI](plots/gru_forecast.png)
+![GRU sweep stage 1: validation RMSE by window and target-time features](plots/gru_sweep_stage1_validation.png)
 
-![GRU hyperparameter tuning comparison](plots/GRU_tuning_comparision.png)
+### Known Limitations
+
+- The dataset has 10 gaps of 1–5 days; forecast windows that cross a gap are treated as contiguous (under 1% of sequences).
+- GHI peaks at 229, well below typical clear-sky irradiance of 800–1000 W/m², so the units are unverified. Treat RMSE as relative to this dataset's scale.
+- Results cover a single site.
 
 ## Data
 
@@ -128,7 +163,7 @@ This avoids the common time-series leakage pattern where scalers or target trans
 The portfolio comparison includes:
 
 - **Persistence baseline**: predicts the future value from the most recent observed value at the configured horizon.
-- **Seasonal naive baseline**: predicts from the same offset in a previous daily cycle when available.
+- **Seasonal naive baseline**: predicts from the same time of day in a previous daily cycle when available.
 - **LSTM**: compact recurrent neural network implemented in PyTorch.
 - **GRU**: compact recurrent neural network implemented in PyTorch.
 
@@ -147,9 +182,13 @@ solar_prediction/
   benchmark.py        # timing/benchmark utilities for pipeline operations
   memory_tracker.py   # memory-usage tracking for PyTorch models
   plot_utils.py       # evaluation and plotting helpers
+  sweep.py            # resumable multi-seed sweeps, test scoring, and forecast export
+  report_plots.py     # report figures for sweep results
+  hf_hub.py           # Hugging Face dataset download and artifact upload/restore
 tests/                # unit and smoke tests
 data/sample/          # tracked sample data
-notebooks/            # Colab smoke and full-data verification
+notebooks/            # Colab smoke check, horizon sweep, and GRU tuning sweep
+plots/                # figures used in this README
 ```
 
 ## Development
