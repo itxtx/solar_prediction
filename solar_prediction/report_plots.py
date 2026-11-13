@@ -102,19 +102,23 @@ def plot_skill_by_horizon(summary: pd.DataFrame, horizons, networks=("lstm", "gr
     skill = skill_table(summary, networks)
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     x = np.arange(len(horizons))
+    # All-hours and daylight skill are often nearly equal (night errors are ~0
+    # for every model), so offset and mark them differently to keep both visible.
+    styles = {"all": ("-", "o", -0.04), "daylight": ("--", "s", 0.04)}
     for name in networks:
-        for scope, style in (("all", "-"), ("daylight", "--")):
+        for scope, (style, marker, offset) in styles.items():
             rows = skill[(skill.model == name) & (skill.scope == scope)].set_index("horizon")
             if rows.empty:
                 continue
             values = [rows.skill.get(h, np.nan) * 100 for h in horizons]
             errors = [rows.skill_std.get(h, 0) * 100 for h in horizons]
             ax.errorbar(
-                x,
+                x + offset,
                 values,
                 yerr=errors,
                 linestyle=style,
-                marker="o",
+                marker=marker,
+                markerfacecolor="white" if scope == "daylight" else None,
                 capsize=3,
                 color=COLORS.get(name),
                 label=f"{_label(name)}, {SCOPE_TITLES[scope].lower()}",
@@ -151,7 +155,9 @@ def plot_rmse_by_hour(forecasts: dict, horizons, networks=("lstm", "gru")):
         frame = forecasts[horizon]
         table = rmse_by_hour(frame, _models(frame, networks))
         for name in table:
-            ax.plot(table.index, table[name], marker=".", color=COLORS.get(name), label=_label(name))
+            ax.plot(
+                table.index, table[name], marker=".", color=COLORS.get(name), label=_label(name)
+            )
         ax.set_title(f"Daylight test RMSE by hour, {horizon} ahead")
         ax.set_xlabel("Target hour (dataset clock, UTC)")
         ax.set_ylabel("RMSE (GHI units)")
@@ -183,7 +189,9 @@ def pick_example_weeks(forecasts: pd.DataFrame, days: int = 7):
         n_days=("timestamp", lambda t: t.dt.normalize().nunique()),
     )
     weeks = weeks[weeks.n_days == days]
-    weeks = weeks[weeks.reference >= weeks.reference.median()]
+    bright = weeks[weeks.reference >= weeks.reference.median()]
+    if len(bright) >= 2:
+        weeks = bright
     if weeks.empty:
         raise ValueError("No complete weeks in the test forecasts")
     clearness = weeks.actual / weeks.reference

@@ -17,12 +17,14 @@ matplotlib.use("Agg")
 NOTEBOOK = Path(__file__).parents[1] / "notebooks/colab_gru_tuning_actual_data.ipynb"
 
 
-def _frame(days=8):
+def _frame(days=8, clouds=None):
     timestamps = pd.date_range("2023-06-01", periods=24 * days, freq="h")
     hour = timestamps.hour.to_numpy()
     is_sun = ((hour >= 5) & (hour <= 20)).astype(int)
     rng = np.random.default_rng(1)
     ghi = is_sun * np.sin(np.clip((hour - 5) / 15, 0, 1) * np.pi) * 600
+    if clouds is not None:
+        ghi = ghi * clouds(timestamps)
     return pd.DataFrame(
         {
             "Time": timestamps,
@@ -208,6 +210,7 @@ def test_notebook_runs_end_to_end_and_resumes(tmp_path, data_path, monkeypatch):
     assert set(test.model) == {"model", "persistence", "seasonal_naive"}
     assert (test.n_seeds == 2).all()
     assert (out / "stage1_validation_plot.png").exists()
+    assert (out / "stage2_validation_plot.png").exists()
     assert ns["runs"].git_commit.notna().all()
 
     trained.clear()
@@ -242,3 +245,104 @@ def test_download_artifacts_folder_restores_and_tolerates_missing(tmp_path, monk
     assert (
         hf_hub.download_artifacts_folder("missing/repo", "sweep", local_dir=tmp_path / "x") is None
     )
+
+
+HORIZON_NOTEBOOK = Path(__file__).parents[1] / "notebooks/colab_horizon_sweep_actual_data.ipynb"
+
+
+def _cloud_pattern(timestamps):
+    """Clear except one very cloudy week inside the test period."""
+    day = (timestamps - timestamps[0]).days
+    return np.where((day >= 90) & (day < 97), 0.15, 1.0)
+
+
+def test_horizon_notebook_runs_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(sweep, "_run_cli", _in_process_cli)
+    monkeypatch.chdir(tmp_path)
+    data_path = tmp_path / "data.csv"
+    _frame(days=110, clouds=_cloud_pattern).to_csv(data_path, index=False)
+    sources = [
+        "".join(c["source"])
+        for c in json.loads(HORIZON_NOTEBOOK.read_text())["cells"]
+        if c["cell_type"] == "code"
+    ]
+    setup = [
+        i for i, s in enumerate(sources) if "%pip" in s or "pyproject.toml" in s or "download_" in s
+    ]
+    assert setup == [1, 2, 3]
+    namespace = {}
+    exec(sources[0], namespace)
+    namespace.update(
+        UPLOAD_TO_HF=False,
+        HORIZONS={"1h": 1, "6h": 6},
+        SEEDS=[0, 1],
+        SEASONAL_LAG=24,
+        CONFIG=dict(namespace["CONFIG"], hidden_dim=4, epochs=1, patience=1, batch_size=64),
+        EXAMPLE_HORIZONS=["1h", "6h"],
+        data_path=data_path,
+        output_root=tmp_path / "out",
+        Path=Path,
+    )
+    namespace["output_root"].mkdir()
+    for source in sources[4:]:
+        exec(source, namespace)
+
+    out = tmp_path / "out"
+    summary = pd.read_csv(out / "test_metrics_summary.csv")
+    assert set(summary.model) == {"gru", "lstm", "persistence", "seasonal_naive"}
+    assert set(summary.scope) == {"all", "daylight"}
+    networks = summary[summary.model.isin(["gru", "lstm"])]
+    assert (networks.n_seeds == 2).all()
+    baselines = pd.read_csv(out / "test_metrics_by_seed.csv")
+    baselines = baselines[baselines.model == "persistence"]
+    assert len(baselines) == 2 * 2 * 2  # horizons x scopes x seeds, not duplicated per network
+    forecasts = pd.read_csv(out / "test_forecasts" / "6h_test_forecasts.csv")
+    assert {"timestamp", "actual", "daylight", "gru", "lstm", "persistence"} <= set(forecasts)
+    for name in (
+        "test_rmse_by_horizon.png",
+        "skill_by_horizon.png",
+        "daylight_rmse_by_hour.png",
+        "example_forecasts.png",
+    ):
+        assert (out / name).exists()
+    clear, cloudy = namespace["weeks"].values()
+    assert clear != cloudy
+    start = pd.Timestamp("2023-06-01")
+    assert (cloudy - start).days in range(84, 97)  # the week overlapping the cloudy days
+
+
+def test_report_helpers_compute_skill_hourly_rmse_and_weeks():
+    from solar_prediction import report_plots
+
+    summary = pd.DataFrame(
+        {
+            "horizon": ["4h"] * 3,
+            "scope": ["all"] * 3,
+            "model": ["persistence", "seasonal_naive", "gru"],
+            "test_rmse_mean": [50.0, 40.0, 30.0],
+            "test_rmse_std": [0.0, 0.0, 2.0],
+        }
+    )
+    skill = report_plots.skill_table(summary, ["gru"]).iloc[0]
+    assert skill.best_baseline == "seasonal_naive"
+    assert skill.skill == pytest.approx(0.25)
+    assert skill.skill_std == pytest.approx(0.05)
+
+    stamps = pd.date_range("2023-06-01", periods=24 * 28, freq="h")
+    hour = stamps.hour.to_numpy()
+    shape = np.clip(np.sin((hour - 5) / 15 * np.pi), 0, None) * 500
+    cloud = np.where((stamps >= "2023-06-15") & (stamps < "2023-06-22"), 0.2, 1.0)
+    frame = pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "actual": shape * cloud,
+            "daylight": shape > 0,
+            "gru": shape * cloud + np.where(hour == 12, 10.0, 0.0),
+        }
+    )
+    by_hour = report_plots.rmse_by_hour(frame, ["gru"])
+    assert by_hour.loc[12, "gru"] == pytest.approx(10.0)
+    assert by_hour.drop(index=12).gru.abs().max() == pytest.approx(0.0)
+    clear, cloudy = report_plots.pick_example_weeks(frame)
+    assert cloudy == pd.Timestamp("2023-06-15")
+    assert clear != cloudy
