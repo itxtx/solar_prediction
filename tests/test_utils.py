@@ -230,7 +230,9 @@ class TestUtilityEdgeCases:
         monkeypatch.chdir(tmp_path)
         tracker = BenchmarkTracker()
         tracker.set_csv_file("bare_benchmark.csv")
-        tracker.add_result(BenchmarkResult(function_name="fn", stage_name="stage", execution_time=0.01))
+        tracker.add_result(
+            BenchmarkResult(function_name="fn", stage_name="stage", execution_time=0.01)
+        )
         assert (tmp_path / "bare_benchmark.csv").exists()
 
         get_benchmark_tracker().add_result(
@@ -238,4 +240,3 @@ class TestUtilityEdgeCases:
         )
         save_benchmark_results("saved_bare.csv")
         assert (tmp_path / "saved_bare.csv").exists()
-

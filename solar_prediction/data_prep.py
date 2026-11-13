@@ -436,7 +436,9 @@ def _engineer_time_features(
         raw_daylength = pd.to_numeric(df[input_cfg.daylength_col_raw], errors="coerce")
         # Convert hours to minutes only if values are on an hour scale (<= 24);
         # datasets like solar_weather.csv already store dayLength in minutes (450-1020).
-        df[STD_DAYLIGHT_MINUTES] = np.where(raw_daylength <= 24.0, raw_daylength * 60.0, raw_daylength)
+        df[STD_DAYLIGHT_MINUTES] = np.where(
+            raw_daylength <= 24.0, raw_daylength * 60.0, raw_daylength
+        )
 
     if input_cfg.is_sun_col_raw in df.columns and STD_IS_DAYLIGHT not in df.columns:
         df[STD_IS_DAYLIGHT] = df[input_cfg.is_sun_col_raw].astype(float)

@@ -240,5 +240,3 @@ def test_hf_hub_helpers_and_notebooks_use_hf(tmp_path, monkeypatch):
         assert "google.colab import drive" not in text
         assert "download_dataset_file" in text
         assert "upload_artifacts_folder" in text
-
-

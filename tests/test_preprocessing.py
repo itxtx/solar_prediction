@@ -351,4 +351,3 @@ def test_daylight_position_night_zero_and_daylength_minutes():
     norm_pl, _, _ = _initial_df_setup(pl_df, cfg.input)
     eng_pl = _engineer_time_features(norm_pl, cfg.features, cfg.input)
     assert eng_pl["DaylightMinutes"].tolist() == pytest.approx([960.0, 960.0])
-
